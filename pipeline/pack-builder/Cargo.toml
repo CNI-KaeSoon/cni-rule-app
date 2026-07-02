@@ -1,0 +1,21 @@
+[package]
+name = "cni-pack-builder"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+rules-core = { path = "../../crates/rules-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tantivy = "0.25"
+tar = "0.4"
+time = { version = "0.3", features = ["formatting", "macros"] }
+walkdir = "2"
+zstd = "0.13"
