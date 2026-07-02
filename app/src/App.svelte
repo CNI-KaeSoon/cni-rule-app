@@ -23,6 +23,7 @@
   type Screen = "start" | "interpret" | "labor" | "compare" | "engine" | "settings";
   type SidebarTab = "chat" | "article";
   type MainView = "chat" | "rulebook";
+  type SettingsTab = "general" | "engine" | "privacy" | "rules" | "diagnostics";
   type QuestionTelemetrySettings = {
     consent: boolean | null;
     shared_dir: string | null;
@@ -64,6 +65,7 @@
     status: "Installed" | "NeedsLogin" | "Ready" | "Missing" | string;
   };
   type UpdateStatus = {
+    installed: boolean;
     institution: string;
     effective_date: string;
     source_commit: string;
@@ -82,6 +84,34 @@
     title: string;
     effective: string;
   };
+  type SearchTraceHit = {
+    article_id: string;
+    score: number;
+  };
+  type AnswerTrace = {
+    message_id: string;
+    conversation_id: string;
+    search_query: string;
+    search_results: SearchTraceHit[];
+    direct_routing: boolean;
+    search_ms: number;
+    context_article_ids: string[];
+    prompt_bytes: number;
+    engine_kind: string;
+    engine_delta_count: number;
+    engine_ms: number;
+    engine_exit_code: number | null;
+    engine_stderr_tail: string;
+    extracted_citations: string[];
+    citations_in_context: boolean;
+    total_ms: number;
+    created_at: string;
+  };
+  type DiagnosticExport = {
+    local_path: string;
+    shared_path: string | null;
+    shared: boolean;
+  };
 
   let screen: Screen = "start";
   let activeMode: ModeLabel = "규정해석";
@@ -89,7 +119,7 @@
   let mainView: MainView = "chat";
   let theme: ThemeChoice = "auto";
   let engineOpen = false;
-  let settingsTab: "general" | "engine" | "privacy" | "rules" = "rules";
+  let settingsTab: SettingsTab = "rules";
   let sidebarOpen = false;
   let prompt = "";
   let rulebookArticles: RulebookArticle[] = [];
@@ -113,6 +143,12 @@
   let searchHits: SearchHit[] = [];
   let selectedArticle: RulebookArticle | null = null;
   let settings: { key: string; value: string }[] = [];
+  let traces: AnswerTrace[] = [];
+  let selectedTrace: AnswerTrace | null = null;
+  let diagnosticsStatus = "";
+  let reportTarget: ChatMessage | null = null;
+  let reportReason = "검색이 이상함";
+  let reportDetails = "";
 
   $: document.documentElement.setAttribute("data-theme", theme);
   $: conversationGroups = groupConversations(conversations.filter((item) => item.title.includes(conversationSearch.trim())));
@@ -120,6 +156,15 @@
     ? [selectedArticle]
     : rulebookArticles.slice(0, 18);
   $: engineLabel = activeEngine?.label ?? "엔진";
+  $: rulesDataMissing = updateStatus?.installed === false;
+  $: rulesStatusLabel = updateStatus
+    ? updateStatus.installed
+      ? `${updateStatus.effective_date || "설치됨"} ${updateStatus.source_commit || ""}`.trim()
+      : "없음"
+    : "확인 전";
+  $: rulesBootstrapMessage = rulesDataMissing
+    ? "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)"
+    : updateMessage || "규정집 업데이트 확인";
 
   function openScreen(next: Screen) {
     screen = next;
@@ -288,8 +333,24 @@
     }
     try {
       searchHits = await invoke<SearchHit[]>("search", { q, filter: null });
-    } catch {
+    } catch (error) {
       searchHits = [];
+      updateMessage = String(error || "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)");
+    }
+  }
+
+  async function loadDataStatus() {
+    try {
+      updateStatus = await invoke<UpdateStatus>("check_update");
+    } catch {
+      updateStatus = {
+        installed: false,
+        institution: "",
+        effective_date: "",
+        source_commit: "",
+        index_built_at: "",
+        stale: true
+      };
     }
   }
 
@@ -303,6 +364,7 @@
       updateStatus = await invoke<UpdateStatus>("apply_update");
       updateMessage = "업데이트 완료";
       await loadRulebook();
+      await searchArticles();
     } catch {
       updateMessage = "업데이트를 적용하지 못했습니다.";
     } finally {
@@ -317,6 +379,16 @@
       if (savedTheme === "auto" || savedTheme === "light" || savedTheme === "dark") theme = savedTheme;
     } catch {
       settings = [];
+    }
+  }
+
+  async function loadTraces() {
+    try {
+      traces = await invoke<AnswerTrace[]>("traces_recent", { limit: 20 });
+      selectedTrace = traces[0] ?? null;
+    } catch {
+      traces = [];
+      selectedTrace = null;
     }
   }
 
@@ -358,12 +430,43 @@
     }
   }
 
+  function openReportDialog(message: ChatMessage) {
+    reportTarget = message;
+    reportReason = "검색이 이상함";
+    reportDetails = "";
+    diagnosticsStatus = "";
+  }
+
+  async function exportDiagnosticReport() {
+    if (!reportTarget) return;
+    const isLabor = activeMode === "노무상담";
+    const laborShareConfirmed =
+      isLabor && telemetryConsent === true && telemetrySharedDir.trim()
+        ? window.confirm("민감 상담 내용이 포함될 수 있습니다. 전송할까요?")
+        : false;
+    try {
+      const result = await invoke<DiagnosticExport>("diagnostics_export", {
+        messageId: reportTarget.id,
+        reason: reportReason,
+        details: reportDetails,
+        laborShareConfirmed
+      });
+      diagnosticsStatus = result.shared ? "진단 리포트를 로컬과 공유 경로에 저장했습니다." : "진단 리포트를 로컬에 저장했습니다.";
+      reportTarget = null;
+      await loadTraces();
+    } catch (error) {
+      diagnosticsStatus = String(error || "진단 리포트를 저장하지 못했습니다.");
+    }
+  }
+
   onMount(() => {
     void loadRulebook();
+    void loadDataStatus();
     void loadConversations();
     void loadEngines();
     void loadSettings();
     void loadTelemetrySettings();
+    void loadTraces();
     const unlisten = listen<{ page: number }>("rulebook://open", async (event) => {
       activeRulebookPage = event.payload.page;
       mainView = "rulebook";
@@ -383,11 +486,16 @@
       updateStatus = event.payload;
       updateMessage = "업데이트 완료";
     }).catch(() => undefined);
+    const unlistenRules = listen<UpdateStatus>("rules://status", (event) => {
+      updateStatus = event.payload;
+      if (!event.payload.installed) updateMessage = "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)";
+    }).catch(() => undefined);
     return () => {
       void unlisten.then((dispose) => dispose?.());
       void unlistenDelta.then((dispose) => dispose?.());
       void unlistenProgress.then((dispose) => dispose?.());
       void unlistenDone.then((dispose) => dispose?.());
+      void unlistenRules.then((dispose) => dispose?.());
     };
   });
 
@@ -433,8 +541,9 @@
       const detail = await invoke<ConversationDetail>("conversations_get", { id: conversationId });
       messages = detail.messages;
       await loadConversations();
-    } catch {
-      updateMessage = "답변을 가져오지 못했습니다.";
+      await loadTraces();
+    } catch (error) {
+      updateMessage = String(error || "답변을 가져오지 못했습니다.");
     }
   }
 </script>
@@ -549,7 +658,12 @@
             </div>
           {/each}
           {#if !searchHits.length && !visibleArticles.length}
-            <p class="empty-state">표시할 조문이 없습니다.</p>
+            <div class="empty-state">
+              <p>{rulesDataMissing ? "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)" : "표시할 조문이 없습니다."}</p>
+              {#if rulesDataMissing}
+                <button class="article-source-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>지금 다운로드</button>
+              {/if}
+            </div>
           {/if}
         </div>
       {/if}
@@ -565,9 +679,9 @@
         <div class="start-center">
           <div class="brand-mark">CNI</div>
           <h1 class="start-heading">무엇을 도와드릴까요?</h1>
-          <button class="update-banner" on:click={() => void checkAndApplyUpdate()}>
+          <button class:missing={rulesDataMissing} class="update-banner" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>
             <span class="banner-icon">📋</span>
-            <span>{updateMessage || "규정집 업데이트 확인"}</span>
+            <span>{rulesBootstrapMessage}</span>
             <span class="banner-arrow">→</span>
           </button>
           <div class="suggestion-grid">
@@ -611,7 +725,12 @@
               </article>
             {/each}
             {#if !rulebookArticles.length && !selectedArticle}
-              <p class="empty-state">규정집을 불러오면 조문이 여기에 표시됩니다.</p>
+              <div class="empty-state">
+                <p>{rulesDataMissing ? "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)" : "규정집을 불러오면 조문이 여기에 표시됩니다."}</p>
+                {#if rulesDataMissing}
+                  <button class="article-source-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>지금 다운로드</button>
+                {/if}
+              </div>
             {/if}
           </div>
         {:else}
@@ -646,12 +765,18 @@
                     {#if activeMode === "노무상담" && message.content.includes(LABOR_DISCLAIMER)}
                       <div class="disclaimer-box"><span>⚠</span><span>{LABOR_DISCLAIMER}</span></div>
                     {/if}
+                    <button class="report-btn" on:click={() => openReportDialog(message)}>👎 문제 신고</button>
                   </div>
                 </div>
               {/if}
             {/each}
           {:else}
-            <p class="empty-state">새 질문을 입력하면 대화가 시작됩니다.</p>
+            <div class="empty-state">
+              <p>{rulesDataMissing ? "규정집 데이터가 아직 없습니다 — 지금 다운로드(1.2MB)" : "새 질문을 입력하면 대화가 시작됩니다."}</p>
+              {#if rulesDataMissing}
+                <button class="article-source-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>지금 다운로드</button>
+              {/if}
+            </div>
           {/if}
         </div>
         {/if}
@@ -676,6 +801,7 @@
             <button class:active={settingsTab === "engine"} class="settings-nav-item" on:click={() => (settingsTab = "engine")}>엔진 연결</button>
             <button class:active={settingsTab === "privacy"} class="settings-nav-item" on:click={() => (settingsTab = "privacy")}>데이터 · 개인정보</button>
             <button class:active={settingsTab === "rules"} class="settings-nav-item" on:click={() => (settingsTab = "rules")}>규정집 정보</button>
+            <button class:active={settingsTab === "diagnostics"} class="settings-nav-item" on:click={() => { settingsTab = "diagnostics"; void loadTraces(); }}>진단</button>
           </nav>
           <div class="settings-content">
             {#if settingsTab === "general"}
@@ -732,12 +858,45 @@
               {/if}
               <div class="settings-row"><span class="settings-row-label">대화 내보내기</span><button class="settings-action-btn">Markdown으로 내보내기</button></div>
               <div class="settings-row"><span class="settings-row-label">전체 대화 휴지통 이동</span><button class="settings-action-btn danger">휴지통으로 이동</button></div>
-            {:else}
+            {:else if settingsTab === "rules"}
               <h3 class="settings-section-title">규정집 정보</h3>
-              <div class="settings-row"><span class="settings-row-label">기관</span><span class="settings-row-value">{updateStatus?.institution ?? "확인 전"}</span></div>
-              <div class="settings-row"><span class="settings-row-label">규정집 버전</span><span class="settings-row-value">{updateStatus?.effective_date ?? "확인 전"}<span class="mono">{updateStatus?.source_commit ?? ""}</span></span></div>
+              <div class="settings-row"><span class="settings-row-label">데이터 상태</span><span class="settings-row-value">{updateStatus?.installed ? "설치됨" : updateStatus ? "없음" : "확인 전"}</span></div>
+              <div class="settings-row"><span class="settings-row-label">기관</span><span class="settings-row-value">{updateStatus?.institution || "없음"}</span></div>
+              <div class="settings-row"><span class="settings-row-label">규정집 버전</span><span class="settings-row-value">{rulesStatusLabel}<span class="mono">{updateStatus?.installed ? updateStatus?.source_commit ?? "" : ""}</span></span></div>
               <div class="settings-row"><span class="settings-row-label">진행 상태</span><span class="settings-row-value">{updateProgress?.message ?? updateMessage ?? "대기"}</span></div>
-              <button class="settings-action-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>지금 업데이트 확인</button>
+              <button class="settings-action-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>{rulesDataMissing ? "지금 다운로드" : "지금 업데이트 확인"}</button>
+            {:else}
+              <h3 class="settings-section-title">진단</h3>
+              {#if diagnosticsStatus}
+                <p class="settings-status">{diagnosticsStatus}</p>
+              {/if}
+              <div class="trace-layout">
+                <div class="trace-list">
+                  {#each traces as trace}
+                    <button class:active={selectedTrace?.message_id === trace.message_id} class="trace-item" on:click={() => (selectedTrace = trace)}>
+                      <span class="trace-question">{trace.search_query.slice(0, 42)}{trace.search_query.length > 42 ? "…" : ""}</span>
+                      <span class="trace-metrics">검색 {trace.search_ms}ms · 엔진 {trace.engine_ms}ms · 전체 {trace.total_ms}ms</span>
+                      <span class:bad={!trace.citations_in_context} class="csr-badge">CSR {trace.citations_in_context ? "OK" : "FALSE"}</span>
+                    </button>
+                  {/each}
+                  {#if !traces.length}
+                    <p class="empty-state">최근 트레이스가 없습니다.</p>
+                  {/if}
+                </div>
+                {#if selectedTrace}
+                  <div class="trace-detail">
+                    <div class="settings-row"><span class="settings-row-label">질문</span><span class="settings-row-value">{selectedTrace.search_query}</span></div>
+                    <div class="settings-row"><span class="settings-row-label">단계별 시간</span><span class="settings-row-value">검색 {selectedTrace.search_ms}ms · 엔진 {selectedTrace.engine_ms}ms · 전체 {selectedTrace.total_ms}ms</span></div>
+                    <div class="settings-row"><span class="settings-row-label">엔진</span><span class="settings-row-value">{selectedTrace.engine_kind} · delta {selectedTrace.engine_delta_count}</span></div>
+                    <div class="settings-row"><span class="settings-row-label">주입 조문</span><span class="settings-row-value">{selectedTrace.context_article_ids.join(", ") || "없음"}</span></div>
+                    <div class="settings-row"><span class="settings-row-label">검색 결과</span><span class="settings-row-value">{selectedTrace.search_results.map((hit) => `${hit.article_id}(${hit.score.toFixed(2)})`).join(", ") || "없음"}</span></div>
+                    <div class="settings-row"><span class="settings-row-label">추출 인용</span><span class="settings-row-value">{selectedTrace.extracted_citations.join(", ") || "없음"}</span></div>
+                    {#if selectedTrace.engine_stderr_tail}
+                      <pre class="trace-error">{selectedTrace.engine_stderr_tail}</pre>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
             {/if}
           </div>
         </div>
@@ -758,6 +917,29 @@
         <div class="consent-actions">
           <button class="settings-action-btn secondary" on:click={() => void saveTelemetrySettings(false)}>거부</button>
           <button class="settings-action-btn" on:click={() => void saveTelemetrySettings(true)}>동의</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if reportTarget}
+    <div class="modal-backdrop consent-backdrop">
+      <div class="consent-modal" role="dialog" aria-label="문제 신고">
+        <div class="settings-modal-header"><h2>문제 신고</h2><button class="icon-btn modal-close" title="닫기" on:click={() => (reportTarget = null)}>✕</button></div>
+        <div class="consent-body">
+          <label class="settings-row-label" for="report-reason">사유</label>
+          <select id="report-reason" class="key-input" bind:value={reportReason}>
+            <option>검색이 이상함</option>
+            <option>답변이 틀림</option>
+            <option>느림</option>
+            <option>기타</option>
+          </select>
+          <label class="settings-row-label report-detail-label" for="report-details">메모</label>
+          <textarea id="report-details" class="key-input report-details" bind:value={reportDetails} rows="4"></textarea>
+        </div>
+        <div class="consent-actions">
+          <button class="settings-action-btn secondary" on:click={() => (reportTarget = null)}>취소</button>
+          <button class="settings-action-btn" on:click={() => void exportDiagnosticReport()}>저장</button>
         </div>
       </div>
     </div>
@@ -894,6 +1076,7 @@
   .convo-title { flex: 1; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); background: transparent; border: none; text-align: left; padding: 0; min-width: 0; }
   .convo-more { background: transparent; border: none; color: var(--text-secondary); width: 22px; height: 22px; border-radius: 6px; }
   .empty-state { color: var(--text-secondary); font-size: 13px; line-height: 1.6; padding: 12px; text-align: center; }
+  .empty-state p { margin: 0; }
   .article-search { display: flex; gap: 6px; align-items: center; padding: 6px 4px 10px; }
   .article-search input { flex: 1; min-width: 0; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; outline: none; }
   .search-hit { width: 100%; display: flex; flex-direction: column; gap: 4px; text-align: left; background: transparent; color: var(--text); border: 1px solid var(--border-soft); border-radius: 8px; padding: 9px; margin-bottom: 6px; }
@@ -919,6 +1102,8 @@
   .brand-mark { width: 52px; height: 52px; font-size: 15px; letter-spacing: 0; }
   .start-heading { font-size: 26px; font-weight: 700; margin: 0; color: var(--text); letter-spacing: 0; }
   .update-banner { display: flex; align-items: center; gap: 10px; background: var(--accent-soft); color: var(--accent-text); padding: 10px 18px; border-radius: 12px; font-size: 13.5px; font-weight: 500; border: 1px solid transparent; max-width: 640px; }
+  .update-banner.missing { border-color: var(--accent); font-weight: 800; }
+  .update-banner:disabled { opacity: 0.72; cursor: default; }
   .suggestion-grid { display: grid; grid-template-columns: repeat(2, minmax(230px, 1fr)); gap: 12px; width: 100%; max-width: 660px; }
   .suggestion-card { display: flex; flex-direction: column; gap: 8px; text-align: left; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg); color: var(--text); }
   .s-icon { font-size: 19px; }
@@ -953,6 +1138,8 @@
   .inline-citation { display: inline-flex; margin: 0 2px; vertical-align: baseline; }
   .mode-banner { max-width: 820px; width: calc(100% - 48px); margin: 16px auto 0; display: flex; align-items: center; gap: 10px; background: var(--accent-soft); color: var(--accent-text); padding: 11px 16px; border-radius: 12px; font-size: 13.3px; font-weight: 500; }
   .disclaimer-box { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 12.6px; color: var(--text-secondary); display: flex; gap: 8px; align-items: flex-start; }
+  .report-btn { margin-top: 8px; border: 1px solid var(--border); background: transparent; color: var(--text-secondary); border-radius: 8px; padding: 5px 9px; font-size: 12px; font-weight: 700; }
+  .report-btn:hover { background: var(--hover); color: var(--text); }
   .modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 80; padding: 24px; }
   .settings-modal { width: 720px; max-width: 100%; max-height: 82vh; background: var(--bg); border: 1px solid var(--border); border-radius: 16px; display: flex; flex-direction: column; overflow: hidden; box-shadow: var(--shadow); }
   .settings-modal-header { flex-shrink: 0; padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
@@ -978,6 +1165,20 @@
   .telemetry-row { align-items: flex-start; }
   .telemetry-path-row { align-items: center; }
   .settings-status { margin: 8px 0 0; color: var(--accent-text); font-size: 12px; font-weight: 700; }
+  .trace-layout { display: grid; grid-template-columns: minmax(210px, 0.9fr) minmax(0, 1.1fr); gap: 14px; min-height: 360px; }
+  .trace-list { border-right: 1px solid var(--border-soft); padding-right: 10px; overflow-y: auto; }
+  .trace-item { width: 100%; display: flex; flex-direction: column; gap: 5px; text-align: left; background: transparent; border: 1px solid var(--border-soft); color: var(--text); border-radius: 8px; padding: 9px; margin-bottom: 8px; }
+  .trace-item.active { background: var(--accent-soft); border-color: transparent; }
+  .trace-question { font-size: 13px; font-weight: 800; }
+  .trace-metrics { font-size: 11.5px; color: var(--text-secondary); }
+  .csr-badge { align-self: flex-start; border-radius: 999px; padding: 2px 7px; background: var(--accent-soft); color: var(--accent-text); font-size: 11px; font-weight: 900; }
+  .csr-badge.bad { background: var(--danger-soft); color: var(--danger-text); }
+  .trace-detail { min-width: 0; overflow-y: auto; }
+  .trace-detail .settings-row { align-items: flex-start; }
+  .trace-detail .settings-row-value { max-width: 100%; overflow-wrap: anywhere; }
+  .trace-error { white-space: pre-wrap; background: var(--sidebar-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; color: var(--danger-text); font: 12px/1.5 "SFMono-Regular", Consolas, monospace; }
+  .report-detail-label { display: block; margin-top: 12px; }
+  .report-details { resize: vertical; min-height: 96px; }
   .switch { position: relative; width: 46px; height: 26px; flex-shrink: 0; }
   .switch input { position: absolute; opacity: 0; inset: 0; margin: 0; }
   .switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--border); transition: background 0.15s; }
@@ -1003,6 +1204,8 @@
     .settings-nav { width: 100%; flex-direction: row; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border); }
     .telemetry-path-row { align-items: flex-start; flex-direction: column; }
     .path-input { max-width: none; }
+    .trace-layout { grid-template-columns: 1fr; }
+    .trace-list { border-right: none; border-bottom: 1px solid var(--border-soft); padding-right: 0; padding-bottom: 10px; max-height: 220px; }
   }
   @media (max-width: 620px) {
     .app-header { padding: 0 8px; gap: 6px; }
