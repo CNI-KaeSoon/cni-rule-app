@@ -1,0 +1,22 @@
+[project]
+name = "cni-rule-pipeline"
+version = "0.1.0"
+description = "PDF to article Markdown pipeline for CNI rule books"
+readme = "README.md"
+requires-python = "==3.13.*"
+dependencies = [
+    "pymupdf>=1.26.3",
+]
+
+[project.scripts]
+cni-rule-pipeline = "cni_rule_pipeline.pipeline:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9"
+]
+build-backend = "uv_build"

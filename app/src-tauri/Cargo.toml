@@ -1,0 +1,30 @@
+[package]
+name = "app"
+version = "0.1.0-beta"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+futures-util = "0.3"
+pack-updater = { path = "../../crates/pack-updater" }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+rules-core.workspace = true
+rules-engines.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tauri = { version = "2.11.5", features = [] }
+thiserror = "2.0.17"
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

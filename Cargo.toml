@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/rules-core",
+    "crates/rules-engines",
+    "crates/public-rules-mcp",
+    "crates/cni-rules-mcp",
+    "crates/pack-updater",
+    "app/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+rules-core = { path = "crates/rules-core" }
+rules-engines = { path = "crates/rules-engines" }
+public-rules-mcp = { path = "crates/public-rules-mcp" }

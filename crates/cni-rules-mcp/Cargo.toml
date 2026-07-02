@@ -1,0 +1,12 @@
+[package]
+name = "cni-rules-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+public-rules-mcp.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml = "0.8"

@@ -1,0 +1,1613 @@
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
+use tantivy::collector::TopDocs;
+use tantivy::doc;
+use tantivy::query::QueryParser;
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value,
+    STORED, STRING,
+};
+use tantivy::{Index, TantivyError};
+use time::OffsetDateTime;
+use unicode_normalization::UnicodeNormalization;
+use walkdir::WalkDir;
+
+pub const ARTICLE_ID_SEPARATOR: &str = "#";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum NodeKind {
+    Rule,
+    Article,
+    Annex,
+    Institution,
+    Dept,
+    Position,
+    Committee,
+    Allowance,
+    LawArticle,
+    Amendment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum EdgeKind {
+    Cites,
+    ApplyMutatis,
+    Delegates,
+    ExceptWhen,
+    AppliesTo,
+    PaymentCondition,
+    AmendedBy,
+    SupersededBy,
+    HasStatus,
+    LegalBasis,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHit {
+    pub article_id: String,
+    pub score: f32,
+    pub snippet: String,
+    pub rule: String,
+    pub title: String,
+    pub effective: String,
+}
+
+pub trait RulesIndex {
+    fn search(&self, q: &str, k: usize, filter: Option<RuleFilter>) -> Vec<SearchHit>;
+    fn get_article(&self, id: &str) -> Option<Article>;
+    fn related_laws(&self, id: &str) -> Vec<LegalBasis>;
+    fn impact(&self, id: &str) -> ImpactReport;
+    fn list_rules(&self) -> Vec<RuleSummary>;
+    fn status(&self) -> PackStatus;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleFilter {
+    pub institution: Option<String>,
+    pub rule: Option<String>,
+    pub status: Option<String>,
+    pub effective: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Article {
+    pub id: String,
+    pub institution: String,
+    pub rule: String,
+    pub article: String,
+    pub title: String,
+    pub effective: String,
+    pub amended: String,
+    pub status: String,
+    pub body: String,
+    pub legal_basis: Vec<LegalBasis>,
+    pub refs: Vec<ArticleRef>,
+    pub prev_id: Option<String>,
+    pub next_id: Option<String>,
+    pub meta: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArticleRef {
+    pub target: String,
+    #[serde(rename = "type", alias = "kind")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LegalBasis {
+    pub law: String,
+    pub article: String,
+    pub mst: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ImpactReport {
+    pub article_id: String,
+    pub reverse_citations: Vec<String>,
+    pub delegation_chain: Vec<String>,
+    pub affected_articles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RuleSummary {
+    pub slug: String,
+    pub name: String,
+    pub article_count: usize,
+    pub effective: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PackStatus {
+    pub institution: String,
+    pub effective_date: String,
+    pub source_commit: String,
+    pub index_built_at: String,
+    pub stale: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RulesCoreError {
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("tantivy error: {0}")]
+    Tantivy(#[from] TantivyError),
+    #[error("invalid article markdown: {0}")]
+    InvalidArticle(String),
+    #[error("manifest digest mismatch for {path}: expected {expected}, got {actual}")]
+    DigestMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("missing manifest entry for {0}")]
+    MissingManifestEntry(String),
+    #[error("unsupported pack schema_version: {0}")]
+    UnsupportedSchema(u32),
+    #[error("unsafe pack path: {0}")]
+    UnsafePackPath(String),
+    #[error("pack contains unlisted file: {0}")]
+    UnlistedPackFile(String),
+    #[error("unsupported archive entry: {0}")]
+    UnsupportedArchiveEntry(String),
+}
+
+pub type Result<T> = std::result::Result<T, RulesCoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct PackManifest {
+    pub schema_version: u32,
+    pub institution: String,
+    pub effective_date: String,
+    pub source_commit: String,
+    pub created_at: String,
+    pub files: BTreeMap<String, String>,
+}
+
+impl PackManifest {
+    pub fn normalize_hashes(&mut self) {
+        for digest in self.files.values_mut() {
+            *digest = digest.to_ascii_lowercase();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub kind: NodeKind,
+    pub label: String,
+    #[serde(default)]
+    pub meta: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphEdge {
+    pub src: String,
+    pub dst: String,
+    pub kind: EdgeKind,
+    #[serde(default)]
+    pub meta: BTreeMap<String, serde_json::Value>,
+}
+
+pub trait EmbeddingProvider {
+    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NoopEmbeddingProvider;
+
+impl EmbeddingProvider for NoopEmbeddingProvider {
+    fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(feature = "vectors")]
+pub struct FastEmbedEmbeddingProvider {
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+}
+
+#[cfg(feature = "vectors")]
+impl FastEmbedEmbeddingProvider {
+    pub fn new() -> anyhow::Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::MultilingualE5Small)
+                .with_show_download_progress(false),
+        )?;
+        Ok(Self {
+            model: std::sync::Mutex::new(model),
+        })
+    }
+}
+
+#[cfg(feature = "vectors")]
+impl EmbeddingProvider for FastEmbedEmbeddingProvider {
+    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let embeddings = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fastembed model mutex poisoned"))?
+            .embed(vec![text], None)?;
+        Ok(embeddings.into_iter().next().unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ArticleFrontmatter {
+    institution: String,
+    rule: String,
+    article: String,
+    title: String,
+    effective: String,
+    amended: String,
+    status: String,
+    #[serde(default)]
+    supersedes: Option<String>,
+    #[serde(default)]
+    legal_basis: Vec<LegalBasis>,
+    #[serde(default)]
+    refs: Vec<ArticleRef>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchFields {
+    id: Field,
+    rule: Field,
+    title: Field,
+    body: Field,
+}
+
+#[derive(Debug)]
+pub struct TantivyRulesIndex {
+    articles: BTreeMap<String, Article>,
+    summaries: Vec<RuleSummary>,
+    status: PackStatus,
+    graph: DiGraph<String, EdgeKind>,
+    node_indices: HashMap<String, NodeIndex>,
+    index: Index,
+    fields: SearchFields,
+}
+
+impl TantivyRulesIndex {
+    pub fn from_articles<I>(articles: I, status: PackStatus) -> Result<Self>
+    where
+        I: IntoIterator<Item = Article>,
+    {
+        let mut articles = articles.into_iter().map(|a| (a.id.clone(), a)).collect();
+        link_neighbors(&mut articles);
+        let (index, fields) = build_search_index(articles.values())?;
+        let summaries = build_rule_summaries(articles.values());
+        let (graph, node_indices) = build_ref_graph(articles.values(), &[], &[]);
+
+        Ok(Self {
+            articles,
+            summaries,
+            status,
+            graph,
+            node_indices,
+            index,
+            fields,
+        })
+    }
+
+    pub fn from_articles_dir(path: impl AsRef<Path>, status: PackStatus) -> Result<Self> {
+        let articles = load_articles_dir(path)?;
+        Self::from_articles(articles, status)
+    }
+
+    pub fn from_pack_dir(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut manifest: PackManifest =
+            serde_json::from_reader(File::open(path.join("manifest.json"))?)?;
+        manifest.normalize_hashes();
+        verify_manifest(path, &manifest)?;
+
+        let articles = load_articles_dir(path.join("articles"))?;
+        let nodes = load_jsonl::<GraphNode>(&path.join("graph/nodes.jsonl"))?;
+        let edges = load_jsonl::<GraphEdge>(&path.join("graph/edges.jsonl"))?;
+        let status = PackStatus {
+            institution: manifest.institution,
+            effective_date: manifest.effective_date,
+            source_commit: manifest.source_commit,
+            index_built_at: manifest.created_at,
+            stale: false,
+        };
+
+        let mut index = Self::from_articles(articles, status)?;
+        let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
+        index.graph = graph;
+        index.node_indices = node_indices;
+        Ok(index)
+    }
+
+    pub fn from_pack_archive(path: impl AsRef<Path>) -> Result<Self> {
+        let tmp = tempfile::tempdir()?;
+        unpack_pack_archive(path, tmp.path())?;
+        Self::from_pack_dir(tmp.path())
+    }
+}
+
+impl RulesIndex for TantivyRulesIndex {
+    fn search(&self, q: &str, k: usize, filter: Option<RuleFilter>) -> Vec<SearchHit> {
+        if q.trim().is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        let pinned = self.direct_article_hit(q, filter.as_ref());
+        let mut parser =
+            QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
+        parser.set_field_boost(self.fields.title, 2.0);
+        let (query, _errors) = parser.parse_query_lenient(q);
+        let Ok(reader) = self.index.reader() else {
+            return merge_pinned_hits(
+                pinned,
+                lexical_fallback(self.articles.values(), q, k, filter.as_ref()),
+                k,
+            );
+        };
+
+        let searcher = reader.searcher();
+        let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(k * 4)) else {
+            return merge_pinned_hits(
+                pinned,
+                lexical_fallback(self.articles.values(), q, k, filter.as_ref()),
+                k,
+            );
+        };
+
+        let mut bm25_hits = Vec::new();
+        for (score, addr) in top_docs {
+            let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                continue;
+            };
+            let Some(id) = first_text(&doc, self.fields.id) else {
+                continue;
+            };
+            let Some(article) = self.articles.get(id) else {
+                continue;
+            };
+            if !matches_filter(article, filter.as_ref()) {
+                continue;
+            }
+            bm25_hits.push(SearchHit {
+                article_id: article.id.clone(),
+                score,
+                snippet: snippet(&article.body, q),
+                rule: article.rule.clone(),
+                title: article.title.clone(),
+                effective: article.effective.clone(),
+            });
+        }
+
+        let mut rule_hits = Vec::new();
+        let rule_terms = rule_query_terms(q);
+        if !rule_terms.is_empty() {
+            let mut rule_parser = QueryParser::for_index(&self.index, vec![self.fields.rule]);
+            rule_parser.set_field_boost(self.fields.rule, 3.0);
+            let (rule_query, _errors) = rule_parser.parse_query_lenient(&rule_terms.join(" "));
+            if let Ok(top_docs) = searcher.search(&rule_query, &TopDocs::with_limit(k * 4)) {
+                for (score, addr) in top_docs {
+                    let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                        continue;
+                    };
+                    let Some(id) = first_text(&doc, self.fields.id) else {
+                        continue;
+                    };
+                    let Some(article) = self.articles.get(id) else {
+                        continue;
+                    };
+                    if !matches_filter(article, filter.as_ref()) {
+                        continue;
+                    }
+                    rule_hits.push(SearchHit {
+                        article_id: article.id.clone(),
+                        score,
+                        snippet: snippet(&article.body, q),
+                        rule: article.rule.clone(),
+                        title: article.title.clone(),
+                        effective: article.effective.clone(),
+                    });
+                }
+            }
+        }
+
+        if bm25_hits.is_empty() {
+            bm25_hits = lexical_fallback(self.articles.values(), q, k * 4, filter.as_ref());
+        }
+
+        let lexical_hits = lexical_rank(self.articles.values(), q, k * 4, filter.as_ref());
+        merge_pinned_hits(
+            pinned,
+            rrf_fuse(vec![bm25_hits, rule_hits, lexical_hits], k),
+            k,
+        )
+    }
+
+    fn get_article(&self, id: &str) -> Option<Article> {
+        self.articles.get(id).cloned()
+    }
+
+    fn related_laws(&self, id: &str) -> Vec<LegalBasis> {
+        self.articles
+            .get(id)
+            .map(|article| article.legal_basis.clone())
+            .unwrap_or_default()
+    }
+
+    fn impact(&self, id: &str) -> ImpactReport {
+        let reverse_citations = self.reverse_neighbors(id, |kind| {
+            matches!(
+                kind,
+                EdgeKind::Cites
+                    | EdgeKind::ApplyMutatis
+                    | EdgeKind::Delegates
+                    | EdgeKind::LegalBasis
+            )
+        });
+        let delegation_chain = self.forward_traversal(id, |kind| {
+            matches!(kind, EdgeKind::Delegates | EdgeKind::ApplyMutatis)
+        });
+
+        let mut affected = BTreeSet::new();
+        affected.extend(reverse_citations.iter().cloned());
+        affected.extend(delegation_chain.iter().cloned());
+
+        ImpactReport {
+            article_id: id.to_string(),
+            reverse_citations,
+            delegation_chain,
+            affected_articles: affected.into_iter().collect(),
+        }
+    }
+
+    fn list_rules(&self) -> Vec<RuleSummary> {
+        self.summaries.clone()
+    }
+
+    fn status(&self) -> PackStatus {
+        self.status.clone()
+    }
+}
+
+impl TantivyRulesIndex {
+    fn direct_article_hit(&self, q: &str, filter: Option<&RuleFilter>) -> Option<SearchHit> {
+        let (rule_slug, article) = direct_article_ref(q, filter.and_then(|f| f.rule.as_deref()))?;
+        let id = format!("{rule_slug}{ARTICLE_ID_SEPARATOR}{article}");
+        let article = self.articles.get(&id)?;
+        if !matches_filter(article, filter) {
+            return None;
+        }
+        Some(SearchHit {
+            article_id: article.id.clone(),
+            score: f32::MAX,
+            snippet: snippet(&article.body, q),
+            rule: article.rule.clone(),
+            title: article.title.clone(),
+            effective: article.effective.clone(),
+        })
+    }
+
+    fn reverse_neighbors(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
+        let Some(node) = self.node_indices.get(id).copied() else {
+            return Vec::new();
+        };
+        let mut out = BTreeSet::new();
+        for edge in self.graph.edges_directed(node, petgraph::Incoming) {
+            if accept(*edge.weight()) {
+                out.insert(self.graph[edge.source()].clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    fn forward_traversal(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
+        let Some(start) = self.node_indices.get(id).copied() else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::from([start]);
+        while let Some(node) = queue.pop_front() {
+            for edge in self.graph.edges(node) {
+                if !accept(*edge.weight()) {
+                    continue;
+                }
+                let next = edge.target();
+                let next_id = self.graph[next].clone();
+                if seen.insert(next_id) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        seen.remove(id);
+        seen.into_iter().collect()
+    }
+}
+
+pub fn parse_article_markdown(path: impl AsRef<Path>) -> Result<Article> {
+    parse_article_markdown_str(&fs::read_to_string(path.as_ref())?)
+}
+
+pub fn parse_article_markdown_str(input: &str) -> Result<Article> {
+    let Some(rest) = input.strip_prefix("---\n") else {
+        return Err(RulesCoreError::InvalidArticle(
+            "missing YAML frontmatter".to_string(),
+        ));
+    };
+    let Some((frontmatter, body)) = rest.split_once("\n---") else {
+        return Err(RulesCoreError::InvalidArticle(
+            "unterminated YAML frontmatter".to_string(),
+        ));
+    };
+    let frontmatter: ArticleFrontmatter = serde_yaml::from_str(frontmatter)?;
+    let body = body.trim_start_matches('\n').to_string();
+    let id = format!(
+        "{}{}{}",
+        slugify_rule(&frontmatter.rule),
+        ARTICLE_ID_SEPARATOR,
+        frontmatter.article
+    );
+    let mut meta = BTreeMap::new();
+    if let Some(supersedes) = frontmatter.supersedes {
+        meta.insert("supersedes".to_string(), supersedes);
+    }
+
+    Ok(Article {
+        id,
+        institution: frontmatter.institution,
+        rule: frontmatter.rule,
+        article: frontmatter.article,
+        title: frontmatter.title,
+        effective: frontmatter.effective,
+        amended: frontmatter.amended,
+        status: frontmatter.status,
+        body,
+        legal_basis: frontmatter.legal_basis,
+        refs: frontmatter.refs,
+        prev_id: None,
+        next_id: None,
+        meta,
+    })
+}
+
+pub fn load_articles_dir(path: impl AsRef<Path>) -> Result<Vec<Article>> {
+    let mut articles = Vec::new();
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|e| e.to_str()) != Some("md")
+        {
+            continue;
+        }
+        articles.push(parse_article_markdown(entry.path())?);
+    }
+    articles.sort_by(|a, b| {
+        a.rule
+            .cmp(&b.rule)
+            .then_with(|| article_sort_key(&a.article).cmp(&article_sort_key(&b.article)))
+    });
+    Ok(articles)
+}
+
+pub fn verify_manifest(root: impl AsRef<Path>, manifest: &PackManifest) -> Result<()> {
+    let root = root.as_ref();
+    if manifest.schema_version != 1 {
+        return Err(RulesCoreError::UnsupportedSchema(manifest.schema_version));
+    }
+    let manifest_files = normalize_manifest_paths(manifest)?;
+    let actual_files = list_pack_files(root)?;
+    for path in actual_files.difference(&manifest_files) {
+        if path != "manifest.json" {
+            return Err(RulesCoreError::UnlistedPackFile(path.clone()));
+        }
+    }
+    for (relative_path, expected) in &manifest.files {
+        let path = root.join(safe_relative_path(relative_path)?);
+        if !path.is_file() {
+            return Err(RulesCoreError::MissingManifestEntry(relative_path.clone()));
+        }
+        let actual = sha256_file(&path)?;
+        let expected = expected.to_ascii_lowercase();
+        if actual != expected {
+            return Err(RulesCoreError::DigestMismatch {
+                path: relative_path.clone(),
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn unpack_pack_archive(
+    archive_path: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<()> {
+    let file = File::open(archive_path)?;
+    let decoder = zstd::stream::read::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let path_key = path_to_manifest_key(&path);
+        safe_relative_path(&path_key)
+            .map_err(|_| RulesCoreError::UnsupportedArchiveEntry(path_key.clone()))?;
+
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Directory => {
+                if !entry.unpack_in(destination.as_ref())? {
+                    return Err(RulesCoreError::UnsupportedArchiveEntry(path_key));
+                }
+            }
+            _ => return Err(RulesCoreError::UnsupportedArchiveEntry(path_key)),
+        }
+    }
+    Ok(())
+}
+
+pub fn slugify_rule(rule: &str) -> String {
+    let slug: String = rule
+        .nfc()
+        .map(|c| if c == '\u{00a0}' { ' ' } else { c })
+        .filter(|c| {
+            !c.is_whitespace()
+                && (c.is_alphanumeric()
+                    || *c == '_'
+                    || ('가'..='힣').contains(c)
+                    || matches!(*c, '·' | 'ㆍ' | '․' | '.' | '-'))
+        })
+        .collect();
+    if slug.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(rule.as_bytes());
+        format!("{:x}", hasher.finalize())[..12].to_string()
+    } else {
+        slug
+    }
+}
+
+pub fn rrf_fuse(rankings: Vec<Vec<SearchHit>>, k: usize) -> Vec<SearchHit> {
+    let mut scored: BTreeMap<String, (SearchHit, f32)> = BTreeMap::new();
+    for ranking in rankings {
+        for (rank, hit) in ranking.into_iter().enumerate() {
+            let score = 1.0 / (60.0 + rank as f32 + 1.0);
+            scored
+                .entry(hit.article_id.clone())
+                .and_modify(|(existing, total)| {
+                    *total += score;
+                    if hit.score > existing.score {
+                        *existing = hit.clone();
+                    }
+                })
+                .or_insert((hit, score));
+        }
+    }
+
+    let mut hits: Vec<_> = scored
+        .into_values()
+        .map(|(mut hit, score)| {
+            hit.score = score;
+            hit
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.article_id.cmp(&b.article_id))
+    });
+    hits.truncate(k);
+    hits
+}
+
+fn merge_pinned_hits(
+    pinned: Option<SearchHit>,
+    mut ranked: Vec<SearchHit>,
+    k: usize,
+) -> Vec<SearchHit> {
+    let Some(pinned) = pinned else {
+        ranked.truncate(k);
+        return ranked;
+    };
+    ranked.retain(|hit| hit.article_id != pinned.article_id);
+    let mut out = Vec::with_capacity(k.min(ranked.len() + 1));
+    out.push(pinned);
+    out.extend(ranked.into_iter().take(k.saturating_sub(1)));
+    out
+}
+
+fn direct_article_ref(q: &str, fallback_rule: Option<&str>) -> Option<(String, String)> {
+    let (article_start, article_end, article) = find_article_ref(q)?;
+    let rule = q[..article_start]
+        .split_whitespace()
+        .last()
+        .map(trim_rule_reference_suffix)
+        .filter(|candidate| !candidate.is_empty())
+        .or(fallback_rule)?;
+    let suffix = q[article_end..].chars().next();
+    if suffix.is_some_and(|c| c.is_ascii_digit() || c == '의') {
+        return None;
+    }
+    Some((slugify_rule(rule), article))
+}
+
+fn find_article_ref(q: &str) -> Option<(usize, usize, String)> {
+    let mut iter = q.char_indices().peekable();
+    while let Some((start, ch)) = iter.next() {
+        if ch != '제' {
+            continue;
+        }
+        let Some((_, next)) = iter.peek().copied() else {
+            continue;
+        };
+        if !next.is_ascii_digit() {
+            continue;
+        }
+
+        let mut main_digits = String::new();
+        while let Some((_, digit)) = iter.peek().copied() {
+            if !digit.is_ascii_digit() {
+                break;
+            }
+            main_digits.push(digit);
+            iter.next();
+        }
+        let Some((idx, '조')) = iter.peek().copied() else {
+            continue;
+        };
+        let mut end = idx + '조'.len_utf8();
+        iter.next();
+
+        let mut article = format!("제{main_digits}조");
+        if let Some((idx, '의')) = iter.peek().copied() {
+            let mut lookahead = iter.clone();
+            lookahead.next();
+            let mut sub_digits = String::new();
+            let mut sub_end = idx + '의'.len_utf8();
+            while let Some((digit_idx, digit)) = lookahead.peek().copied() {
+                if !digit.is_ascii_digit() {
+                    break;
+                }
+                sub_digits.push(digit);
+                sub_end = digit_idx + digit.len_utf8();
+                lookahead.next();
+            }
+            if !sub_digits.is_empty() {
+                article.push('의');
+                article.push_str(&sub_digits);
+                end = sub_end;
+            }
+        }
+        return Some((start, end, article));
+    }
+    None
+}
+
+fn trim_rule_reference_suffix(rule: &str) -> &str {
+    rule.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '상' | '의' | '은' | '는' | '이' | '가' | '을' | '를' | ':' | ',' | '，'
+        )
+    })
+}
+
+fn strip_korean_suffixes(mut term: &str) -> &str {
+    let punctuation = ['?', '!', '.', ',', ':', ';', '，', '。'];
+    term = term.trim_end_matches(punctuation);
+    for suffix in ["에서", "에게", "으로", "로서", "로써"] {
+        if let Some(stripped) = term.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    trim_rule_reference_suffix(term)
+}
+
+pub fn default_pack_status(
+    institution: impl Into<String>,
+    effective_date: impl Into<String>,
+) -> PackStatus {
+    PackStatus {
+        institution: institution.into(),
+        effective_date: effective_date.into(),
+        source_commit: "fixture".to_string(),
+        index_built_at: OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        stale: false,
+    }
+}
+
+fn build_search_index<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+) -> Result<(Index, SearchFields)> {
+    let mut schema_builder = Schema::builder();
+    let ko_text = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("ko")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_stored();
+    let id = schema_builder.add_text_field("id", STRING | STORED);
+    let rule = schema_builder.add_text_field("rule", ko_text.clone());
+    let title = schema_builder.add_text_field("title", ko_text.clone());
+    let effective = schema_builder.add_text_field("effective", STRING | STORED);
+    let body = schema_builder.add_text_field("body", ko_text);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    register_ko_tokenizer(&index);
+
+    let fields = SearchFields {
+        id,
+        rule,
+        title,
+        body,
+    };
+    let mut writer = index.writer(50_000_000)?;
+    for article in articles {
+        writer.add_document(doc!(
+            id => article.id.clone(),
+            rule => article.rule.clone(),
+            title => article.title.clone(),
+            effective => article.effective.clone(),
+            body => article.body.clone(),
+        ))?;
+    }
+    writer.commit()?;
+    Ok((index, fields))
+}
+
+#[cfg(feature = "korean-tokenizer")]
+fn register_ko_tokenizer(index: &Index) {
+    use lindera::dictionary::load_dictionary;
+    use lindera::mode::Mode;
+    use lindera::segmenter::Segmenter;
+
+    let tokenizer = load_dictionary("embedded://ko-dic")
+        .map(|dictionary| Segmenter::new(Mode::Normal, dictionary, None))
+        .map(lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter);
+    match tokenizer {
+        Ok(tokenizer) => index.tokenizers().register("ko", tokenizer),
+        Err(_) => register_simple_ko_tokenizer(index),
+    }
+}
+
+#[cfg(not(feature = "korean-tokenizer"))]
+fn register_ko_tokenizer(index: &Index) {
+    register_simple_ko_tokenizer(index);
+}
+
+fn register_simple_ko_tokenizer(index: &Index) {
+    use tantivy::tokenizer::TextAnalyzer;
+    index.tokenizers().register(
+        "ko",
+        TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default()).build(),
+    );
+}
+
+fn build_rule_summaries<'a>(articles: impl Iterator<Item = &'a Article>) -> Vec<RuleSummary> {
+    let mut by_rule: BTreeMap<String, RuleSummary> = BTreeMap::new();
+    for article in articles {
+        let entry = by_rule
+            .entry(article.rule.clone())
+            .or_insert_with(|| RuleSummary {
+                slug: slugify_rule(&article.rule),
+                name: article.rule.clone(),
+                article_count: 0,
+                effective: article.effective.clone(),
+            });
+        entry.article_count += 1;
+        if article.effective > entry.effective {
+            entry.effective = article.effective.clone();
+        }
+    }
+    by_rule.into_values().collect()
+}
+
+fn build_ref_graph<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+) -> (DiGraph<String, EdgeKind>, HashMap<String, NodeIndex>) {
+    let mut graph = DiGraph::new();
+    let mut node_indices = HashMap::new();
+    let ensure = |id: &str,
+                  graph: &mut DiGraph<String, EdgeKind>,
+                  node_indices: &mut HashMap<String, NodeIndex>| {
+        node_indices
+            .entry(id.to_string())
+            .or_insert_with(|| graph.add_node(id.to_string()))
+            .to_owned()
+    };
+
+    for node in nodes {
+        ensure(&node.id, &mut graph, &mut node_indices);
+    }
+
+    for article in articles {
+        let src = ensure(&article.id, &mut graph, &mut node_indices);
+        for article_ref in &article.refs {
+            let dst = ensure(&article_ref.target, &mut graph, &mut node_indices);
+            graph.add_edge(src, dst, edge_kind_from_ref(&article_ref.kind));
+        }
+        for basis in &article.legal_basis {
+            let law_id = format!("{}#{}", basis.law, basis.article);
+            let dst = ensure(&law_id, &mut graph, &mut node_indices);
+            graph.add_edge(src, dst, EdgeKind::LegalBasis);
+        }
+    }
+
+    for edge in edges {
+        let src = ensure(&edge.src, &mut graph, &mut node_indices);
+        let dst = ensure(&edge.dst, &mut graph, &mut node_indices);
+        graph.add_edge(src, dst, edge.kind);
+    }
+
+    (graph, node_indices)
+}
+
+fn link_neighbors(articles: &mut BTreeMap<String, Article>) {
+    let mut by_rule: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for article in articles.values() {
+        by_rule
+            .entry(article.rule.clone())
+            .or_default()
+            .push(article.id.clone());
+    }
+    for ids in by_rule.values_mut() {
+        ids.sort_by(|a, b| {
+            let aa = articles
+                .get(a)
+                .map(|article| article.article.as_str())
+                .unwrap_or_default();
+            let bb = articles
+                .get(b)
+                .map(|article| article.article.as_str())
+                .unwrap_or_default();
+            article_sort_key(aa).cmp(&article_sort_key(bb))
+        });
+        for (idx, id) in ids.iter().enumerate() {
+            let prev = idx.checked_sub(1).and_then(|i| ids.get(i)).cloned();
+            let next = ids.get(idx + 1).cloned();
+            if let Some(article) = articles.get_mut(id) {
+                article.prev_id = prev;
+                article.next_id = next;
+            }
+        }
+    }
+}
+
+fn article_sort_key(article: &str) -> (u32, u32, String) {
+    let before_sub = article.split('의').next().unwrap_or(article);
+    let main = before_sub
+        .split('조')
+        .next()
+        .unwrap_or(before_sub)
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    let sub = article
+        .split_once('의')
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0);
+    (main, sub, article.to_string())
+}
+
+fn edge_kind_from_ref(kind: &str) -> EdgeKind {
+    match kind {
+        "준용" => EdgeKind::ApplyMutatis,
+        "위임" => EdgeKind::Delegates,
+        "단서예외" => EdgeKind::ExceptWhen,
+        _ => EdgeKind::Cites,
+    }
+}
+
+fn load_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for line in fs::read_to_string(path)?.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(line)?);
+    }
+    Ok(out)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let len = file.read(&mut buf)?;
+        if len == 0 {
+            break;
+        }
+        hasher.update(&buf[..len]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn lexical_fallback<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    q: &str,
+    k: usize,
+    filter: Option<&RuleFilter>,
+) -> Vec<SearchHit> {
+    lexical_rank(articles, q, k, filter)
+}
+
+fn lexical_rank<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    q: &str,
+    k: usize,
+    filter: Option<&RuleFilter>,
+) -> Vec<SearchHit> {
+    let terms = lexical_query_terms(q);
+    let mut hits = Vec::new();
+    for article in articles {
+        if !matches_filter(article, filter) {
+            continue;
+        }
+        let score = terms.iter().fold(0.0, |score, term| {
+            score
+                + if article.rule.contains(term.as_str()) {
+                    3.0
+                } else {
+                    0.0
+                }
+                + if article.title.contains(term.as_str()) {
+                    2.0
+                } else {
+                    0.0
+                }
+                + if article.article.contains(term.as_str()) {
+                    1.5
+                } else {
+                    0.0
+                }
+                + if article.body.contains(term.as_str()) {
+                    1.0
+                } else {
+                    0.0
+                }
+        });
+        if score > 0.0 {
+            hits.push(SearchHit {
+                article_id: article.id.clone(),
+                score,
+                snippet: snippet(&article.body, q),
+                rule: article.rule.clone(),
+                title: article.title.clone(),
+                effective: article.effective.clone(),
+            });
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.article_id.cmp(&b.article_id))
+    });
+    hits.truncate(k);
+    hits
+}
+
+fn lexical_query_terms(q: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in q.split_whitespace() {
+        let stripped = strip_korean_suffixes(raw);
+        for term in [
+            raw.trim_matches(|c: char| c.is_ascii_punctuation()),
+            stripped,
+        ] {
+            if term.chars().count() >= 2 && !terms.iter().any(|existing| existing == term) {
+                terms.push(term.to_string());
+            }
+        }
+    }
+    terms
+}
+
+fn rule_query_terms(q: &str) -> Vec<String> {
+    lexical_query_terms(q)
+        .into_iter()
+        .filter(|term| looks_like_rule_name(term))
+        .collect()
+}
+
+fn looks_like_rule_name(term: &str) -> bool {
+    [
+        "규정",
+        "규칙",
+        "강령",
+        "정관",
+        "조례",
+        "법",
+        "시행령",
+        "시행규칙",
+    ]
+    .iter()
+    .any(|suffix| term.ends_with(suffix))
+}
+
+fn matches_filter(article: &Article, filter: Option<&RuleFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    filter
+        .institution
+        .as_ref()
+        .is_none_or(|v| &article.institution == v)
+        && filter.rule.as_ref().is_none_or(|v| &article.rule == v)
+        && filter.status.as_ref().is_none_or(|v| &article.status == v)
+        && filter
+            .effective
+            .as_ref()
+            .is_none_or(|v| &article.effective == v)
+}
+
+fn normalize_manifest_paths(manifest: &PackManifest) -> Result<BTreeSet<String>> {
+    manifest
+        .files
+        .keys()
+        .map(|path| safe_relative_path(path).map(|p| path_to_manifest_key(&p)))
+        .collect()
+}
+
+fn safe_relative_path(path: &str) -> Result<PathBuf> {
+    let raw = Path::new(path);
+    if raw.is_absolute() || path.is_empty() {
+        return Err(RulesCoreError::UnsafePackPath(path.to_string()));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            _ => return Err(RulesCoreError::UnsafePackPath(path.to_string())),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(RulesCoreError::UnsafePackPath(path.to_string()));
+    }
+    Ok(normalized)
+}
+
+fn list_pack_files(root: &Path) -> Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+    collect_files(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_files(root: &Path, current: &Path, files: &mut BTreeSet<String>) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path.strip_prefix(root).expect("path is inside root");
+            files.insert(path_to_manifest_key(relative));
+        }
+    }
+    Ok(())
+}
+
+fn path_to_manifest_key(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn first_text(doc: &TantivyDocument, field: Field) -> Option<&str> {
+    doc.get_first(field).and_then(|value| value.as_str())
+}
+
+fn snippet(body: &str, q: &str) -> String {
+    let needle = q.split_whitespace().next().unwrap_or_default();
+    if needle.is_empty() {
+        return body.chars().take(120).collect();
+    }
+    let Some(pos) = body.find(needle) else {
+        return body.chars().take(120).collect();
+    };
+    let start = body[..pos]
+        .char_indices()
+        .rev()
+        .nth(40)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let end = body[pos..]
+        .char_indices()
+        .nth(80)
+        .map(|(idx, _)| pos + idx)
+        .unwrap_or(body.len());
+    body[start..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_articles() -> Vec<Article> {
+        [
+            r#"---
+institution: cni
+rule: 복무규정
+article: 제18조
+title: 연차휴가
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+supersedes: null
+legal_basis:
+  - law: 근로기준법
+    article: 제60조
+    mst: "265959"
+refs: []
+---
+① 직원의 연차휴가는 근로기준법에 따른다.
+"#,
+            r#"---
+institution: cni
+rule: 여비규정
+article: 제12조
+title: 일비
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+supersedes: null
+legal_basis: []
+refs:
+  - target: 복무규정#제18조
+    type: 준용
+---
+① 국내 출장자에게는 일비를 지급한다. 휴가 중 출장은 복무규정을 준용한다.
+"#,
+            r#"---
+institution: cni
+rule: 여비규정
+article: 제13조
+title: 숙박비
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+supersedes: null
+legal_basis: []
+refs:
+  - target: 여비규정#제12조
+    type: 인용
+---
+① 숙박비는 출장지와 일비 지급 기준을 고려하여 지급한다.
+"#,
+        ]
+        .into_iter()
+        .map(parse_article_markdown_str)
+        .collect::<Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_frontmatter_article_id_and_refs() {
+        let article = fixture_articles().remove(1);
+        assert_eq!(article.id, "여비규정#제12조");
+        assert_eq!(article.legal_basis.len(), 0);
+        assert_eq!(article.refs[0].target, "복무규정#제18조");
+    }
+
+    #[test]
+    fn builds_index_and_searches_articles() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let hits = index.search("일비 출장", 5, None);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].article_id, "여비규정#제12조");
+
+        let filtered = index.search(
+            "연차휴가",
+            5,
+            Some(RuleFilter {
+                rule: Some("복무규정".to_string()),
+                ..RuleFilter::default()
+            }),
+        );
+        assert_eq!(filtered[0].article_id, "복무규정#제18조");
+    }
+
+    #[test]
+    fn searches_rule_name_and_title_fields_with_boost() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let by_rule = index.search("여비규정은 무엇을 정하는가", 5, None);
+        assert!(by_rule
+            .iter()
+            .take(2)
+            .any(|hit| hit.article_id == "여비규정#제12조"));
+
+        let by_title = index.search("숙박비 기준", 5, None);
+        assert_eq!(by_title[0].article_id, "여비규정#제13조");
+    }
+
+    #[test]
+    fn pins_direct_article_reference_when_id_exists() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let hits = index.search("여비규정 제13조는 현재 어떤 상태인가?", 5, None);
+        assert_eq!(hits[0].article_id, "여비규정#제13조");
+    }
+
+    #[test]
+    fn direct_article_reference_uses_filter_rule_when_query_omits_rule_name() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let hits = index.search(
+            "제18조는 무엇인가?",
+            5,
+            Some(RuleFilter {
+                rule: Some("복무규정".to_string()),
+                ..RuleFilter::default()
+            }),
+        );
+        assert_eq!(hits[0].article_id, "복무규정#제18조");
+    }
+
+    #[test]
+    fn direct_article_reference_parser_handles_sub_articles_and_suffix_particles() {
+        assert_eq!(
+            direct_article_ref("인사관리규정상 제19조의2는 무엇인가?", None),
+            Some(("인사관리규정".to_string(), "제19조의2".to_string()))
+        );
+        assert_eq!(
+            direct_article_ref("제18조는 무엇인가?", Some("복무규정")),
+            Some(("복무규정".to_string(), "제18조".to_string()))
+        );
+        assert_eq!(direct_article_ref("인사관리규정 제19조의는?", None), None);
+    }
+
+    #[test]
+    fn gets_article_neighbors_and_legal_basis() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let article = index.get_article("여비규정#제12조").unwrap();
+        assert_eq!(article.next_id.as_deref(), Some("여비규정#제13조"));
+        assert_eq!(index.related_laws("복무규정#제18조")[0].law, "근로기준법");
+        assert_eq!(index.list_rules().len(), 2);
+    }
+
+    #[test]
+    fn computes_impact_from_reverse_refs_and_delegation_chain() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let impact = index.impact("복무규정#제18조");
+        assert_eq!(impact.reverse_citations, vec!["여비규정#제12조"]);
+
+        let travel_impact = index.impact("여비규정#제12조");
+        assert_eq!(travel_impact.reverse_citations, vec!["여비규정#제13조"]);
+        assert_eq!(travel_impact.delegation_chain, vec!["복무규정#제18조"]);
+    }
+
+    // --- 조문 파서 경계: 제N조의M ---
+
+    fn article_md(rule: &str, article: &str, title: &str, body: &str) -> String {
+        format!(
+            "---\ninstitution: cni\nrule: {rule}\narticle: {article}\ntitle: {title}\neffective: 2026-02-27\namended: 2026-02-27\nstatus: active\nsupersedes: null\nlegal_basis: []\nrefs: []\n---\n{body}\n"
+        )
+    }
+
+    #[test]
+    fn parses_article_id_for_sub_numbered_article() {
+        let article = parse_article_markdown_str(&article_md(
+            "인사관리규정",
+            "제19조의2",
+            "결원보충",
+            "① 본문",
+        ))
+        .unwrap();
+        assert_eq!(article.id, "인사관리규정#제19조의2");
+        assert_eq!(article.article, "제19조의2");
+    }
+
+    #[test]
+    fn slugify_rule_matches_pipeline_canonical_golden_cases() {
+        assert_eq!(slugify_rule(" 여비 지급 규칙 "), "여비지급규칙");
+        assert_eq!(
+            slugify_rule("안전\u{00a0}· 보건 관리규칙"),
+            "안전·보건관리규칙"
+        );
+        assert_eq!(slugify_rule("A/B: CNI Rules!"), "ABCNIRules");
+        assert_eq!(slugify_rule("e\u{301} 규정"), "é규정");
+    }
+
+    #[test]
+    fn preserves_nested_hang_structure_verbatim_in_body() {
+        let body = "① 첫째 항이다.\n② 둘째 항이다. 1. 첫째 호\n2. 둘째 호\n③ 셋째 항, 단서예외를 포함한다.";
+        let article =
+            parse_article_markdown_str(&article_md("여비지급규칙", "제12조", "항공운임", body))
+                .unwrap();
+        assert_eq!(article.body, format!("{body}\n"));
+        assert!(article.body.contains("① 첫째"));
+        assert!(article.body.contains("② 둘째"));
+        assert!(article.body.contains("③ 셋째"));
+    }
+
+    #[test]
+    fn orders_neighbors_so_sub_numbered_article_sits_between_base_articles() {
+        let articles = vec![
+            parse_article_markdown_str(&article_md("인사관리규정", "제19조", "채용", "① 본문"))
+                .unwrap(),
+            parse_article_markdown_str(&article_md(
+                "인사관리규정",
+                "제19조의2",
+                "결원보충",
+                "① 본문",
+            ))
+            .unwrap(),
+            parse_article_markdown_str(&article_md("인사관리규정", "제20조", "임용", "① 본문"))
+                .unwrap(),
+        ];
+        let index =
+            TantivyRulesIndex::from_articles(articles, default_pack_status("cni", "2026-02-27"))
+                .unwrap();
+
+        let base = index.get_article("인사관리규정#제19조").unwrap();
+        assert_eq!(base.next_id.as_deref(), Some("인사관리규정#제19조의2"));
+
+        let sub = index.get_article("인사관리규정#제19조의2").unwrap();
+        assert_eq!(sub.prev_id.as_deref(), Some("인사관리규정#제19조"));
+        assert_eq!(sub.next_id.as_deref(), Some("인사관리규정#제20조"));
+
+        let next = index.get_article("인사관리규정#제20조").unwrap();
+        assert_eq!(next.prev_id.as_deref(), Some("인사관리규정#제19조의2"));
+    }
+
+    #[test]
+    fn rejects_article_markdown_without_frontmatter() {
+        let err = parse_article_markdown_str("본문만 있고 프론트매터가 없음").unwrap_err();
+        assert!(matches!(err, RulesCoreError::InvalidArticle(_)));
+    }
+
+    #[test]
+    fn rejects_article_markdown_with_unterminated_frontmatter() {
+        let err = parse_article_markdown_str("---\nrule: 여비규정\n\n본문").unwrap_err();
+        assert!(matches!(err, RulesCoreError::InvalidArticle(_)));
+    }
+
+    // --- 팩 sha256 위변조 (rules-core 자체 verify_manifest / from_pack_dir 경로) ---
+
+    fn write_pack_fixture(root: &Path) -> PackManifest {
+        let articles_dir = root.join("articles");
+        fs::create_dir_all(&articles_dir).unwrap();
+        let content = article_md("여비지급규칙", "제12조", "항공운임", "① 본문");
+        fs::write(articles_dir.join("제12조.md"), &content).unwrap();
+
+        let hash = sha256_file(&articles_dir.join("제12조.md")).unwrap();
+        let manifest = PackManifest {
+            schema_version: 1,
+            institution: "cni".to_string(),
+            effective_date: "2026-02-27".to_string(),
+            source_commit: "abc123".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            files: BTreeMap::from([("articles/제12조.md".to_string(), hash)]),
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn verify_manifest_accepts_untampered_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_pack_fixture(temp.path());
+        verify_manifest(temp.path(), &manifest).unwrap();
+    }
+
+    #[test]
+    fn verify_manifest_rejects_tampered_article_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = write_pack_fixture(temp.path());
+
+        // Tamper the article after the manifest digest was computed.
+        fs::write(
+            temp.path().join("articles/제12조.md"),
+            "attacker-modified content",
+        )
+        .unwrap();
+
+        let err = verify_manifest(temp.path(), &manifest).unwrap_err();
+        assert!(matches!(err, RulesCoreError::DigestMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_manifest_rejects_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = write_pack_fixture(temp.path());
+        manifest
+            .files
+            .insert("articles/누락.md".to_string(), "0".repeat(64));
+
+        let err = verify_manifest(temp.path(), &manifest).unwrap_err();
+        assert!(matches!(err, RulesCoreError::MissingManifestEntry(_)));
+    }
+
+    #[test]
+    fn from_pack_dir_rejects_tampered_pack_before_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pack_fixture(temp.path());
+        fs::write(
+            temp.path().join("articles/제12조.md"),
+            "attacker-modified content",
+        )
+        .unwrap();
+
+        let err = TantivyRulesIndex::from_pack_dir(temp.path()).unwrap_err();
+        assert!(matches!(err, RulesCoreError::DigestMismatch { .. }));
+    }
+
+    #[test]
+    fn from_pack_dir_loads_untampered_pack_and_is_searchable() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pack_fixture(temp.path());
+
+        let index = TantivyRulesIndex::from_pack_dir(temp.path()).unwrap();
+        let hits = index.search("항공운임", 5, None);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].article_id, "여비지급규칙#제12조");
+    }
+}

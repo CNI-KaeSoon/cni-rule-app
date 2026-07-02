@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cargo run --release -p rules-core --example eval --features korean-tokenizer 2>/dev/null > /tmp/../private/tmp/claude-501/-Users-kaesoon-Projects-cni-rule/929ade20-1fb3-4e37-baa7-1e986c197...",
+  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<stdin>\", line 3, in <module>\nFileNotFoundError: [Errno 2] No such file or directory: '/private/tmp/claude-501/-Users-kaesoon-Projects-cni-rule/929ade20-1fb3-4e37-baa7-1e986c197f88/scratchpad/eval-out.txt'",
+  "timestamp": "2026-07-02T08:28:26.204Z",
+  "retry_count": 1
+}

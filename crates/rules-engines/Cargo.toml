@@ -1,0 +1,26 @@
+[package]
+name = "rules-engines"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+korean-tokenizer = ["rules-core/korean-tokenizer"]
+
+[dependencies]
+async-stream = "0.3"
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rules-core = { path = "../rules-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "process", "rt", "time"] }
+which = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

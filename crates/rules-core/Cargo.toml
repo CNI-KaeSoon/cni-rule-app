@@ -1,0 +1,52 @@
+[package]
+name = "rules-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+petgraph = "0.6"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tantivy = "0.25"
+tar = "0.4"
+tempfile = "3"
+thiserror = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+toml = "0.8"
+unicode-normalization = "0.1"
+walkdir = "2"
+zstd = "0.13"
+
+[dependencies.fastembed]
+version = "5"
+optional = true
+
+[dependencies.rusqlite]
+version = "0.37"
+features = ["bundled"]
+optional = true
+
+[dependencies.sqlite-vec]
+version = "0.1"
+optional = true
+
+[dependencies.lindera-tantivy]
+version = "2.0"
+features = ["embed-ko-dic"]
+optional = true
+
+[dependencies.lindera]
+version = "2.3"
+features = ["embed-ko-dic"]
+optional = true
+
+[features]
+default = ["korean-tokenizer"]
+korean-tokenizer = ["dep:lindera", "dep:lindera-tantivy"]
+vectors = ["dep:fastembed", "dep:rusqlite", "dep:sqlite-vec"]
