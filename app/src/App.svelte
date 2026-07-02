@@ -13,6 +13,12 @@
     type ModeLabel,
     type ThemeChoice
   } from "./lib/constants";
+  import {
+    appendAssistantDelta,
+    extractCitationRefs,
+    parseCitationSegments,
+    type ChatMessage
+  } from "./lib/chat";
 
   type Screen = "start" | "interpret" | "labor" | "compare" | "engine" | "settings";
   type SidebarTab = "chat" | "article";
@@ -34,6 +40,48 @@
     };
     source_pages: number[];
   };
+  type Conversation = {
+    id: string;
+    title: string;
+    mode: string;
+    engine: string;
+    created_at: string;
+    updated_at: string;
+    deleted_at: string | null;
+  };
+  type ConversationDetail = {
+    conversation: Conversation;
+    messages: ChatMessage[];
+  };
+  type ConversationGroup = {
+    group: string;
+    items: Conversation[];
+  };
+  type EngineKind = "ChatGpt" | "Claude" | "Gemini" | { ApiKey: "OpenAi" | "Anthropic" | "Google" | { Custom: string } };
+  type EngineStatusDto = {
+    kind: EngineKind;
+    label: string;
+    status: "Installed" | "NeedsLogin" | "Ready" | "Missing" | string;
+  };
+  type UpdateStatus = {
+    institution: string;
+    effective_date: string;
+    source_commit: string;
+    index_built_at: string;
+    stale: boolean;
+  };
+  type UpdateProgress = {
+    stage: string;
+    message: string;
+  };
+  type SearchHit = {
+    article_id: string;
+    score: number;
+    snippet: string;
+    rule: string;
+    title: string;
+    effective: string;
+  };
 
   let screen: Screen = "start";
   let activeMode: ModeLabel = "규정해석";
@@ -51,30 +99,27 @@
   let telemetryInstallId = "";
   let telemetryStatus = "";
   let telemetryLoaded = false;
-
-  const conversations = [
-    { group: "오늘", items: ["국내 출장 시 일비는 얼마인가요?", "겸직 허가 절차 문의"] },
-    { group: "어제", items: ["육아휴직 복직 관련 상담"] },
-    { group: "지난 7일", items: ["타 기관 육아휴직 규정 비교", "연차휴가 이월 기준 질의", "복무규정 개정 사항 확인"] }
-  ];
+  let conversations: Conversation[] = [];
+  let activeConversationId: string | null = null;
+  let messages: ChatMessage[] = [];
+  let conversationSearch = "";
+  let engines: EngineStatusDto[] = [];
+  let activeEngine: EngineStatusDto | null = null;
+  let updateStatus: UpdateStatus | null = null;
+  let updateProgress: UpdateProgress | null = null;
+  let updateBusy = false;
+  let updateMessage = "";
+  let articleSearch = "";
+  let searchHits: SearchHit[] = [];
+  let selectedArticle: RulebookArticle | null = null;
+  let settings: { key: string; value: string }[] = [];
 
   $: document.documentElement.setAttribute("data-theme", theme);
-
-  const fallbackRulebook: RulebookArticle[] = [
-    {
-      article: {
-        id: "여비규정#제12조",
-        rule: "여비규정",
-        article: "제12조",
-        title: "일비",
-        body:
-          "① 국내 출장자에게는 출장 일수에 따라 일비를 지급한다.\n② 일비는 직급별로 구분하여 정액으로 지급하며, 구체적인 금액은 별표에 따른다.\n③ 같은 날 2개소 이상을 순회 출장하는 경우에도 일비는 1일분만 지급한다.",
-        effective: "2026-02-27",
-        amended: "2026-02-27"
-      },
-      source_pages: [176]
-    }
-  ];
+  $: conversationGroups = groupConversations(conversations.filter((item) => item.title.includes(conversationSearch.trim())));
+  $: visibleArticles = selectedArticle
+    ? [selectedArticle]
+    : rulebookArticles.slice(0, 18);
+  $: engineLabel = activeEngine?.label ?? "엔진";
 
   function openScreen(next: Screen) {
     screen = next;
@@ -88,12 +133,123 @@
     sidebarTab = next === "interpret" || next === "engine" || next === "settings" ? "article" : "chat";
   }
 
+  function groupConversations(items: Conversation[]): ConversationGroup[] {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const groups = new Map<string, Conversation[]>();
+    for (const item of items) {
+      const updated = new Date(item.updated_at).getTime();
+      const days = Math.floor((startOfToday - new Date(new Date(updated).getFullYear(), new Date(updated).getMonth(), new Date(updated).getDate()).getTime()) / 86_400_000);
+      const label = days <= 0 ? "오늘" : days === 1 ? "어제" : days <= 7 ? "지난 7일" : "이전";
+      groups.set(label, [...(groups.get(label) ?? []), item]);
+    }
+    return ["오늘", "어제", "지난 7일", "이전"]
+      .map((group) => ({ group, items: groups.get(group) ?? [] }))
+      .filter((group) => group.items.length > 0);
+  }
+
+  function engineStatusLabel(status: string, label = "") {
+    if (label === "Gemini") return "API 키 필요";
+    if (status === "Ready" || status === "Installed") return "연결됨";
+    if (status === "NeedsLogin") return "로그인 필요";
+    return "미설치";
+  }
+
+  function engineDotClass(status: string, label = "") {
+    if (status === "Ready" || status === "Installed") return "connected";
+    if (label === "Gemini") return "key";
+    return "";
+  }
+
+  function sameEngine(a: EngineKind, b: EngineKind) {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  function messageParagraphs(content: string) {
+    return content
+      .replace(LABOR_DISCLAIMER, "")
+      .split(/\n{2,}/)
+      .map((paragraph) => paragraph.trim())
+      .filter((paragraph) => paragraph.length > 0);
+  }
+
   async function loadRulebook() {
     try {
       const result = await invoke<{ articles: RulebookArticle[] }>("get_rulebook");
       rulebookArticles = result.articles;
     } catch {
-      rulebookArticles = fallbackRulebook;
+      rulebookArticles = [];
+    }
+  }
+
+  async function loadConversations() {
+    try {
+      conversations = await invoke<Conversation[]>("conversations_list", { includeDeleted: false });
+    } catch {
+      conversations = [];
+    }
+  }
+
+  async function loadConversation(id: string) {
+    try {
+      const detail = await invoke<ConversationDetail>("conversations_get", { id });
+      activeConversationId = detail.conversation.id;
+      messages = detail.messages;
+      screen = detail.conversation.mode === "Labor" ? "labor" : detail.conversation.mode === "Compare" ? "compare" : "interpret";
+      activeMode = detail.conversation.mode === "Labor" ? "노무상담" : detail.conversation.mode === "Compare" ? "규정비교" : "규정해석";
+      mainView = "chat";
+      sidebarTab = "chat";
+    } catch {
+      updateMessage = "대화를 불러오지 못했습니다.";
+    }
+  }
+
+  function startNewConversation() {
+    activeConversationId = null;
+    messages = [];
+    prompt = "";
+    openScreen("start");
+  }
+
+  async function renameConversation(id: string, currentTitle: string) {
+    const title = window.prompt("대화 이름", currentTitle)?.trim();
+    if (!title || title === currentTitle) return;
+    try {
+      await invoke("conversations_rename", { id, title });
+      await loadConversations();
+    } catch {
+      updateMessage = "대화 이름을 바꾸지 못했습니다.";
+    }
+  }
+
+  async function trashConversation(id: string) {
+    if (!window.confirm("이 대화를 휴지통으로 이동할까요?")) return;
+    try {
+      await invoke("conversations_delete_to_trash", { id });
+      if (activeConversationId === id) startNewConversation();
+      await loadConversations();
+    } catch {
+      updateMessage = "대화를 휴지통으로 이동하지 못했습니다.";
+    }
+  }
+
+  async function loadEngines() {
+    try {
+      engines = await invoke<EngineStatusDto[]>("list_engines");
+      activeEngine = await invoke<EngineStatusDto>("engine_status");
+    } catch {
+      engines = [];
+      activeEngine = null;
+    }
+  }
+
+  async function selectEngine(engine: EngineStatusDto) {
+    try {
+      activeEngine = await invoke<EngineStatusDto>("set_engine", { kind: engine.kind });
+      await loadEngines();
+      engineOpen = false;
+    } catch {
+      updateMessage = "엔진을 전환하지 못했습니다.";
     }
   }
 
@@ -109,6 +265,68 @@
     }
     await tick();
     document.getElementById(`page-${page}`)?.scrollIntoView({ block: "start" });
+  }
+
+  async function openArticle(id: string) {
+    try {
+      selectedArticle = await invoke<RulebookArticle>("get_article", { id });
+      sidebarTab = "article";
+      mainView = "rulebook";
+      const page = selectedArticle.source_pages[0];
+      if (page) await openRulebook(page);
+    } catch {
+      updateMessage = "조문을 불러오지 못했습니다.";
+    }
+  }
+
+  async function searchArticles() {
+    const q = articleSearch.trim();
+    if (!q) {
+      searchHits = [];
+      selectedArticle = null;
+      return;
+    }
+    try {
+      searchHits = await invoke<SearchHit[]>("search", { q, filter: null });
+    } catch {
+      searchHits = [];
+    }
+  }
+
+  async function checkAndApplyUpdate() {
+    if (updateBusy) return;
+    updateBusy = true;
+    updateMessage = "업데이트 확인 중";
+    try {
+      updateStatus = await invoke<UpdateStatus>("check_update");
+      updateMessage = "규정팩 적용 중";
+      updateStatus = await invoke<UpdateStatus>("apply_update");
+      updateMessage = "업데이트 완료";
+      await loadRulebook();
+    } catch {
+      updateMessage = "업데이트를 적용하지 못했습니다.";
+    } finally {
+      updateBusy = false;
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      settings = await invoke<{ key: string; value: string }[]>("settings_list");
+      const savedTheme = settings.find((item) => item.key === "theme")?.value;
+      if (savedTheme === "auto" || savedTheme === "light" || savedTheme === "dark") theme = savedTheme;
+    } catch {
+      settings = [];
+    }
+  }
+
+  async function saveTheme(next: ThemeChoice) {
+    theme = next;
+    try {
+      await invoke("settings_set", { key: "theme", value: next });
+    } catch {
+      // Browser preview without Tauri runtime keeps local UI state only.
+    }
   }
 
   async function loadTelemetrySettings() {
@@ -142,6 +360,9 @@
 
   onMount(() => {
     void loadRulebook();
+    void loadConversations();
+    void loadEngines();
+    void loadSettings();
     void loadTelemetrySettings();
     const unlisten = listen<{ page: number }>("rulebook://open", async (event) => {
       activeRulebookPage = event.payload.page;
@@ -150,8 +371,23 @@
       await tick();
       document.getElementById(`page-${event.payload.page}`)?.scrollIntoView({ block: "start" });
     }).catch(() => undefined);
+    const unlistenDelta = listen<{ conversation_id: string; content: string; done: boolean }>("chat://delta", (event) => {
+      if (event.payload.conversation_id !== activeConversationId) return;
+      messages = appendAssistantDelta(messages, event.payload.conversation_id, event.payload.content, event.payload.done);
+    }).catch(() => undefined);
+    const unlistenProgress = listen<UpdateProgress>("update://progress", (event) => {
+      updateProgress = event.payload;
+      updateMessage = event.payload.message;
+    }).catch(() => undefined);
+    const unlistenDone = listen<UpdateStatus>("update://done", (event) => {
+      updateStatus = event.payload;
+      updateMessage = "업데이트 완료";
+    }).catch(() => undefined);
     return () => {
       void unlisten.then((dispose) => dispose?.());
+      void unlistenDelta.then((dispose) => dispose?.());
+      void unlistenProgress.then((dispose) => dispose?.());
+      void unlistenDone.then((dispose) => dispose?.());
     };
   });
 
@@ -167,17 +403,38 @@
     if (!text) return;
     prompt = "";
     try {
-      const conversation = await invoke<{ id: string }>("conversations_create", {
-        title: text,
-        mode: toBackendMode(activeMode)
-      });
+      let conversationId = activeConversationId;
+      if (!conversationId) {
+        const conversation = await invoke<Conversation>("conversations_create", {
+          title: text,
+          mode: toBackendMode(activeMode)
+        });
+        conversationId = conversation.id;
+        activeConversationId = conversation.id;
+        await loadConversations();
+      }
+      screen = activeMode === "노무상담" ? "labor" : activeMode === "규정비교" ? "compare" : "interpret";
+      mainView = "chat";
+      messages = [
+        ...messages,
+        {
+          id: `local-${Date.now()}`,
+          conversation_id: conversationId,
+          role: "user",
+          content: text,
+          created_at: new Date().toISOString()
+        }
+      ];
       await invoke("send_chat", {
-        conversationId: conversation.id,
+        conversationId,
         mode: toBackendMode(activeMode),
         text
       });
+      const detail = await invoke<ConversationDetail>("conversations_get", { id: conversationId });
+      messages = detail.messages;
+      await loadConversations();
     } catch {
-      // The UI remains usable in browser preview without the Tauri runtime.
+      updateMessage = "답변을 가져오지 못했습니다.";
     }
   }
 </script>
@@ -188,15 +445,29 @@
       <button class="hamburger-btn" title="사이드바 열기/닫기" aria-label="사이드바 토글" on:click={() => (sidebarOpen = !sidebarOpen)}>☰</button>
       <div class:open={engineOpen} class="engine-picker-wrap">
         <button class="engine-picker" aria-haspopup="listbox" aria-expanded={engineOpen} on:click={() => (engineOpen = !engineOpen)}>
-          <span class="engine-dot" aria-hidden="true"></span>
-          <span>ChatGPT</span>
+          <span class="engine-dot {engineDotClass(activeEngine?.status ?? '', activeEngine?.label)}" aria-hidden="true"></span>
+          <span>{engineLabel}</span>
           <span class="chevron">▾</span>
         </button>
         <div class="engine-menu" role="listbox">
-          <button class="engine-item active" role="option" aria-selected="true"><span class="dot connected"></span>ChatGPT<span class="check">✓ 연결됨</span></button>
-          <button class="engine-item" role="option" aria-selected="false"><span class="dot"></span>Claude<span class="status">로그인 필요</span></button>
-          <button class="engine-item" role="option" aria-selected="false"><span class="dot"></span>Gemini<span class="status">로그인 필요</span></button>
-          <button class="engine-item" role="option" aria-selected="false"><span class="dot key"></span>API 키 직접 입력</button>
+          {#each engines as engine}
+            <button
+              class:active={activeEngine ? sameEngine(engine.kind, activeEngine.kind) : false}
+              class="engine-item"
+              role="option"
+              aria-selected={activeEngine ? sameEngine(engine.kind, activeEngine.kind) : false}
+              on:click={() => selectEngine(engine)}
+            >
+              <span class="dot {engineDotClass(engine.status, engine.label)}"></span>
+              {engine.label}
+              <span class={engine.status === "Ready" || engine.status === "Installed" ? "check" : "status"}>
+                {engineStatusLabel(engine.status, engine.label)}
+              </span>
+            </button>
+          {/each}
+          {#if !engines.length}
+            <div class="engine-empty">엔진 상태를 불러오는 중</div>
+          {/if}
         </div>
       </div>
       <span class="beta-badge">{BETA_BADGE_LABEL}</span>
@@ -209,11 +480,11 @@
     </nav>
 
     <div class="header-right">
-      <button class="icon-btn" title="규정 업데이트 확인 (1건)" on:click={() => void invoke("check_update").catch(() => undefined)}>🔄<span class="badge">1</span></button>
+      <button class="icon-btn" title="규정 업데이트 확인" on:click={() => void checkAndApplyUpdate()}>🔄{#if updateBusy}<span class="badge">…</span>{/if}</button>
       <div class="theme-toggle-group" role="group" aria-label="테마 선택">
-        <button class:active={theme === "auto"} class="theme-btn" title="자동 (시스템 설정)" on:click={() => (theme = "auto")}>🖥</button>
-        <button class:active={theme === "light"} class="theme-btn" title="라이트" on:click={() => (theme = "light")}>☀</button>
-        <button class:active={theme === "dark"} class="theme-btn" title="다크" on:click={() => (theme = "dark")}>🌙</button>
+        <button class:active={theme === "auto"} class="theme-btn" title="자동 (시스템 설정)" on:click={() => void saveTheme("auto")}>🖥</button>
+        <button class:active={theme === "light"} class="theme-btn" title="라이트" on:click={() => void saveTheme("light")}>☀</button>
+        <button class:active={theme === "dark"} class="theme-btn" title="다크" on:click={() => void saveTheme("dark")}>🌙</button>
       </div>
       <button class="icon-btn" title="설정" on:click={() => openScreen("settings")}>⚙</button>
     </div>
@@ -222,11 +493,11 @@
   <div class:sidebar-open={sidebarOpen} class="app-body">
     <aside class="sidebar">
       <div class="sidebar-header">
-        <button class="new-chat-btn" on:click={() => openScreen("start")}><span class="logo-badge">CNI</span> 새 대화</button>
+        <button class="new-chat-btn" on:click={startNewConversation}><span class="logo-badge">CNI</span> 새 대화</button>
       </div>
       <div class="sidebar-search">
         <span class="search-icon">⌕</span>
-        <input type="text" placeholder="대화 검색" />
+        <input type="text" placeholder="대화 검색" bind:value={conversationSearch} />
       </div>
       <div class="sidebar-tabs" role="tablist">
         <button class:active={sidebarTab === "chat"} class="sbtab" on:click={() => (sidebarTab = "chat")}>💬 대화</button>
@@ -235,19 +506,36 @@
 
       {#if sidebarTab === "chat"}
         <div class="sidebar-panel chat-panel">
-          {#each conversations as group}
+          {#each conversationGroups as group}
             <div class="convo-group-label">{group.group}</div>
-            {#each group.items as title}
-              <div class:active={title.includes("국내 출장")} class="convo-item">
-                <span class="convo-title">{title}</span>
-                <button class="convo-more" title="대화 옵션">⋯</button>
+            {#each group.items as item}
+              <div class:active={item.id === activeConversationId} class="convo-item">
+                <button class="convo-title" on:click={() => loadConversation(item.id)}>{item.title}</button>
+                <button class="convo-more" title="이름 변경" on:click={() => renameConversation(item.id, item.title)}>✎</button>
+                <button class="convo-more" title="휴지통 이동" on:click={() => trashConversation(item.id)}>🗑</button>
               </div>
             {/each}
           {/each}
+          {#if !conversationGroups.length}
+            <p class="empty-state">저장된 대화가 없습니다.</p>
+          {/if}
         </div>
       {:else}
         <div class="sidebar-panel article-panel">
-          {#each (rulebookArticles.length ? rulebookArticles : fallbackRulebook).slice(0, 18) as item}
+          <div class="article-search">
+            <input type="text" placeholder="조문 검색" bind:value={articleSearch} on:keydown={(event) => event.key === "Enter" && void searchArticles()} />
+            <button class="article-source-btn" on:click={() => void searchArticles()}>검색</button>
+          </div>
+          {#if searchHits.length}
+            {#each searchHits as hit}
+              <button class="search-hit" on:click={() => openArticle(hit.article_id)}>
+                <span class="article-breadcrumb">{hit.rule} &gt; {hit.article_id.split("#")[1]}</span>
+                <strong>{hit.title}</strong>
+                <span>{hit.snippet}</span>
+              </button>
+            {/each}
+          {/if}
+          {#each visibleArticles as item}
             <div class="article-card compact">
               <div class="article-breadcrumb">{item.article.rule} &gt; {item.article.article}</div>
               <h3 class="article-title">{item.article.article}({item.article.title})</h3>
@@ -260,6 +548,9 @@
               {/if}
             </div>
           {/each}
+          {#if !searchHits.length && !visibleArticles.length}
+            <p class="empty-state">표시할 조문이 없습니다.</p>
+          {/if}
         </div>
       {/if}
 
@@ -274,9 +565,9 @@
         <div class="start-center">
           <div class="brand-mark">CNI</div>
           <h1 class="start-heading">무엇을 도와드릴까요?</h1>
-          <button class="update-banner" on:click={() => void invoke("check_update").catch(() => undefined)}>
+          <button class="update-banner" on:click={() => void checkAndApplyUpdate()}>
             <span class="banner-icon">📋</span>
-            <span>여비규정이 <strong>2026.2.27.</strong> 개정되었습니다 — 변경 내용 보기</span>
+            <span>{updateMessage || "규정집 업데이트 확인"}</span>
             <span class="banner-arrow">→</span>
           </button>
           <div class="suggestion-grid">
@@ -305,7 +596,7 @@
         {/if}
         {#if mainView === "rulebook"}
           <div class="rulebook-scroll" aria-label="규정집 보기">
-            {#each (rulebookArticles.length ? rulebookArticles : fallbackRulebook) as item}
+            {#each (selectedArticle ? [selectedArticle] : rulebookArticles) as item}
               {@const page = item.source_pages[0]}
               <article
                 id={page ? `page-${page}` : item.article.id}
@@ -319,40 +610,48 @@
                 <pre>{item.article.body}</pre>
               </article>
             {/each}
+            {#if !rulebookArticles.length && !selectedArticle}
+              <p class="empty-state">규정집을 불러오면 조문이 여기에 표시됩니다.</p>
+            {/if}
           </div>
         {:else}
         <div class="chat-scroll">
-          {#if activeMode === "규정해석"}
-            <div class="msg-user"><div class="bubble">국내 출장 시 일비는 얼마인가요?</div></div>
-            <div class="msg-ai">
-              <div class="ai-avatar">C</div>
-              <div class="ai-content">
-                <p>국내 출장 시 일비는 소속 부서장의 사전 승인을 받은 출장 일수에 따라 지급됩니다. 구체적인 지급 기준과 금액은 여비규정에서 정하고 있습니다<sup class="footnote">[1]</sup>.</p>
-                <p>일비는 실비 정산이 아닌 정액 지급 방식이며, 같은 날 2개소 이상을 순회 출장하더라도 일비는 1일분만 지급됩니다.</p>
-                <div class="citation-row">
-                  <span class="citation-label">📖 근거</span>
-                  <span class="citation-chip">여비규정 제12조(일비) · 개정 2026.2.27</span>
-                  <span class="citation-chip">근로기준법 제60조</span>
+          {#if messages.length}
+            {#each messages as message (message.id)}
+              {#if message.role === "user"}
+                <div class="msg-user"><div class="bubble">{message.content}</div></div>
+              {:else}
+                <div class="msg-ai">
+                  <div class="ai-avatar">C</div>
+                  <div class="ai-content">
+                    {#each messageParagraphs(message.content) as paragraph}
+                      <p>
+                        {#each parseCitationSegments(paragraph) as segment}
+                          {#if segment.type === "citation"}
+                            <button class="inline-citation" on:click={() => openArticle(segment.citation.id)}>{segment.citation.label}</button>
+                          {:else}
+                            {segment.text}
+                          {/if}
+                        {/each}
+                      </p>
+                    {/each}
+                    {#if extractCitationRefs(message.content).length}
+                      <div class="citation-row">
+                        <span class="citation-label">근거</span>
+                        {#each extractCitationRefs(message.content) as citation}
+                          <button class="citation-chip" on:click={() => openArticle(citation.id)}>{citation.label}</button>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if activeMode === "노무상담" && message.content.includes(LABOR_DISCLAIMER)}
+                      <div class="disclaimer-box"><span>⚠</span><span>{LABOR_DISCLAIMER}</span></div>
+                    {/if}
+                  </div>
                 </div>
-              </div>
-            </div>
-          {:else if activeMode === "노무상담"}
-            <div class="msg-ai"><div class="ai-avatar">C</div><div class="ai-content"><p>노무상담을 시작하기 전에 몇 가지 여쭙겠습니다. 현재 재직 중이신가요?</p></div></div>
-            <div class="msg-user"><div class="bubble">재직 중입니다. 육아휴직 후 복직 관련해서 문의드리고 싶어요.</div></div>
-            <div class="msg-ai"><div class="ai-avatar">C</div><div class="ai-content"><p>육아휴직 종료 예정일과 복직 희망 부서가 휴직 전과 동일한지 확인해 주세요.</p><div class="disclaimer-box"><span>⚠</span><span>{LABOR_DISCLAIMER}</span></div></div></div>
+              {/if}
+            {/each}
           {:else}
-            <div class="msg-user"><div class="bubble">타 기관 육아휴직 규정과 비교해줘</div></div>
-            <div class="msg-ai"><div class="ai-avatar">C</div><div class="ai-content">
-              <p>충남연구원 육아휴직 규정을 출연연 평균 및 우수 기관 사례와 비교해 드립니다.</p>
-              <table class="compare-table">
-                <thead><tr><th>구분</th><th>충남연구원</th><th>출연연 평균</th><th>우수 기관</th></tr></thead>
-                <tbody>
-                  <tr><td>휴직 기간</td><td>최대 ○○개월</td><td>최대 ○○개월</td><td class="highlight-cell">최대 ○○개월<span class="tag">개선 여지</span></td></tr>
-                  <tr><td>분할 사용 횟수</td><td>○회</td><td>○회</td><td class="highlight-cell">○회<span class="tag">개선 여지</span></td></tr>
-                  <tr><td>복직 후 근무형태</td><td>전일제</td><td>전일제</td><td class="highlight-cell">단축근무 병행<span class="tag">개선 여지</span></td></tr>
-                </tbody>
-              </table>
-            </div></div>
+            <p class="empty-state">새 질문을 입력하면 대화가 시작됩니다.</p>
           {/if}
         </div>
         {/if}
@@ -387,9 +686,14 @@
               <a class="feedback-link" href={FEEDBACK_URL} target="_blank" rel="noreferrer">피드백 보내기</a>
             {:else if settingsTab === "engine"}
               <h3 class="settings-section-title">엔진 연결</h3>
-              <div class="settings-row"><span class="settings-row-label">🟢 ChatGPT</span><span class="settings-row-value">연결됨 · Codex CLI</span></div>
-              <div class="settings-row"><span class="settings-row-label">⚪ Claude</span><span class="settings-row-value">로그인 필요</span></div>
-              <div class="settings-row"><span class="settings-row-label">⚪ Gemini</span><span class="settings-row-value">로그인 필요</span></div>
+              {#each engines as engine}
+                <div class="settings-row">
+                  <span class="settings-row-label">{engine.label}</span>
+                  <span class="settings-row-value">{engineStatusLabel(engine.status, engine.label)}</span>
+                  <button class="settings-action-btn compact-action" on:click={() => selectEngine(engine)}>사용</button>
+                </div>
+              {/each}
+              <p class="settings-help">Gemini CLI 경로는 차단 상태입니다. Gemini 사용은 API 키 경로가 필요합니다.</p>
               <input class="key-input" type="password" placeholder="sk-••••••••••••••••••••" />
             {:else if settingsTab === "privacy"}
               <h3 class="settings-section-title">데이터 · 개인정보</h3>
@@ -430,10 +734,10 @@
               <div class="settings-row"><span class="settings-row-label">전체 대화 휴지통 이동</span><button class="settings-action-btn danger">휴지통으로 이동</button></div>
             {:else}
               <h3 class="settings-section-title">규정집 정보</h3>
-              <div class="settings-row"><span class="settings-row-label">규정집 버전</span><span class="settings-row-value">2026.2.27<span class="mono">(커밋 abc123)</span></span></div>
-              <div class="settings-row"><span class="settings-row-label">마지막 업데이트 확인</span><span class="settings-row-value">오늘</span></div>
-              <div class="settings-row"><span class="settings-row-label">포함 규정</span><span class="settings-row-value">복무규정, 여비규정, 보수규정 외 12건</span></div>
-              <button class="settings-action-btn">지금 업데이트 확인</button>
+              <div class="settings-row"><span class="settings-row-label">기관</span><span class="settings-row-value">{updateStatus?.institution ?? "확인 전"}</span></div>
+              <div class="settings-row"><span class="settings-row-label">규정집 버전</span><span class="settings-row-value">{updateStatus?.effective_date ?? "확인 전"}<span class="mono">{updateStatus?.source_commit ?? ""}</span></span></div>
+              <div class="settings-row"><span class="settings-row-label">진행 상태</span><span class="settings-row-value">{updateProgress?.message ?? updateMessage ?? "대기"}</span></div>
+              <button class="settings-action-btn" on:click={() => void checkAndApplyUpdate()} disabled={updateBusy}>지금 업데이트 확인</button>
             {/if}
           </div>
         </div>
@@ -449,6 +753,7 @@
         <div class="consent-body">
           <p>질문 문장만 익명으로 팀 공유 경로에 기록해 서비스 개선에 사용합니다</p>
           <p class="settings-row-label">답변과 대화 맥락은 수집하지 않으며, 노무상담 모드는 코드 레벨에서 수집 대상에서 제외됩니다.</p>
+          <p class="settings-row-label">질문에 개인정보(이름·연락처 등) 입력은 자제해 주세요.</p>
         </div>
         <div class="consent-actions">
           <button class="settings-action-btn secondary" on:click={() => void saveTelemetrySettings(false)}>거부</button>
@@ -558,6 +863,7 @@
   .engine-item { width: 100%; display: flex; align-items: center; gap: 8px; background: transparent; border: none; text-align: left; padding: 9px 10px; border-radius: 8px; font-size: 13.5px; color: var(--text); }
   .engine-item:hover { background: var(--hover); }
   .engine-item.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+  .engine-empty { padding: 10px; color: var(--text-secondary); font-size: 12.5px; }
   .status, .check { margin-left: auto; font-size: 12px; color: var(--text-secondary); font-weight: 400; }
   .check { color: var(--good); font-weight: 600; }
   .mode-tabs { display: flex; gap: 4px; margin: 0 auto; }
@@ -585,8 +891,14 @@
   .convo-group-label { font-size: 12px; padding: 10px 8px 4px; font-weight: 600; }
   .convo-item { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 8px; }
   .convo-item.active { background: var(--accent-soft); }
-  .convo-title { flex: 1; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+  .convo-title { flex: 1; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); background: transparent; border: none; text-align: left; padding: 0; min-width: 0; }
   .convo-more { background: transparent; border: none; color: var(--text-secondary); width: 22px; height: 22px; border-radius: 6px; }
+  .empty-state { color: var(--text-secondary); font-size: 13px; line-height: 1.6; padding: 12px; text-align: center; }
+  .article-search { display: flex; gap: 6px; align-items: center; padding: 6px 4px 10px; }
+  .article-search input { flex: 1; min-width: 0; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; outline: none; }
+  .search-hit { width: 100%; display: flex; flex-direction: column; gap: 4px; text-align: left; background: transparent; color: var(--text); border: 1px solid var(--border-soft); border-radius: 8px; padding: 9px; margin-bottom: 6px; }
+  .search-hit:hover { background: var(--hover); }
+  .search-hit span:last-child { color: var(--text-secondary); font-size: 12.5px; line-height: 1.5; }
   .article-card { padding: 6px 6px 10px; }
   .article-card.compact { border-bottom: 1px solid var(--border-soft); padding: 10px 6px 12px; }
   .article-breadcrumb { font-size: 11.5px; margin-bottom: 6px; }
@@ -637,13 +949,10 @@
   .footnote { color: var(--accent-text); font-weight: 700; }
   .citation-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 4px 0; }
   .citation-label { font-size: 12.8px; color: var(--text-secondary); font-weight: 700; }
-  .citation-chip { background: var(--accent-soft); color: var(--accent-text); padding: 4px 12px; border-radius: 999px; font-size: 12.3px; font-weight: 500; }
+  .citation-chip, .inline-citation { background: var(--accent-soft); color: var(--accent-text); border: 1px solid transparent; padding: 4px 12px; border-radius: 999px; font-size: 12.3px; font-weight: 700; }
+  .inline-citation { display: inline-flex; margin: 0 2px; vertical-align: baseline; }
   .mode-banner { max-width: 820px; width: calc(100% - 48px); margin: 16px auto 0; display: flex; align-items: center; gap: 10px; background: var(--accent-soft); color: var(--accent-text); padding: 11px 16px; border-radius: 12px; font-size: 13.3px; font-weight: 500; }
   .disclaimer-box { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 12.6px; color: var(--text-secondary); display: flex; gap: 8px; align-items: flex-start; }
-  .compare-table { width: 100%; border-collapse: collapse; margin: 10px 0 14px; font-size: 13.6px; }
-  .compare-table th, .compare-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }
-  .compare-table thead th, .highlight-cell { background: var(--accent-soft); color: var(--accent-text); font-weight: 700; }
-  .tag { display: inline-block; background: var(--accent); color: var(--on-accent); font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 6px; margin-left: 6px; }
   .modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 80; padding: 24px; }
   .settings-modal { width: 720px; max-width: 100%; max-height: 82vh; background: var(--bg); border: 1px solid var(--border); border-radius: 16px; display: flex; flex-direction: column; overflow: hidden; box-shadow: var(--shadow); }
   .settings-modal-header { flex-shrink: 0; padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
@@ -660,6 +969,8 @@
   .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; color: var(--text-secondary); font-weight: 400; margin-left: 4px; }
   .feedback-link { display: inline-flex; align-items: center; justify-content: center; margin-top: 14px; min-height: 34px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); color: var(--accent-text); text-decoration: none; font-size: 13.3px; font-weight: 700; }
   .settings-action-btn { margin-top: 14px; padding: 8px 18px; border-radius: 8px; background: var(--accent); color: var(--on-accent); border: none; font-size: 13.3px; font-weight: 700; }
+  .settings-action-btn:disabled { opacity: 0.65; cursor: default; }
+  .compact-action { margin-top: 0; padding: 6px 10px; }
   .settings-action-btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
   .settings-action-btn.danger { background: transparent; color: var(--danger-text); border: 1px solid var(--border); }
   .key-input, .path-input { width: 100%; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); font-size: 13px; padding: 9px 12px; border-radius: 9px; outline: none; }

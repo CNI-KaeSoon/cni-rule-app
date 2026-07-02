@@ -19,6 +19,9 @@ use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+// Vector fusion is intentionally deferred: the M1 quality gate was met with
+// BM25 plus the Korean tokenizer path, so the optional `vectors` feature stays
+// inactive until a later quality or latency gate needs it.
 pub const ARTICLE_ID_SEPARATOR: &str = "#";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -57,6 +60,13 @@ pub struct SearchHit {
     pub rule: String,
     pub title: String,
     pub effective: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SearchRouteReport {
+    pub hits: Vec<SearchHit>,
+    pub pin_hit: Option<SearchHit>,
+    pub retrieval_hits: Vec<SearchHit>,
 }
 
 pub trait RulesIndex {
@@ -339,34 +349,38 @@ impl TantivyRulesIndex {
         unpack_pack_archive(path, tmp.path())?;
         Self::from_pack_dir(tmp.path())
     }
-}
 
-impl RulesIndex for TantivyRulesIndex {
-    fn search(&self, q: &str, k: usize, filter: Option<RuleFilter>) -> Vec<SearchHit> {
+    pub fn search_with_routes(
+        &self,
+        q: &str,
+        k: usize,
+        filter: Option<RuleFilter>,
+    ) -> SearchRouteReport {
         if q.trim().is_empty() || k == 0 {
-            return Vec::new();
+            return SearchRouteReport::default();
         }
-
         let pinned = self.direct_article_hit(q, filter.as_ref());
+        let retrieval_hits = self.search_retrieval(q, k, filter.as_ref());
+        let hits = merge_pinned_hits(pinned.clone(), retrieval_hits.clone(), k);
+        SearchRouteReport {
+            hits,
+            pin_hit: pinned,
+            retrieval_hits,
+        }
+    }
+
+    fn search_retrieval(&self, q: &str, k: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
         parser.set_field_boost(self.fields.title, 2.0);
         let (query, _errors) = parser.parse_query_lenient(q);
         let Ok(reader) = self.index.reader() else {
-            return merge_pinned_hits(
-                pinned,
-                lexical_fallback(self.articles.values(), q, k, filter.as_ref()),
-                k,
-            );
+            return lexical_fallback(self.articles.values(), q, k, filter);
         };
 
         let searcher = reader.searcher();
         let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(k * 4)) else {
-            return merge_pinned_hits(
-                pinned,
-                lexical_fallback(self.articles.values(), q, k, filter.as_ref()),
-                k,
-            );
+            return lexical_fallback(self.articles.values(), q, k, filter);
         };
 
         let mut bm25_hits = Vec::new();
@@ -380,7 +394,7 @@ impl RulesIndex for TantivyRulesIndex {
             let Some(article) = self.articles.get(id) else {
                 continue;
             };
-            if !matches_filter(article, filter.as_ref()) {
+            if !matches_filter(article, filter) {
                 continue;
             }
             bm25_hits.push(SearchHit {
@@ -410,7 +424,7 @@ impl RulesIndex for TantivyRulesIndex {
                     let Some(article) = self.articles.get(id) else {
                         continue;
                     };
-                    if !matches_filter(article, filter.as_ref()) {
+                    if !matches_filter(article, filter) {
                         continue;
                     }
                     rule_hits.push(SearchHit {
@@ -425,16 +439,19 @@ impl RulesIndex for TantivyRulesIndex {
             }
         }
 
-        if bm25_hits.is_empty() {
-            bm25_hits = lexical_fallback(self.articles.values(), q, k * 4, filter.as_ref());
-        }
+        let lexical_hits = lexical_rank(self.articles.values(), q, k * 4, filter);
+        let rankings = if bm25_hits.is_empty() {
+            vec![rule_hits, lexical_hits]
+        } else {
+            vec![bm25_hits, rule_hits, lexical_hits]
+        };
+        rrf_fuse(rankings, k)
+    }
+}
 
-        let lexical_hits = lexical_rank(self.articles.values(), q, k * 4, filter.as_ref());
-        merge_pinned_hits(
-            pinned,
-            rrf_fuse(vec![bm25_hits, rule_hits, lexical_hits], k),
-            k,
-        )
+impl RulesIndex for TantivyRulesIndex {
+    fn search(&self, q: &str, k: usize, filter: Option<RuleFilter>) -> Vec<SearchHit> {
+        self.search_with_routes(q, k, filter).hits
     }
 
     fn get_article(&self, id: &str) -> Option<Article> {
@@ -1379,6 +1396,27 @@ refs:
     }
 
     #[test]
+    fn reports_pin_and_retrieval_routes_separately() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        let report = index.search_with_routes("여비규정 제13조 숙박비 기준", 5, None);
+
+        assert_eq!(
+            report.pin_hit.as_ref().map(|hit| hit.article_id.as_str()),
+            Some("여비규정#제13조")
+        );
+        assert!(report
+            .retrieval_hits
+            .iter()
+            .any(|hit| hit.article_id == "여비규정#제13조"));
+        assert_eq!(report.hits[0].article_id, "여비규정#제13조");
+    }
+
+    #[test]
     fn direct_article_reference_uses_filter_rule_when_query_omits_rule_name() {
         let index = TantivyRulesIndex::from_articles(
             fixture_articles(),
@@ -1470,6 +1508,7 @@ refs:
         );
         assert_eq!(slugify_rule("A/B: CNI Rules!"), "ABCNIRules");
         assert_eq!(slugify_rule("e\u{301} 규정"), "é규정");
+        assert_eq!(slugify_rule("!!!"), "e84c538e7fe2");
     }
 
     #[test]

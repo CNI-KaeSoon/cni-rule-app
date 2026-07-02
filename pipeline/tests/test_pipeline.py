@@ -55,6 +55,10 @@ def test_extract_refs_for_internal_same_rule_and_quoted_law():
     assert {"target": "인사관리규정#제60조", "type": "준용"} not in refs
 
 
+def test_slugify_fallback_matches_rules_core_sha256_contract():
+    assert slugify("!!!") == "e84c538e7fe2"
+
+
 def test_parse_articles_skips_duplicate_article_keys():
     entry = TocEntry(code="III-2", rule="직제규정", start_page=91, end_page=97)
     text = """직제규정

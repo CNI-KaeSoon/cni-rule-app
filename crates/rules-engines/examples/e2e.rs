@@ -6,17 +6,66 @@ use std::time::Instant;
 use futures_util::StreamExt;
 use rules_core::{default_pack_status, RulesIndex, TantivyRulesIndex};
 use rules_engines::{
-    codex_cli_engine, ChatEngine, ChatRequest, ContextBlock, Mode, Msg, PromptBuilder,
+    claude_cli_engine, codex_cli_engine, gemini_cli_engine, ChatEngine, ChatRequest, ContextBlock,
+    Mode, Msg, PromptBuilder,
 };
 
 const DEFAULT_RULES_DIR: &str = "/Users/kaesoon/Projects/cni-rule/04_data/90_index-build/rules";
 const DEFAULT_EFFECTIVE_DATE: &str = "2026-02-27";
+const USAGE: &str = "usage: cargo run -p rules-engines --example e2e --features korean-tokenizer -- \"<질문>\" [--engine codex|claude|gemini]";
+
+#[derive(Debug, Clone, Copy)]
+enum EngineChoice {
+    Codex,
+    Claude,
+    Gemini,
+}
+
+impl EngineChoice {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            "gemini" => Ok(Self::Gemini),
+            other => Err(format!(
+                "unsupported engine '{other}'; expected codex, claude, or gemini"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+fn parse_args() -> Result<(String, EngineChoice), String> {
+    let mut args = env::args().skip(1);
+    let question = args.next().ok_or_else(|| USAGE.to_string())?;
+    let mut engine = EngineChoice::Codex;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--engine" => {
+                let value = args.next().ok_or_else(|| {
+                    "missing value for --engine; expected codex, claude, or gemini".to_string()
+                })?;
+                engine = EngineChoice::parse(&value)?;
+            }
+            "--help" | "-h" => return Err(USAGE.to_string()),
+            other => return Err(format!("unexpected argument '{other}'\n{USAGE}")),
+        }
+    }
+
+    Ok((question, engine))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let question = env::args().nth(1).ok_or(
-        "usage: cargo run -p rules-engines --example e2e --features korean-tokenizer -- \"<질문>\"",
-    )?;
+    let (question, engine_choice) = parse_args().map_err(|err| format!("{err}\n{USAGE}"))?;
 
     let started_at = Instant::now();
     let index = TantivyRulesIndex::from_articles_dir(
@@ -49,7 +98,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let prompt = PromptBuilder::build(&request);
-    let engine = codex_cli_engine();
+    let engine: Box<dyn ChatEngine> = match engine_choice {
+        EngineChoice::Codex => Box::new(codex_cli_engine()),
+        EngineChoice::Claude => Box::new(claude_cli_engine()),
+        EngineChoice::Gemini => Box::new(gemini_cli_engine()),
+    };
+    eprintln!("engine={}", engine_choice.as_str());
     eprintln!("engine_status={:?}", engine.probe());
     eprintln!("prompt_bytes={}", prompt.len());
     eprintln!(

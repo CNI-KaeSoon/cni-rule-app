@@ -975,7 +975,7 @@ fn apply_update(app: AppHandle, state: State<'_, AppState>) -> CommandResult<Upd
         .map_err(|err| AppError::RulesIndex(err.to_string()))?;
     let status = UpdateStatusDto::from(index.status());
     *lock_or_recover(&state.rules_index) = Some(index);
-    app.emit("update://progress", &status).ok();
+    app.emit("update://done", &status).ok();
     Ok(status)
 }
 
@@ -1019,6 +1019,15 @@ fn conversations_create(
     let engine = engine_label(&lock_or_recover(&state.engine));
     let db = lock_or_recover(&state.db);
     db.create_conversation(title, mode, engine)
+}
+
+#[tauri::command]
+fn conversations_get(
+    state: State<'_, AppState>,
+    id: String,
+) -> CommandResult<ConversationDetailDto> {
+    let db = lock_or_recover(&state.db);
+    db.get_conversation_detail(&id)
 }
 
 #[tauri::command]
@@ -1123,6 +1132,7 @@ pub fn run() {
             get_rulebook,
             conversations_list,
             conversations_create,
+            conversations_get,
             conversations_rename,
             conversations_delete_to_trash,
             conversations_export_md,

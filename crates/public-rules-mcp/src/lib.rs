@@ -4,14 +4,14 @@ use rmcp::{
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, Article, LegalBasis, PackStatus, RuleFilter, RuleSummary, RulesIndex,
-    SearchHit, TantivyRulesIndex,
+    default_pack_status, parse_article_markdown, Article, LegalBasis, PackStatus, RuleFilter,
+    RuleSummary, RulesIndex, SearchHit, TantivyRulesIndex,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const SEARCH_RULES_TOOL: &str = "search_rules";
@@ -32,6 +32,7 @@ pub struct PackConfig {
     pub path: Option<PathBuf>,
     pub url: Option<String>,
     pub effective: Option<String>,
+    pub source_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -119,12 +120,7 @@ impl PublicRulesServer {
     }
 
     pub fn from_config(config: ServerConfig) -> anyhow::Result<Self> {
-        let effective = config
-            .pack
-            .effective
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let status = default_pack_status(config.institution, effective);
+        let institution = config.institution.clone();
         let path = config
             .pack
             .path
@@ -134,6 +130,18 @@ impl PublicRulesServer {
         } else if path.join("manifest.json").is_file() {
             TantivyRulesIndex::from_pack_dir(path)?
         } else {
+            let effective = if let Some(effective) = config.pack.effective.clone() {
+                effective
+            } else {
+                most_frequent_effective(&path)?.unwrap_or_else(|| "unknown".to_string())
+            };
+            let source_commit = config
+                .pack
+                .source_commit
+                .clone()
+                .unwrap_or_else(|| "bare-dir".to_string());
+            let mut status = default_pack_status(institution, effective);
+            status.source_commit = source_commit;
             TantivyRulesIndex::from_articles_dir(path, status)?
         };
         Ok(Self::new(index))
@@ -156,6 +164,40 @@ impl PublicRulesServer {
             extra: BTreeMap::new(),
         }
     }
+}
+
+fn most_frequent_effective(path: &Path) -> anyhow::Result<Option<String>> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    collect_effective_counts(path, &mut counts)?;
+    Ok(counts
+        .into_iter()
+        .max_by(|(effective_a, count_a), (effective_b, count_b)| {
+            count_a
+                .cmp(count_b)
+                .then_with(|| effective_b.cmp(effective_a))
+        })
+        .map(|(effective, _)| effective))
+}
+
+fn collect_effective_counts(
+    path: &Path,
+    counts: &mut BTreeMap<String, usize>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_effective_counts(&path, counts)?;
+            continue;
+        }
+        if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let article = parse_article_markdown(&path)?;
+        *counts.entry(article.effective).or_default() += 1;
+    }
+    Ok(())
 }
 
 #[tool_router(router = tool_router)]
@@ -393,5 +435,88 @@ refs: []
         assert_eq!(result.institution, "cni");
         assert_eq!(result.effective_date, "2026-02-27");
         assert!(!result.stale);
+    }
+
+    #[tokio::test]
+    async fn bare_dir_config_uses_modal_article_effective_and_injected_source_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "public-rules-mcp-bare-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rule_dir = root.join("여비지급규칙");
+        fs::create_dir_all(&rule_dir).unwrap();
+        fs::write(
+            rule_dir.join("제12조.md"),
+            r#"---
+institution: cni
+rule: 여비지급규칙
+article: 제12조
+title: 항공운임의 지급
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+supersedes: null
+legal_basis: []
+refs: []
+---
+① 항공운임을 지급한다.
+"#,
+        )
+        .unwrap();
+        fs::write(
+            rule_dir.join("제13조.md"),
+            r#"---
+institution: cni
+rule: 여비지급규칙
+article: 제13조
+title: 숙박비 지급
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+supersedes: null
+legal_basis: []
+refs: []
+---
+① 숙박비를 지급한다.
+"#,
+        )
+        .unwrap();
+        fs::write(
+            rule_dir.join("제14조.md"),
+            r#"---
+institution: cni
+rule: 여비지급규칙
+article: 제14조
+title: 이전 규정
+effective: 2025-01-01
+amended: 2025-01-01
+status: active
+supersedes: null
+legal_basis: []
+refs: []
+---
+① 이전 기준이다.
+"#,
+        )
+        .unwrap();
+
+        let server = PublicRulesServer::from_config(ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(root),
+                url: None,
+                effective: None,
+                source_commit: Some("local-test".to_string()),
+            },
+        })
+        .unwrap();
+        let Json(result) = server.status().await;
+
+        assert_eq!(result.effective_date, "2026-02-27");
+        assert_eq!(result.source_commit, "local-test");
     }
 }

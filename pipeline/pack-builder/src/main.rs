@@ -23,6 +23,7 @@ struct Args {
     source_commit: String,
     created_at: String,
     golden_path: PathBuf,
+    max_unresolved_refs: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ struct QualityReport {
     legal_basis_edge_count: usize,
     broken_edges: usize,
     orphans: usize,
+    unresolved_refs: usize,
     external_ref_nodes: usize,
     coverage: BTreeMap<&'static str, usize>,
 }
@@ -80,7 +82,10 @@ fn main() -> Result<()> {
 fn build_pack(args: &Args) -> Result<()> {
     let mut articles = load_source_articles(&args.rules_dir)?;
     if articles.is_empty() {
-        bail!("no article markdown files found under {}", args.rules_dir.display());
+        bail!(
+            "no article markdown files found under {}",
+            args.rules_dir.display()
+        );
     }
     articles.sort_by(|a, b| a.article.id.cmp(&b.article.id));
 
@@ -100,24 +105,32 @@ fn build_pack(args: &Args) -> Result<()> {
         .collect::<BTreeSet<_>>();
 
     copy_articles(&articles, &stage.join("articles"))?;
-    let (nodes, edges, external_ref_nodes) = build_graph(&articles, &article_ids, &rule_ids);
+    let (nodes, edges, unresolved_refs) = build_graph(&articles, &article_ids, &rule_ids);
     write_jsonl(&stage.join("graph/nodes.jsonl"), &nodes)?;
     write_jsonl(&stage.join("graph/edges.jsonl"), &edges)?;
     build_tantivy_index(&articles, &stage.join("tantivy"))?;
     File::create(stage.join("vectors.db"))?;
 
-    let quality = quality_report(
-        &articles,
-        &rule_ids,
-        &nodes,
-        &edges,
-        external_ref_nodes,
-    );
+    let quality = quality_report(&articles, &rule_ids, &nodes, &edges, unresolved_refs);
     if quality.broken_edges != 0 || quality.orphans != 0 {
         bail!(
             "QA gate failed: broken_edges={} orphans={}",
             quality.broken_edges,
             quality.orphans
+        );
+    }
+    if let Some(max_unresolved_refs) = args.max_unresolved_refs {
+        if quality.unresolved_refs > max_unresolved_refs {
+            bail!(
+                "QA gate failed: unresolved_refs={} max_unresolved_refs={}",
+                quality.unresolved_refs,
+                max_unresolved_refs
+            );
+        }
+    } else if quality.unresolved_refs != 0 {
+        eprintln!(
+            "QA warning: unresolved_refs={} (set --max-unresolved-refs to fail this gate)",
+            quality.unresolved_refs
         );
     }
     write_json_pretty(&stage.join("quality/report.json"), &quality)?;
@@ -131,14 +144,15 @@ fn build_pack(args: &Args) -> Result<()> {
     write_archive(&stage, &args.archive_path)?;
 
     println!(
-        "built {} articles={} rules={} nodes={} edges={} broken_edges={} orphans={}",
+        "built {} articles={} rules={} nodes={} edges={} broken_edges={} orphans={} unresolved_refs={}",
         args.archive_path.display(),
         quality.article_count,
         quality.rule_count,
         quality.node_count,
         quality.edge_count,
         quality.broken_edges,
-        quality.orphans
+        quality.orphans,
+        quality.unresolved_refs
     );
     Ok(())
 }
@@ -156,6 +170,7 @@ impl Args {
         let mut source_commit = None;
         let mut created_at = None;
         let mut golden_path = project_root.join("01_docs/eval/golden.jsonl");
+        let mut max_unresolved_refs = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -172,6 +187,13 @@ impl Args {
                 "--source-commit" => source_commit = Some(value),
                 "--created-at" => created_at = Some(value),
                 "--golden" => golden_path = PathBuf::from(value),
+                "--max-unresolved-refs" => {
+                    max_unresolved_refs = Some(
+                        value
+                            .parse::<usize>()
+                            .with_context(|| format!("invalid --max-unresolved-refs: {value}"))?,
+                    )
+                }
                 _ => bail!("unknown argument: {flag}"),
             }
         }
@@ -183,6 +205,7 @@ impl Args {
             source_commit: source_commit.context("--source-commit is required")?,
             created_at: created_at.context("--created-at is required")?,
             golden_path,
+            max_unresolved_refs,
         })
     }
 }
@@ -240,8 +263,13 @@ fn copy_articles(articles: &[SourceArticle], articles_dir: &Path) -> Result<()> 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&source.source_path, &target)
-            .with_context(|| format!("copy {} to {}", source.source_path.display(), target.display()))?;
+        fs::copy(&source.source_path, &target).with_context(|| {
+            format!(
+                "copy {} to {}",
+                source.source_path.display(),
+                target.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -261,7 +289,10 @@ fn build_graph(
 
     let mut rule_labels = BTreeMap::<String, &str>::new();
     for source in articles {
-        rule_labels.insert(rule_node_id(&source.article.rule), source.article.rule.as_str());
+        rule_labels.insert(
+            rule_node_id(&source.article.rule),
+            source.article.rule.as_str(),
+        );
     }
     for (id, label) in &rule_labels {
         nodes.push(GraphNode {
@@ -289,7 +320,7 @@ fn build_graph(
     }
 
     let mut external_nodes = BTreeMap::<String, (NodeKind, String, bool)>::new();
-    let mut external_ref_nodes = 0_usize;
+    let mut unresolved_refs = 0_usize;
     for source in articles {
         for basis in &source.article.legal_basis {
             let id = law_node_id(&basis.law, &basis.article);
@@ -304,7 +335,7 @@ fn build_graph(
         }
         for article_ref in &source.article.refs {
             if !article_ids.contains(&article_ref.target) {
-                external_ref_nodes += 1;
+                unresolved_refs += 1;
                 external_nodes.insert(
                     article_ref.target.clone(),
                     (
@@ -362,10 +393,10 @@ fn build_graph(
             });
         }
     }
-    edges.sort_by(|a, b| edge_sort_key(a).cmp(&edge_sort_key(b)));
+    edges.sort_by_key(edge_sort_key);
     edges.dedup_by(|a, b| edge_sort_key(a) == edge_sort_key(b));
 
-    (nodes, edges, external_ref_nodes)
+    (nodes, edges, unresolved_refs)
 }
 
 fn quality_report(
@@ -373,9 +404,12 @@ fn quality_report(
     rule_ids: &BTreeSet<String>,
     nodes: &[GraphNode],
     edges: &[GraphEdge],
-    external_ref_nodes: usize,
+    unresolved_refs: usize,
 ) -> QualityReport {
-    let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<BTreeSet<_>>();
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
     let mut degree = BTreeMap::<String, usize>::new();
     let mut broken_edges = 0_usize;
     let mut ref_edge_count = 0_usize;
@@ -429,7 +463,8 @@ fn quality_report(
         legal_basis_edge_count,
         broken_edges,
         orphans,
-        external_ref_nodes,
+        unresolved_refs,
+        external_ref_nodes: unresolved_refs,
         coverage: BTreeMap::from([
             ("active_articles", active_articles),
             ("with_source_pages", with_source_pages),
@@ -615,10 +650,9 @@ fn law_node_id(law: &str, article: &str) -> String {
 }
 
 fn looks_like_law_article(target: &str) -> bool {
-    target
-        .split('#')
-        .next()
-        .is_some_and(|name| name.ends_with('법') || name.ends_with("시행령") || name.ends_with("조례"))
+    target.split('#').next().is_some_and(|name| {
+        name.ends_with('법') || name.ends_with("시행령") || name.ends_with("조례")
+    })
 }
 
 fn edge_kind_from_ref(kind: &str) -> EdgeKind {
@@ -636,4 +670,52 @@ fn edge_sort_key(edge: &GraphEdge) -> (String, String, String) {
         edge.dst.clone(),
         format!("{:?}", edge.kind),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rules_core::ArticleRef;
+
+    #[test]
+    fn quality_report_counts_unresolved_refs_even_when_placeholder_nodes_hide_broken_edges() {
+        let article = Article {
+            id: "여비규정#제12조".to_string(),
+            institution: "cni".to_string(),
+            rule: "여비규정".to_string(),
+            article: "제12조".to_string(),
+            title: "일비".to_string(),
+            effective: "2026-02-27".to_string(),
+            amended: "2026-02-27".to_string(),
+            status: "active".to_string(),
+            body: "일비 지급 기준".to_string(),
+            refs: vec![ArticleRef {
+                target: "없는규정#제1조".to_string(),
+                kind: "인용".to_string(),
+            }],
+            ..Article::default()
+        };
+        let source = SourceArticle {
+            article,
+            source_path: PathBuf::from("unused.md"),
+            relative_path: PathBuf::from("여비규정/제12조.md"),
+            source_pages: vec![1],
+        };
+        let articles = vec![source];
+        let article_ids = articles
+            .iter()
+            .map(|source| source.article.id.clone())
+            .collect::<BTreeSet<_>>();
+        let rule_ids = articles
+            .iter()
+            .map(|source| rule_node_id(&source.article.rule))
+            .collect::<BTreeSet<_>>();
+
+        let (nodes, edges, unresolved_refs) = build_graph(&articles, &article_ids, &rule_ids);
+        let report = quality_report(&articles, &rule_ids, &nodes, &edges, unresolved_refs);
+
+        assert_eq!(report.broken_edges, 0);
+        assert_eq!(report.unresolved_refs, 1);
+        assert_eq!(report.external_ref_nodes, 1);
+    }
 }

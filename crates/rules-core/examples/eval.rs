@@ -1,4 +1,4 @@
-use rules_core::{default_pack_status, RulesIndex, TantivyRulesIndex};
+use rules_core::{default_pack_status, TantivyRulesIndex};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -31,14 +31,26 @@ fn main() -> anyhow::Result<()> {
         TantivyRulesIndex::from_articles_dir(&rules_dir, default_pack_status("cni", "2026-02-27"))?;
 
     let mut hit_count = 0_usize;
+    let mut pin_hit_count = 0_usize;
+    let mut retrieval_hit_count = 0_usize;
     let mut latencies = Vec::with_capacity(cases.len());
     for case in &cases {
         let start = Instant::now();
-        let hits = index.search(&case.q, 5, None);
+        let report = index.search_with_routes(&case.q, 5, None);
         let elapsed = start.elapsed().as_micros();
         latencies.push(elapsed);
 
-        let hit = hits.iter().any(|result| {
+        let hit = report.hits.iter().any(|result| {
+            case.expect
+                .iter()
+                .any(|expected| expected == &result.article_id)
+        });
+        let pin_hit = report.pin_hit.as_ref().is_some_and(|result| {
+            case.expect
+                .iter()
+                .any(|expected| expected == &result.article_id)
+        });
+        let retrieval_hit = report.retrieval_hits.iter().any(|result| {
             case.expect
                 .iter()
                 .any(|expected| expected == &result.article_id)
@@ -46,12 +58,26 @@ fn main() -> anyhow::Result<()> {
         if hit {
             hit_count += 1;
         }
+        if pin_hit {
+            pin_hit_count += 1;
+        }
+        if retrieval_hit {
+            retrieval_hit_count += 1;
+        }
 
         println!(
-            "{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             if hit { "hit" } else { "miss" },
+            if pin_hit { "pin-hit" } else { "pin-miss" },
+            if retrieval_hit {
+                "retrieval-hit"
+            } else {
+                "retrieval-miss"
+            },
             elapsed,
-            hits.iter()
+            report
+                .hits
+                .iter()
                 .map(|hit| hit.article_id.as_str())
                 .collect::<Vec<_>>()
                 .join(",")
@@ -72,6 +98,13 @@ fn main() -> anyhow::Result<()> {
         cases.len(),
         hit_rate,
         p95
+    );
+    println!(
+        "routes pin_hit@5={}/{} retrieval_hit@5={}/{}",
+        pin_hit_count,
+        cases.len(),
+        retrieval_hit_count,
+        cases.len()
     );
     Ok(())
 }

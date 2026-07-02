@@ -1,0 +1,144 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1782995450549,
+  "projectRoot": "/Users/kaesoon/Projects/cni-rule/05_app",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "SP=/private/tmp/claude-501/-Users-kaesoon-Projects-cni-rule/929ade20-1fb3-4e37-baa7-1e986c197f88/scratchpad\ncat > \"$SP/lane-r4a-spec.md\" << 'EOF'\n# R4-A: 프런트엔드 실배선 (M6 리뷰 HIGH-1 — 베타 배포 전 필수)\n\n작업 범위: /Users/kaesoon/Projects/cni-rule/05_app/app/** 만 (crates/ 수정 금지 — rules-engines 는 다른 레인이 작업 중).\n리뷰 근거: App.svelte 가 chat://delta 리스너 없음, submitPrompt 반환 버림, 채팅 영역 하드코딩 데모 답변, 다수 커맨드(search/get_article/conversations_*/settings_*/list_engines/set_engine/engine_status/apply_update) UI 미호출, \"지금 업데이트 확인\" 버튼 on:click 없음.\n\n구현:\n1. **채팅 실배선**: onMount listen(\"chat://delta\") → 스트리밍 누적 렌더(현재 대화에). submitPrompt → send_chat 호출 + 사용자 메시지 즉시 표시. 정적 데모 대화·답변 마크업 전부 제거. 각주 [규정#조] 패턴을 인용 칩으로 렌더(클릭 → get_article → 좌측 조문 패널 표시 — 기존 rulebook 연동 재사용)\n2. **대화 목록 실배선**: conversations_list 로 사이드바 렌더(날짜 그룹핑 유지), 새 대화/이름변경/휴지통 삭제/이어하기, 대화 클릭 시 messages 로드\n3. **엔진 피커 실배선**: list_engines/engine_status 로 상태 점(연결됨/로그인 필요/미설치) 표시, set_engine 전환. Gemini 는 CLI 차단 상태이므로 \"API 키 필요\" 안내 유지\n4. **업데이트 실배선**: \"지금 업데이트 확인\" 버튼 → check_update → apply_update, update://progress 소비(진행 표시). 백엔드의 완료 emit 을 별도 채널 update://done 으로 분리(src-tauri 의 emit 채널명만 수정 허용 — 리뷰 LOW-3)\n5. **검색 실배선**: 조문 탭 검색(있다면) → search 커맨드\n6. 옵트인 모달 문구에 \"질문에 개인정보(이름·연락처 등) 입력은 자제해 주세요\" 한 줄 추가 (리뷰 LOW-5)\n7. 테스트: vitest — delta 누적 렌더 로직·각주 파싱 유닛테스트. 기존 테스트 퇴행 금지.\n\n완료 조건: npm run build + npm test + cargo check -p app 통과. 프런트가 데모 데이터 없이 빈 상태에서 시작함을 확인.\nEOF\ncat \"$SP/lane-r4a-spec.md\" | codex exec --sandbox workspace-write --skip-git-repo-check -c sandbox_workspace_write.network_access=true --cd /Users/kaesoon/Projects/cni-rule - 2>&1 | tail -10",
+    "testCommand": "cargo test --workspace 2>&1 | grep -E \"^test result\" | awk -F'[ ;]+' '{s+=$4; f+=$6} END {print \"passed:\", s, \"failed:\", f}'",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "app"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "99_tmp": {
+      "path": "99_tmp",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1782995450531,
+      "keyFiles": []
+    },
+    "app": {
+      "path": "app",
+      "purpose": "Application code",
+      "fileCount": 9,
+      "lastAccessed": 1782995450531,
+      "keyFiles": [
+        "README.md",
+        "index.html",
+        "package-lock.json",
+        "package.json",
+        "tsconfig.json"
+      ]
+    },
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1782995450532,
+      "keyFiles": []
+    },
+    "pipeline": {
+      "path": "pipeline",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1782995450532,
+      "keyFiles": [
+        "README.md",
+        "analyze_qlogs.py",
+        "pyproject.toml",
+        "uv.lock"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1782995450533,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    },
+    "app/dist": {
+      "path": "app/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 1,
+      "lastAccessed": 1782995450534,
+      "keyFiles": [
+        "index.html"
+      ]
+    },
+    "app/node_modules": {
+      "path": "app/node_modules",
+      "purpose": "Dependencies",
+      "fileCount": 1,
+      "lastAccessed": 1782995450534,
+      "keyFiles": []
+    },
+    "app/src": {
+      "path": "app/src",
+      "purpose": "Source code",
+      "fileCount": 3,
+      "lastAccessed": 1782995450534,
+      "keyFiles": [
+        "App.svelte",
+        "main.ts",
+        "vite-env.d.ts"
+      ]
+    },
+    "pipeline/src": {
+      "path": "pipeline/src",
+      "purpose": "Source code",
+      "fileCount": 0,
+      "lastAccessed": 1782995450535,
+      "keyFiles": []
+    },
+    "pipeline/tests": {
+      "path": "pipeline/tests",
+      "purpose": "Test files",
+      "fileCount": 1,
+      "lastAccessed": 1782995450535,
+      "keyFiles": [
+        "test_pipeline.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "crates/rules-engines/src/lib.rs",
+      "accessCount": 6,
+      "lastAccessed": 1782995907514,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -2,7 +2,8 @@ const CNI_CONFIG: &str = r#"
 institution = "cni"
 
 [pack]
-effective = "unknown"
+effective = "2026-02-27"
+source_commit = "bundled-rules"
 "#;
 
 #[tokio::main]
@@ -33,6 +34,8 @@ mod tests {
         let config: ServerConfig = toml::from_str(CNI_CONFIG).expect("embedded config must parse");
         assert_eq!(config.institution, "cni");
         assert!(config.pack.path.is_none());
+        assert_eq!(config.pack.effective.as_deref(), Some("2026-02-27"));
+        assert_eq!(config.pack.source_commit.as_deref(), Some("bundled-rules"));
         assert!(executable_rules_dir().unwrap().is_absolute());
     }
 }

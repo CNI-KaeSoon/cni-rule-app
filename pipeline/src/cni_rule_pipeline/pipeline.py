@@ -113,7 +113,7 @@ def slugify(rule_name: str) -> str:
     slug = normalize_spaces(rule_name)
     slug = re.sub(r"\s+", "", slug)
     slug = re.sub(r"[^\w가-힣·ㆍ․.-]+", "", slug)
-    return slug or hashlib.sha1(rule_name.encode("utf-8")).hexdigest()[:12]
+    return slug or hashlib.sha256(rule_name.encode("utf-8")).hexdigest()[:12]
 
 
 def article_key(num: str, sub: str | None) -> str:

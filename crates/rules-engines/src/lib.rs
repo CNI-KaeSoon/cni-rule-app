@@ -10,7 +10,7 @@ use keyring::Entry;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
@@ -92,6 +92,13 @@ impl ChatDelta {
         Self {
             content: String::new(),
             done: true,
+        }
+    }
+
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            content: error.into(),
+            done: false,
         }
     }
 }
@@ -179,6 +186,14 @@ struct CliCommandSpec {
     executable: String,
     args: Vec<String>,
     login_args: Vec<String>,
+    prompt_input: CliPromptInput,
+    envs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CliPromptInput {
+    Stdin,
+    Arg,
 }
 
 impl CliCommandSpec {
@@ -191,6 +206,8 @@ impl CliCommandSpec {
                 "-".to_string(),
             ],
             login_args: vec!["auth".to_string(), "status".to_string()],
+            prompt_input: CliPromptInput::Stdin,
+            envs: Vec::new(),
         }
     }
 
@@ -199,14 +216,19 @@ impl CliCommandSpec {
             executable: "claude".to_string(),
             args: vec!["--print".to_string()],
             login_args: vec!["--version".to_string()],
+            prompt_input: CliPromptInput::Stdin,
+            envs: Vec::new(),
         }
     }
 
     fn gemini() -> Self {
         Self {
             executable: "gemini".to_string(),
-            args: vec!["--prompt".to_string(), "-".to_string()],
+            args: vec!["-p".to_string()],
             login_args: vec!["--version".to_string()],
+            prompt_input: CliPromptInput::Arg,
+            // headless 실행은 신뢰 디렉터리 검사에 걸림 — 명시 신뢰 필요
+            envs: vec![("GEMINI_CLI_TRUST_WORKSPACE".to_string(), "true".to_string())],
         }
     }
 
@@ -216,6 +238,8 @@ impl CliCommandSpec {
             executable: executable.into(),
             args,
             login_args: vec!["--version".to_string()],
+            prompt_input: CliPromptInput::Stdin,
+            envs: Vec::new(),
         }
     }
 }
@@ -241,8 +265,14 @@ impl CliSidecarEngine {
         let read_timeout = self.read_timeout;
         Box::pin(stream! {
             let prompt = PromptBuilder::build(&req);
+            let mut args = command.args.clone();
+            if matches!(command.prompt_input, CliPromptInput::Arg) {
+                args.push(prompt.clone());
+            }
+
             let mut child = match TokioCommand::new(&command.executable)
-                .args(&command.args)
+                .args(&args)
+                .envs(command.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -256,12 +286,20 @@ impl CliSidecarEngine {
                 }
             };
 
-            if let Some(mut stdin) = child.stdin.take() {
+            if matches!(command.prompt_input, CliPromptInput::Stdin) {
+                let Some(mut stdin) = child.stdin.take() else {
+                    yield ChatDelta::content("engine stdin was unavailable");
+                    yield ChatDelta::done();
+                    return;
+                };
+
                 if let Err(err) = stdin.write_all(prompt.as_bytes()).await {
                     yield ChatDelta::content(format!("engine stdin write failed: {err}"));
                     yield ChatDelta::done();
                     return;
                 }
+            } else {
+                drop(child.stdin.take());
             }
 
             let Some(stdout) = child.stdout.take() else {
@@ -269,13 +307,22 @@ impl CliSidecarEngine {
                 yield ChatDelta::done();
                 return;
             };
+            let stderr_task = child.stderr.take().map(|mut stderr| {
+                tokio::spawn(async move {
+                    let mut captured = String::new();
+                    let _ = stderr.read_to_string(&mut captured).await;
+                    captured
+                })
+            });
 
             let mut lines = BufReader::new(stdout).lines();
+            let mut content_delta_count = 0_usize;
             loop {
                 match timeout(read_timeout, lines.next_line()).await {
                     Ok(Ok(Some(line))) => {
                         for content in parse_cli_stdout_line(&line) {
                             if !content.is_empty() {
+                                content_delta_count += 1;
                                 yield ChatDelta::content(content);
                             }
                         }
@@ -294,7 +341,15 @@ impl CliSidecarEngine {
                 }
             }
 
-            let _ = child.wait().await;
+            let status = child.wait().await;
+            let stderr = match stderr_task {
+                Some(task) => task.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            let failed = status.as_ref().map_or(true, |status| !status.success());
+            if failed || content_delta_count == 0 {
+                yield ChatDelta::error(sidecar_error_message(status, &stderr, content_delta_count == 0));
+            }
             yield ChatDelta::done();
         })
     }
@@ -346,6 +401,7 @@ fn probe_cli(spec: &CliCommandSpec) -> EngineStatus {
 
     let output = Command::new(&spec.executable)
         .args(&spec.login_args)
+        .envs(spec.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
@@ -361,17 +417,51 @@ fn probe_cli(spec: &CliCommandSpec) -> EngineStatus {
     )
     .to_lowercase();
 
-    if combined.contains("login")
-        || combined.contains("not authenticated")
-        || combined.contains("unauthorized")
-        || combined.contains("auth required")
-    {
+    if looks_like_cli_auth_error(&combined) {
         EngineStatus::NeedsLogin
     } else if output.status.success() {
         EngineStatus::Ready
     } else {
         EngineStatus::Installed
     }
+}
+
+fn looks_like_cli_auth_error(output: &str) -> bool {
+    let output = output.to_lowercase();
+    output.contains("login")
+        || output.contains("not authenticated")
+        || output.contains("unauthorized")
+        || output.contains("auth required")
+        || output.contains("authentication")
+        || output.contains("forbidden")
+        || output.contains("ineligibletiererror")
+        || output.contains("ineligible tier")
+}
+
+fn sidecar_error_message(
+    status: Result<std::process::ExitStatus, std::io::Error>,
+    stderr: &str,
+    no_stdout_content: bool,
+) -> String {
+    let reason = match status {
+        Ok(status) if status.success() && no_stdout_content => {
+            "engine process finished without output".to_string()
+        }
+        Ok(status) => format!("engine process exited with {status}"),
+        Err(err) => format!("engine process wait failed: {err}"),
+    };
+    let stderr = last_chars(stderr.trim(), 500);
+    if stderr.is_empty() {
+        reason
+    } else {
+        format!("{reason}: {stderr}")
+    }
+}
+
+fn last_chars(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars().rev().take(max_chars).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 pub fn parse_cli_stdout_line(line: &str) -> Vec<String> {
@@ -674,11 +764,20 @@ data: [DONE]
         assert_eq!(engine.probe(), EngineStatus::Missing);
     }
 
+    #[test]
+    fn probe_auth_error_detection_includes_cli_eligibility_failures() {
+        assert!(looks_like_cli_auth_error(
+            "IneligibleTierError: This account cannot use Gemini CLI"
+        ));
+        assert!(looks_like_cli_auth_error("not authenticated"));
+        assert!(!looks_like_cli_auth_error("gemini version 0.40.1"));
+    }
+
     #[tokio::test]
     async fn stream_terminates_with_done_when_process_exits_immediately_without_output() {
         // Simulates a sidecar CLI that crashes/exits before writing anything —
-        // the stream must still terminate with a `done` delta instead of
-        // hanging or silently dropping the conversation turn.
+        // the stream must surface an error delta and terminate with `done`
+        // instead of hanging or silently dropping the conversation turn.
         let engine = CliSidecarEngine::for_test("sh", vec!["-c".to_string(), "exit 1".to_string()]);
 
         let deltas = collect_stream_with_timeout(
@@ -688,6 +787,35 @@ data: [DONE]
         .await;
 
         assert!(!deltas.is_empty(), "must emit at least the done delta");
+        assert!(deltas
+            .iter()
+            .any(|delta| delta.content.contains("engine process exited")));
+        assert!(deltas.last().is_some_and(|delta| delta.done));
+    }
+
+    #[tokio::test]
+    async fn stream_reports_stderr_when_process_exits_without_stdout() {
+        let engine = CliSidecarEngine::for_test(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "cat >/dev/null; printf '%s' 'IneligibleTierError: Gemini auth failed' >&2; exit 1"
+                    .to_string(),
+            ],
+        );
+
+        let deltas = collect_stream_with_timeout(
+            engine.send(request(Mode::Interpret)),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let error_delta = deltas
+            .iter()
+            .find(|delta| delta.content.contains("IneligibleTierError"))
+            .expect("stderr must be surfaced as an error delta");
+        assert!(!error_delta.done);
+        assert!(error_delta.content.contains("engine process exited"));
         assert!(deltas.last().is_some_and(|delta| delta.done));
     }
 
