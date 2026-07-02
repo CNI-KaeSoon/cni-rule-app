@@ -61,6 +61,6 @@ jobs:
         with:
           name: cni-rule-windows-installer
           path: |
-            app/src-tauri/target/release/bundle/nsis/*.exe
-            app/src-tauri/target/release/bundle/nsis/*.msi
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
           if-no-files-found: error
