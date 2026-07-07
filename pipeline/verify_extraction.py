@@ -39,6 +39,8 @@ class VerificationCase:
     status: str
     pdf_excerpt: str
     body_excerpt: str
+    diagnosis: str | None = None
+    diagnosis_detail: dict[str, object] | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -205,18 +207,75 @@ def extract_pdf_text(pdf_path: Path, page_range: tuple[int, int]) -> str:
     return "\n".join(parts)
 
 
+def load_pdf_page_texts(pdf_path: Path) -> dict[int, str]:
+    with pdfplumber.open(pdf_path) as pdf:
+        return {
+            page_no: page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            for page_no, page in enumerate(pdf.pages, start=1)
+        }
+
+
+def text_for_page_range(page_texts: dict[int, str], page_range: tuple[int, int]) -> str:
+    start, end = page_range
+    max_page = max(page_texts) if page_texts else 0
+    if end > max_page:
+        raise ValueError(f"page range {page_range} exceeds PDF page count {max_page}")
+    return "\n".join(page_texts.get(page_no, "") for page_no in range(start, end + 1))
+
+
+def diagnose_mismatch(
+    item: ExtractedItem,
+    recorded_score: float,
+    page_texts: dict[int, str],
+) -> tuple[str, dict[str, object]]:
+    best_page = 0
+    best_score = -1.0
+    best_text = ""
+    for page_no, page_text in page_texts.items():
+        score = similarity_score(item.body, page_text)
+        if score > best_score:
+            best_page = page_no
+            best_score = score
+            best_text = page_text
+
+    recorded_start, recorded_end = item.pages
+    recorded_page = recorded_start
+    detail: dict[str, object] = {
+        "kind": "text-error",
+        "recorded_page": recorded_page,
+        "recorded_pages": [recorded_start, recorded_end],
+        "recorded_score": round(recorded_score, 4),
+        "best_page": best_page,
+        "best_score": round(best_score, 4),
+        "best_excerpt": normalize_text(best_text)[:200],
+    }
+    if best_page not in range(recorded_start, recorded_end + 1) and best_score >= PARTIAL_THRESHOLD and best_score > recorded_score:
+        offset = best_page - recorded_page
+        detail.update({"kind": "page-error", "actual_page": best_page, "offset": offset})
+        return f"page-error(actual={best_page}, recorded={recorded_page}, offset={offset})", detail
+    return "text-error", detail
+
+
 def verify_items(items: list[ExtractedItem], pdf_path: Path) -> list[VerificationCase]:
     cases: list[VerificationCase] = []
+    page_texts = load_pdf_page_texts(pdf_path)
     for item in items:
-        pdf_text = extract_pdf_text(pdf_path, item.pages)
+        pdf_text = text_for_page_range(page_texts, item.pages)
         score = similarity_score(item.body, pdf_text)
+        status = verdict(score)
+        diagnosis = None
+        diagnosis_detail = None
+        if status == "mismatch":
+            diagnosis, diagnosis_detail = diagnose_mismatch(item, score, page_texts)
         cases.append(
             VerificationCase(
                 item=item,
                 score=score,
-                status=verdict(score),
+                status=status,
                 pdf_excerpt=normalize_text(pdf_text)[:200],
                 body_excerpt=normalize_text(item.body)[:200],
+                diagnosis=diagnosis,
+                diagnosis_detail=diagnosis_detail,
             )
         )
     return cases
@@ -232,7 +291,7 @@ def summarize(cases: list[VerificationCase]) -> dict[str, dict[str, int]]:
 
 
 def case_to_json(case: VerificationCase) -> dict[str, object]:
-    return {
+    payload = {
         "id": case.item.item_id,
         "institution": case.item.institution,
         "rule": case.item.rule,
@@ -245,6 +304,11 @@ def case_to_json(case: VerificationCase) -> dict[str, object]:
         "body_excerpt": case.body_excerpt,
         "pdf_excerpt": case.pdf_excerpt,
     }
+    if case.diagnosis is not None:
+        payload["diagnosis"] = case.diagnosis
+    if case.diagnosis_detail is not None:
+        payload["diagnosis_detail"] = case.diagnosis_detail
+    return payload
 
 
 def write_json_report(
@@ -306,11 +370,14 @@ def write_markdown_report(
                 f"- Kind: {case.item.kind}",
                 f"- Pages: {case.item.pages[0]}-{case.item.pages[1]}",
                 f"- Score: {case.score:.4f}",
+                f"- Diagnosis: {case.diagnosis or 'n/a'}",
                 f"- Markdown excerpt: {case.body_excerpt}",
                 f"- pdfplumber excerpt: {case.pdf_excerpt}",
-                "",
             ]
         )
+        if case.diagnosis_detail and case.diagnosis_detail.get("best_excerpt"):
+            lines.append(f"- Best-page excerpt: {case.diagnosis_detail['best_excerpt']}")
+        lines.append("")
     (output_dir / "verify-report.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 

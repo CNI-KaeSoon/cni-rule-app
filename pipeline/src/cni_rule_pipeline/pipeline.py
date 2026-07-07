@@ -706,6 +706,8 @@ def article_pages_from_spans(
     result: dict[str, tuple[int, int]] = {}
     for idx, match in enumerate(matches):
         key = article_key(match.group("num"), match.group("sub"))
+        if key in result:
+            continue
         start = match.start()
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
         overlapping = [span.page_no for span in page_spans if span.start < end and span.end > start]
@@ -724,6 +726,8 @@ def estimate_article_pages(entry: TocEntry, text: str, matches: list[re.Match[st
     result: dict[str, tuple[int, int]] = {}
     for idx, match in enumerate(matches):
         key = article_key(match.group("num"), match.group("sub"))
+        if key in result:
+            continue
         start_line = text[: match.start()].count("\n")
         end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
         end_line = text[:end_pos].count("\n")

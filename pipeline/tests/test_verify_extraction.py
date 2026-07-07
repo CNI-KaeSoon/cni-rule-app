@@ -14,6 +14,8 @@ SPEC.loader.exec_module(verify_extraction)
 normalize_text = verify_extraction.normalize_text
 similarity_score = verify_extraction.similarity_score
 verdict = verify_extraction.verdict
+ExtractedItem = verify_extraction.ExtractedItem
+diagnose_mismatch = verify_extraction.diagnose_mismatch
 
 
 def test_normalize_text_folds_whitespace_and_nbsp():
@@ -34,3 +36,54 @@ def test_similarity_score_classifies_partial_and_mismatch():
 
     assert verdict(partial) == "partial"
     assert verdict(mismatch) == "mismatch"
+
+
+def test_diagnose_mismatch_classifies_page_error_with_offset():
+    item = ExtractedItem(
+        path=Path("rules/규칙/제2조.md"),
+        item_id="규칙#제2조",
+        institution="cni",
+        rule="규칙",
+        kind="article",
+        label="제2조",
+        pages=(5, 5),
+        body="제2조(정의) 이 규칙에서 직원은 근로자를 말한다.",
+    )
+
+    diagnosis, detail = diagnose_mismatch(
+        item,
+        recorded_score=0.1,
+        page_texts={
+            5: "부 칙 제2조(다른 규칙의 개정) 관련 문구",
+            3: "제2조(정의) 이 규칙에서 직원은 근로자를 말한다.",
+        },
+    )
+
+    assert diagnosis == "page-error(actual=3, recorded=5, offset=-2)"
+    assert detail["kind"] == "page-error"
+    assert detail["actual_page"] == 3
+
+
+def test_diagnose_mismatch_classifies_text_error_without_better_page():
+    item = ExtractedItem(
+        path=Path("rules/규칙/제2조.md"),
+        item_id="규칙#제2조",
+        institution="cni",
+        rule="규칙",
+        kind="article",
+        label="제2조",
+        pages=(5, 5),
+        body="제2조(정의) 이 규칙에서 직원은 근로자를 말한다.",
+    )
+
+    diagnosis, detail = diagnose_mismatch(
+        item,
+        recorded_score=0.1,
+        page_texts={
+            5: "부 칙 제2조(다른 규칙의 개정) 관련 문구",
+            3: "완전히 다른 본문",
+        },
+    )
+
+    assert diagnosis == "text-error"
+    assert detail["kind"] == "text-error"

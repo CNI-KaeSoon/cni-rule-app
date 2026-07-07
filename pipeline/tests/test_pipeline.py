@@ -162,6 +162,25 @@ def test_parse_articles_skips_duplicate_article_keys():
     assert articles[0].title == "목적"
 
 
+def test_duplicate_supplementary_article_does_not_override_source_pages():
+    entry = TocEntry(code="III-2", rule="직제규정", start_page=91, end_page=93)
+    page_91 = "직제규정\n제1조(목적) 본문 제1조이다.\n제2조(정의) 본문 제2조이다."
+    page_92 = "제3조(운영) 본문 제3조이다."
+    page_93 = "부 칙\n제1조(시행일) 부칙 제1조이다.\n제2조(경과조치) 부칙 제2조이다."
+    text = f"{page_91}\n{page_92}\n{page_93}"
+    spans = [
+        PageSpan(page_no=91, start=0, end=len(page_91)),
+        PageSpan(page_no=92, start=len(page_91) + 1, end=len(page_91) + 1 + len(page_92)),
+        PageSpan(page_no=93, start=len(page_91) + len(page_92) + 2, end=len(text)),
+    ]
+
+    articles = parse_articles(entry, text, page_spans=spans)
+
+    assert [article.article for article in articles] == ["제1조", "제2조", "제3조"]
+    assert articles[0].source_pages == (91, 91)
+    assert articles[1].source_pages == (91, 91)
+
+
 def test_extract_refs_uses_known_rule_suffix():
     refs = extract_refs(
         "연구원의 직제규정 제4조와 직원대외활동규칙 제4조를 따른다.",
