@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     let args = public_rules_mcp::load_transport_args()?;
     let mut config: public_rules_mcp::ServerConfig = toml::from_str(CNI_CONFIG)?;
     config.pack.path = Some(executable_rules_dir()?);
-    public_rules_mcp::run_server(config, args.transport, args.bind_addr).await
+    public_rules_mcp::run_server_with_transport_args(config, args).await
 }
 
 fn executable_rules_dir() -> anyhow::Result<std::path::PathBuf> {
