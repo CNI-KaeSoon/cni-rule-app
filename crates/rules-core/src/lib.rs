@@ -55,6 +55,7 @@ pub enum EdgeKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchHit {
     pub article_id: String,
+    pub institution: String,
     pub score: f32,
     pub snippet: String,
     pub rule: String,
@@ -399,6 +400,7 @@ impl TantivyRulesIndex {
             }
             bm25_hits.push(SearchHit {
                 article_id: article.id.clone(),
+                institution: article.institution.clone(),
                 score,
                 snippet: snippet(&article.body, q),
                 rule: article.rule.clone(),
@@ -429,6 +431,7 @@ impl TantivyRulesIndex {
                     }
                     rule_hits.push(SearchHit {
                         article_id: article.id.clone(),
+                        institution: article.institution.clone(),
                         score,
                         snippet: snippet(&article.body, q),
                         rule: article.rule.clone(),
@@ -510,6 +513,7 @@ impl TantivyRulesIndex {
         }
         Some(SearchHit {
             article_id: article.id.clone(),
+            institution: article.institution.clone(),
             score: f32::MAX,
             snippet: snippet(&article.body, q),
             rule: article.rule.clone(),
@@ -1119,6 +1123,7 @@ fn lexical_rank<'a>(
         if score > 0.0 {
             hits.push(SearchHit {
                 article_id: article.id.clone(),
+                institution: article.institution.clone(),
                 score,
                 snippet: snippet(&article.body, q),
                 rule: article.rule.clone(),

@@ -45,6 +45,7 @@ pub struct CliArgs {
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub query_log_path: Option<PathBuf>,
+    pub extra_packs: Vec<ExtraPackConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,8 @@ pub struct ServerConfig {
     pub institution: String,
     #[serde(default)]
     pub pack: PackConfig,
+    #[serde(default)]
+    pub extra_packs: Vec<ExtraPackConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -70,6 +73,13 @@ pub struct PackConfig {
     pub source_commit: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtraPackConfig {
+    pub institution: String,
+    #[serde(default)]
+    pub pack: PackConfig,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct SearchRulesParams {
     pub query: String,
@@ -77,12 +87,16 @@ pub struct SearchRulesParams {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub rule: Option<String>,
+    #[serde(default)]
+    pub institution: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct SearchRulesResult {
     pub hits: Vec<SearchHit>,
     pub meta: FreshnessMeta,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hit_meta: BTreeMap<String, FreshnessMeta>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -129,7 +143,20 @@ pub struct StatusResult {
     pub source_commit: String,
     pub index_built_at: String,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub institutions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<LoadedPackStatus>,
     pub meta: FreshnessMeta,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct LoadedPackStatus {
+    pub institution: String,
+    pub effective_date: String,
+    pub source_commit: String,
+    pub index_built_at: String,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -142,15 +169,29 @@ pub struct FreshnessMeta {
 
 #[derive(Debug, Clone)]
 pub struct PublicRulesServer {
-    index: Arc<TantivyRulesIndex>,
+    packs: Arc<Vec<LoadedPack>>,
+    default_institution: String,
+    multi_pack: bool,
     tool_router: ToolRouter<Self>,
     query_logger: Option<QueryLogger>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedPack {
+    institution: String,
+    index: Arc<TantivyRulesIndex>,
+}
+
 impl PublicRulesServer {
     pub fn new(index: TantivyRulesIndex) -> Self {
+        let institution = index.status().institution;
         Self {
-            index: Arc::new(index),
+            packs: Arc::new(vec![LoadedPack {
+                institution: institution.clone(),
+                index: Arc::new(index),
+            }]),
+            default_institution: institution,
+            multi_pack: false,
             tool_router: Self::tool_router(),
             query_logger: None,
         }
@@ -162,31 +203,33 @@ impl PublicRulesServer {
     }
 
     pub fn from_config(config: ServerConfig) -> anyhow::Result<Self> {
-        let institution = config.institution.clone();
-        let path = config
-            .pack
-            .path
-            .ok_or_else(|| anyhow::anyhow!("pack.path is required for M0 local stdio server"))?;
-        let index = if path.is_file() {
-            TantivyRulesIndex::from_pack_archive(path)?
-        } else if path.join("manifest.json").is_file() {
-            TantivyRulesIndex::from_pack_dir(path)?
-        } else {
-            let effective = if let Some(effective) = config.pack.effective.clone() {
-                effective
-            } else {
-                most_frequent_effective(&path)?.unwrap_or_else(|| "unknown".to_string())
-            };
-            let source_commit = config
-                .pack
-                .source_commit
-                .clone()
-                .unwrap_or_else(|| "bare-dir".to_string());
-            let mut status = default_pack_status(institution, effective);
-            status.source_commit = source_commit;
-            TantivyRulesIndex::from_articles_dir(path, status)?
-        };
-        Ok(Self::new(index))
+        let default_institution = config.institution.clone();
+        let mut seen = BTreeMap::new();
+        seen.insert(default_institution.clone(), ());
+        let mut packs = vec![LoadedPack {
+            institution: default_institution.clone(),
+            index: Arc::new(load_pack(default_institution.clone(), config.pack)?),
+        }];
+        for extra in config.extra_packs {
+            if seen.insert(extra.institution.clone(), ()).is_some() {
+                return Err(anyhow::anyhow!(
+                    "duplicate pack institution: {}",
+                    extra.institution
+                ));
+            }
+            packs.push(LoadedPack {
+                institution: extra.institution.clone(),
+                index: Arc::new(load_pack(extra.institution, extra.pack)?),
+            });
+        }
+        let multi_pack = packs.len() > 1;
+        Ok(Self {
+            packs: Arc::new(packs),
+            default_institution,
+            multi_pack,
+            tool_router: Self::tool_router(),
+            query_logger: None,
+        })
     }
 
     pub fn from_config_toml(toml_text: &str) -> anyhow::Result<Self> {
@@ -194,7 +237,11 @@ impl PublicRulesServer {
     }
 
     fn status_meta(&self, article: Option<&Article>) -> FreshnessMeta {
-        let status = self.index.status();
+        let status = article
+            .and_then(|article| self.pack_for_institution(&article.institution))
+            .unwrap_or_else(|| self.default_pack())
+            .index
+            .status();
         FreshnessMeta {
             effective: article
                 .map(|article| article.effective.clone())
@@ -205,6 +252,75 @@ impl PublicRulesServer {
             source_commit: status.source_commit,
             extra: BTreeMap::new(),
         }
+    }
+
+    fn default_pack(&self) -> &LoadedPack {
+        self.packs
+            .iter()
+            .find(|pack| pack.institution == self.default_institution)
+            .unwrap_or_else(|| &self.packs[0])
+    }
+
+    fn pack_for_institution(&self, institution: &str) -> Option<&LoadedPack> {
+        self.packs
+            .iter()
+            .find(|pack| pack.institution == institution)
+    }
+
+    fn selected_packs(&self, institution: Option<&str>) -> Vec<&LoadedPack> {
+        match institution {
+            Some(institution) => self
+                .pack_for_institution(institution)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            None => self.packs.iter().collect(),
+        }
+    }
+
+    fn namespace_article(&self, mut article: Article, institution: &str) -> Article {
+        article.institution = institution.to_string();
+        if self.multi_pack {
+            article.id = prefixed_article_id(institution, &article.id);
+            article.prev_id = article
+                .prev_id
+                .map(|id| prefixed_article_id(institution, &id));
+            article.next_id = article
+                .next_id
+                .map(|id| prefixed_article_id(institution, &id));
+            for reference in &mut article.refs {
+                reference.target = prefixed_article_id(institution, &reference.target);
+            }
+        }
+        article
+    }
+
+    fn resolve_article_id<'a>(&'a self, id: &'a str) -> Option<(&'a LoadedPack, &'a str)> {
+        if let Some((institution, local_id)) = id.split_once('/') {
+            if !institution.is_empty() && local_id.contains(rules_core::ARTICLE_ID_SEPARATOR) {
+                return self
+                    .pack_for_institution(institution)
+                    .map(|pack| (pack, local_id));
+            }
+        }
+        Some((self.default_pack(), id))
+    }
+
+    fn hit_meta(&self, hits: &[SearchHit]) -> BTreeMap<String, FreshnessMeta> {
+        hits.iter()
+            .filter_map(|hit| {
+                let pack = self.pack_for_institution(&hit.institution)?;
+                let status = pack.index.status();
+                Some((
+                    hit.article_id.clone(),
+                    FreshnessMeta {
+                        effective: hit.effective.clone(),
+                        amended: hit.effective.clone(),
+                        source_commit: status.source_commit,
+                        extra: BTreeMap::new(),
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn log_query(&self, started_at: Instant, event: serde_json::Value) {
@@ -282,6 +398,63 @@ fn optional_query_logger(path: Option<PathBuf>) -> Option<QueryLogger> {
     }
 }
 
+fn load_pack(institution: String, pack: PackConfig) -> anyhow::Result<TantivyRulesIndex> {
+    let path = pack
+        .path
+        .ok_or_else(|| anyhow::anyhow!("pack.path is required for M0 local stdio server"))?;
+    let index = if path.is_file() {
+        TantivyRulesIndex::from_pack_archive(path)?
+    } else if path.join("manifest.json").is_file() {
+        TantivyRulesIndex::from_pack_dir(path)?
+    } else {
+        let effective = if let Some(effective) = pack.effective.clone() {
+            effective
+        } else {
+            most_frequent_effective(&path)?.unwrap_or_else(|| "unknown".to_string())
+        };
+        let source_commit = pack
+            .source_commit
+            .clone()
+            .unwrap_or_else(|| "bare-dir".to_string());
+        let mut status = default_pack_status(institution, effective);
+        status.source_commit = source_commit;
+        TantivyRulesIndex::from_articles_dir(path, status)?
+    };
+    Ok(index)
+}
+
+fn prefixed_article_id(institution: &str, article_id: &str) -> String {
+    format!("{institution}/{article_id}")
+}
+
+fn search_pack(
+    pack: &LoadedPack,
+    query: &str,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+) -> Vec<SearchHit> {
+    pack.index
+        .search(
+            query,
+            limit,
+            Some(RuleFilter {
+                institution: None,
+                rule,
+                ..RuleFilter::default()
+            }),
+        )
+        .into_iter()
+        .map(|mut hit| {
+            hit.institution = pack.institution.clone();
+            if multi_pack {
+                hit.article_id = prefixed_article_id(&hit.institution, &hit.article_id);
+            }
+            hit
+        })
+        .collect()
+}
+
 fn most_frequent_effective(path: &Path) -> anyhow::Result<Option<String>> {
     let mut counts = BTreeMap::<String, usize>::new();
     collect_effective_counts(path, &mut counts)?;
@@ -330,11 +503,40 @@ impl PublicRulesServer {
         let query = params.query.clone();
         let top_k = params.top_k;
         let rule = params.rule.clone();
-        let filter = rule.clone().map(|rule| RuleFilter {
-            rule: Some(rule),
-            ..RuleFilter::default()
-        });
-        let hits = self.index.search(&query, top_k.unwrap_or(5), filter);
+        let institution = params.institution.clone();
+        let limit = top_k.unwrap_or(5);
+        let selected_packs = self.selected_packs(institution.as_deref());
+        let rankings = if selected_packs.len() <= 1 {
+            selected_packs
+                .into_iter()
+                .map(|pack| search_pack(pack, &query, limit, rule.clone(), self.multi_pack))
+                .collect::<Vec<_>>()
+        } else {
+            std::thread::scope(|scope| {
+                selected_packs
+                    .into_iter()
+                    .map(|pack| {
+                        let query = &query;
+                        let rule = rule.clone();
+                        let multi_pack = self.multi_pack;
+                        scope.spawn(move || search_pack(pack, query, limit, rule, multi_pack))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let hits = if rankings.len() <= 1 {
+            rankings.into_iter().next().unwrap_or_default()
+        } else {
+            rules_core::rrf_fuse(rankings, limit)
+        };
+        let hit_meta = if self.multi_pack {
+            self.hit_meta(&hits)
+        } else {
+            BTreeMap::new()
+        };
         self.log_query(
             started_at,
             serde_json::json!({
@@ -344,6 +546,7 @@ impl PublicRulesServer {
                     "query": query.clone(),
                     "top_k": top_k,
                     "rule": rule,
+                    "institution": institution,
                 },
                 "result": {
                     "article_ids": hits.iter().map(|hit| hit.article_id.as_str()).collect::<Vec<_>>(),
@@ -354,6 +557,7 @@ impl PublicRulesServer {
         Json(SearchRulesResult {
             hits,
             meta: self.status_meta(None),
+            hit_meta,
         })
     }
 
@@ -367,7 +571,11 @@ impl PublicRulesServer {
     ) -> Json<GetArticleResult> {
         let started_at = Instant::now();
         let id = params.id;
-        let article = self.index.get_article(&id);
+        let article = self.resolve_article_id(&id).and_then(|(pack, local_id)| {
+            pack.index
+                .get_article(local_id)
+                .map(|article| self.namespace_article(article, &pack.institution))
+        });
         self.log_query(
             started_at,
             serde_json::json!({
@@ -394,7 +602,11 @@ impl PublicRulesServer {
     #[tool(name = "list_rules", description = "List rules in the loaded pack.")]
     pub async fn list_rules(&self) -> Json<ListRulesResult> {
         let started_at = Instant::now();
-        let rules = self.index.list_rules();
+        let rules = self
+            .packs
+            .iter()
+            .flat_map(|pack| pack.index.list_rules())
+            .collect::<Vec<_>>();
         self.log_query(
             started_at,
             serde_json::json!({
@@ -421,11 +633,16 @@ impl PublicRulesServer {
     ) -> Json<GetLegalBasisResult> {
         let started_at = Instant::now();
         let id = params.id;
-        let article = self.index.get_article(&id);
+        let resolved = self.resolve_article_id(&id);
+        let article = resolved.and_then(|(pack, local_id)| pack.index.get_article(local_id));
         let basis = article
             .as_ref()
             .map(|article| article.legal_basis.clone())
-            .unwrap_or_else(|| self.index.related_laws(&id));
+            .unwrap_or_else(|| {
+                resolved
+                    .map(|(pack, local_id)| pack.index.related_laws(local_id))
+                    .unwrap_or_default()
+            });
         self.log_query(
             started_at,
             serde_json::json!({
@@ -445,18 +662,55 @@ impl PublicRulesServer {
     #[tool(name = "status", description = "Return loaded pack freshness status.")]
     pub async fn status(&self) -> Json<StatusResult> {
         let started_at = Instant::now();
-        let status = StatusResult::from(self.index.status());
+        let status = self.status_result();
         self.log_query(
             started_at,
             serde_json::json!({
                 "tool": STATUS_TOOL,
                 "params": {},
                 "result": {
-                    "count": 1,
+                    "count": self.packs.len(),
                 },
             }),
         );
         Json(status)
+    }
+}
+
+impl PublicRulesServer {
+    fn status_result(&self) -> StatusResult {
+        let default_status = self.default_pack().index.status();
+        let packs = if self.multi_pack {
+            self.packs
+                .iter()
+                .map(|pack| LoadedPackStatus::from(pack.index.status()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let institutions = if self.multi_pack {
+            packs
+                .iter()
+                .map(|pack| pack.institution.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        StatusResult {
+            institution: default_status.institution.clone(),
+            effective_date: default_status.effective_date.clone(),
+            source_commit: default_status.source_commit.clone(),
+            index_built_at: default_status.index_built_at.clone(),
+            stale: default_status.stale,
+            institutions,
+            packs,
+            meta: FreshnessMeta {
+                effective: default_status.effective_date.clone(),
+                amended: default_status.effective_date,
+                source_commit: default_status.source_commit,
+                extra: BTreeMap::new(),
+            },
+        }
     }
 }
 
@@ -483,7 +737,21 @@ impl From<PackStatus> for StatusResult {
             source_commit: status.source_commit,
             index_built_at: status.index_built_at,
             stale: status.stale,
+            institutions: Vec::new(),
+            packs: Vec::new(),
             meta,
+        }
+    }
+}
+
+impl From<PackStatus> for LoadedPackStatus {
+    fn from(status: PackStatus) -> Self {
+        Self {
+            institution: status.institution,
+            effective_date: status.effective_date,
+            source_commit: status.source_commit,
+            index_built_at: status.index_built_at,
+            stale: status.stale,
         }
     }
 }
@@ -607,6 +875,7 @@ where
     let mut args = args.into_iter().map(Into::into);
     let mut config_path = None;
     let mut transport_args = TransportArgs::default();
+    let mut extra_packs = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -615,6 +884,12 @@ where
                         .map(PathBuf::from)
                         .ok_or_else(|| anyhow::anyhow!("--config requires a TOML path"))?,
                 );
+            }
+            "--extra-pack" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--extra-pack requires <slug>=<path>"))?;
+                extra_packs.push(parse_extra_pack_arg(&value)?);
             }
             _ => parse_transport_arg(&arg, &mut args, &mut transport_args)?,
         }
@@ -627,6 +902,7 @@ where
         bind_addr: transport_args.bind_addr,
         allowed_hosts: transport_args.allowed_hosts,
         query_log_path: transport_args.query_log_path,
+        extra_packs,
     })
 }
 
@@ -717,6 +993,22 @@ fn parse_bind_addr(value: String) -> anyhow::Result<SocketAddr> {
     })
 }
 
+fn parse_extra_pack_arg(value: &str) -> anyhow::Result<ExtraPackConfig> {
+    let (institution, path) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--extra-pack requires <slug>=<path>"))?;
+    if institution.trim().is_empty() || path.trim().is_empty() {
+        return Err(anyhow::anyhow!("--extra-pack requires <slug>=<path>"));
+    }
+    Ok(ExtraPackConfig {
+        institution: institution.to_string(),
+        pack: PackConfig {
+            path: Some(PathBuf::from(path)),
+            ..PackConfig::default()
+        },
+    })
+}
+
 fn default_allowed_hosts() -> Vec<String> {
     StreamableHttpServerConfig::default().allowed_hosts
 }
@@ -768,6 +1060,77 @@ refs: []
         PublicRulesServer::new(index)
     }
 
+    fn fixture_article(
+        institution: &str,
+        rule: &str,
+        article: &str,
+        title: &str,
+        effective: &str,
+        body: &str,
+    ) -> Article {
+        rules_core::parse_article_markdown_str(&format!(
+            r#"---
+institution: {institution}
+rule: {rule}
+article: {article}
+title: {title}
+effective: {effective}
+amended: {effective}
+status: active
+supersedes: null
+legal_basis: []
+refs: []
+---
+{body}
+"#
+        ))
+        .unwrap()
+    }
+
+    fn multi_pack_fixture_server() -> PublicRulesServer {
+        let cni = TantivyRulesIndex::from_articles(
+            vec![fixture_article(
+                "cni",
+                "인사규정",
+                "제10조",
+                "육아휴직",
+                "2026-02-27",
+                "① 직원은 육아휴직을 신청할 수 있다.",
+            )],
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let ctp = TantivyRulesIndex::from_articles(
+            vec![fixture_article(
+                "ctp",
+                "인사규정",
+                "제10조",
+                "육아휴직",
+                "2026-03-01",
+                "① 임직원 육아휴직 기간은 별도로 정한다.",
+            )],
+            default_pack_status("ctp", "2026-03-01"),
+        )
+        .unwrap();
+
+        PublicRulesServer {
+            packs: Arc::new(vec![
+                LoadedPack {
+                    institution: "cni".to_string(),
+                    index: Arc::new(cni),
+                },
+                LoadedPack {
+                    institution: "ctp".to_string(),
+                    index: Arc::new(ctp),
+                },
+            ]),
+            default_institution: "cni".to_string(),
+            multi_pack: true,
+            tool_router: PublicRulesServer::tool_router(),
+            query_logger: None,
+        }
+    }
+
     // §6 계약: "모든 응답 meta에 effective·amended·source_commit 포함(신선도 계약)."
 
     #[tokio::test]
@@ -778,12 +1141,76 @@ refs: []
                 query: "항공운임".to_string(),
                 top_k: Some(5),
                 rule: None,
+                institution: None,
             }))
             .await;
 
         assert!(!result.hits.is_empty());
         assert_eq!(result.hits[0].article_id, "여비지급규칙#제12조");
+        assert_eq!(result.hits[0].institution, "cni");
         assert_eq!(result.hits[0].rule, "여비지급규칙");
+    }
+
+    #[tokio::test]
+    async fn multi_pack_search_labels_filters_and_prefixes_article_ids() {
+        let server = multi_pack_fixture_server();
+        let Json(result) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "육아휴직".to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: None,
+            }))
+            .await;
+
+        let ids = result
+            .hits
+            .iter()
+            .map(|hit| (hit.institution.as_str(), hit.article_id.as_str()))
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&("cni", "cni/인사규정#제10조")));
+        assert!(ids.contains(&("ctp", "ctp/인사규정#제10조")));
+        assert_eq!(
+            result
+                .hit_meta
+                .get("ctp/인사규정#제10조")
+                .map(|meta| meta.effective.as_str()),
+            Some("2026-03-01")
+        );
+
+        let Json(filtered) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "육아휴직".to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: Some("ctp".to_string()),
+            }))
+            .await;
+        assert_eq!(filtered.hits.len(), 1);
+        assert_eq!(filtered.hits[0].institution, "ctp");
+        assert_eq!(filtered.hits[0].article_id, "ctp/인사규정#제10조");
+    }
+
+    #[tokio::test]
+    async fn multi_pack_get_article_accepts_prefixed_and_default_unprefixed_ids() {
+        let server = multi_pack_fixture_server();
+        let Json(prefixed) = server
+            .get_article(Parameters(GetArticleParams {
+                id: "ctp/인사규정#제10조".to_string(),
+            }))
+            .await;
+        let prefixed_article = prefixed.article.expect("prefixed article must resolve");
+        assert_eq!(prefixed_article.id, "ctp/인사규정#제10조");
+        assert_eq!(prefixed_article.institution, "ctp");
+
+        let Json(unprefixed) = server
+            .get_article(Parameters(GetArticleParams {
+                id: "인사규정#제10조".to_string(),
+            }))
+            .await;
+        let default_article = unprefixed.article.expect("default article must resolve");
+        assert_eq!(default_article.id, "cni/인사규정#제10조");
+        assert_eq!(default_article.institution, "cni");
     }
 
     #[tokio::test]
@@ -1039,6 +1466,7 @@ refs: []
                 effective: None,
                 source_commit: Some("local-test".to_string()),
             },
+            extra_packs: Vec::new(),
         })
         .unwrap();
         let Json(result) = server.status().await;

@@ -113,6 +113,60 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn streamable_http_searches_multiple_packs_with_institution_labels() -> anyhow::Result<()> {
+    let cni_root = make_institution_pack("cni", "2026-02-27", "직원은 육아휴직을 신청할 수 있다.")?;
+    let ctp_root =
+        make_institution_pack("ctp", "2026-03-01", "임직원 육아휴직 기간은 별도로 정한다.")?;
+    let mut config = fixture_config(cni_root.clone());
+    config.extra_packs.push(public_rules_mcp::ExtraPackConfig {
+        institution: "ctp".to_string(),
+        pack: PackConfig {
+            path: Some(ctp_root),
+            url: None,
+            effective: Some("2026-03-01".to_string()),
+            source_commit: Some("http-fixture-ctp".to_string()),
+        },
+    });
+
+    let addr = unused_loopback_addr().await?;
+    let server_handle = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        config,
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: Vec::new(),
+            query_log_path: None,
+        },
+    ));
+    let url = format!("http://{addr}/mcp");
+    let client = connect_with_retry(&url).await?;
+
+    let arguments = serde_json::from_value(serde_json::json!({
+        "query": "육아휴직",
+        "top_k": 5
+    }))?;
+    let result = client
+        .call_tool(CallToolRequestParams::new(SEARCH_RULES_TOOL).with_arguments(arguments))
+        .await?;
+    assert_ne!(result.is_error, Some(true));
+
+    let payload = tool_result_json(result)?;
+    let search_result: SearchRulesResult = serde_json::from_value(payload)?;
+    let hits = search_result
+        .hits
+        .iter()
+        .map(|hit| (hit.institution.as_str(), hit.article_id.as_str()))
+        .collect::<Vec<_>>();
+    assert!(hits.contains(&("cni", "cni/인사규정#제10조")));
+    assert!(hits.contains(&("ctp", "ctp/인사규정#제10조")));
+
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn streamable_http_rejects_untrusted_host_header() -> anyhow::Result<()> {
     let fixture_root = make_fixture_pack()?;
     let addr = unused_loopback_addr().await?;
@@ -241,6 +295,7 @@ fn fixture_config(fixture_root: std::path::PathBuf) -> ServerConfig {
             effective: Some("2026-02-27".to_string()),
             source_commit: Some("http-fixture".to_string()),
         },
+        extra_packs: Vec::new(),
     }
 }
 
@@ -267,17 +322,61 @@ fn make_fixture_pack() -> anyhow::Result<std::path::PathBuf> {
     Ok(root)
 }
 
+fn make_institution_pack(
+    institution: &str,
+    effective: &str,
+    body: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let root = std::env::temp_dir().join(format!(
+        "public-rules-mcp-http-{institution}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let rule_dir = root.join("인사규정");
+    fs::create_dir_all(&rule_dir)?;
+    write_article_with_institution(
+        &rule_dir.join("제10조.md"),
+        institution,
+        effective,
+        "인사규정",
+        "제10조",
+        "육아휴직",
+        body,
+    )?;
+    Ok(root)
+}
+
 fn write_article(path: &Path, article: &str, title: &str, body: &str) -> anyhow::Result<()> {
+    write_article_with_institution(
+        path,
+        "cni",
+        "2026-02-27",
+        "여비지급규칙",
+        article,
+        title,
+        body,
+    )
+}
+
+fn write_article_with_institution(
+    path: &Path,
+    institution: &str,
+    effective: &str,
+    rule: &str,
+    article: &str,
+    title: &str,
+    body: &str,
+) -> anyhow::Result<()> {
     fs::write(
         path,
         format!(
             r#"---
-institution: cni
-rule: 여비지급규칙
+institution: {institution}
+rule: {rule}
 article: {article}
 title: {title}
-effective: 2026-02-27
-amended: 2026-02-27
+effective: {effective}
+amended: {effective}
 status: active
 supersedes: null
 legal_basis:
