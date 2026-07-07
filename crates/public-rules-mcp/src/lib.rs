@@ -14,10 +14,15 @@ use rules_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 pub const SEARCH_RULES_TOOL: &str = "search_rules";
@@ -39,6 +44,7 @@ pub struct CliArgs {
     pub transport: ServerTransport,
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
+    pub query_log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +52,7 @@ pub struct TransportArgs {
     pub transport: ServerTransport,
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
+    pub query_log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -137,6 +144,7 @@ pub struct FreshnessMeta {
 pub struct PublicRulesServer {
     index: Arc<TantivyRulesIndex>,
     tool_router: ToolRouter<Self>,
+    query_logger: Option<QueryLogger>,
 }
 
 impl PublicRulesServer {
@@ -144,7 +152,13 @@ impl PublicRulesServer {
         Self {
             index: Arc::new(index),
             tool_router: Self::tool_router(),
+            query_logger: None,
         }
+    }
+
+    pub fn with_query_logger(mut self, query_logger: QueryLogger) -> Self {
+        self.query_logger = Some(query_logger);
+        self
     }
 
     pub fn from_config(config: ServerConfig) -> anyhow::Result<Self> {
@@ -190,6 +204,80 @@ impl PublicRulesServer {
                 .unwrap_or_else(|| status.effective_date.clone()),
             source_commit: status.source_commit,
             extra: BTreeMap::new(),
+        }
+    }
+
+    fn log_query(&self, started_at: Instant, event: serde_json::Value) {
+        if let Some(query_logger) = &self.query_logger {
+            query_logger.log(started_at, event);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryLogger {
+    file: Arc<Mutex<std::fs::File>>,
+    warned: Arc<AtomicBool>,
+}
+
+impl QueryLogger {
+    pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            warned: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn log(&self, started_at: Instant, mut event: serde_json::Value) {
+        if let Some(object) = event.as_object_mut() {
+            object.insert("ts_ms".to_string(), serde_json::json!(unix_epoch_ms()));
+            object.insert(
+                "duration_ms".to_string(),
+                serde_json::json!(started_at.elapsed().as_millis() as u64),
+            );
+        }
+        let line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                self.warn_once(format!("query log serialization failed: {error}"));
+                return;
+            }
+        };
+        let result = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("query log mutex poisoned"))
+            .and_then(|mut file| writeln!(file, "{line}"));
+        if let Err(error) = result {
+            self.warn_once(format!("query log write failed: {error}"));
+        }
+    }
+
+    fn warn_once(&self, message: String) {
+        if !self.warned.swap(true, Ordering::Relaxed) {
+            eprintln!("{message}");
+        }
+    }
+}
+
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn optional_query_logger(path: Option<PathBuf>) -> Option<QueryLogger> {
+    let path = path?;
+    match QueryLogger::new(&path) {
+        Ok(logger) => Some(logger),
+        Err(error) => {
+            eprintln!(
+                "query log disabled: failed to open {}: {error}",
+                path.display()
+            );
+            None
         }
     }
 }
@@ -238,14 +326,33 @@ impl PublicRulesServer {
         &self,
         Parameters(params): Parameters<SearchRulesParams>,
     ) -> Json<SearchRulesResult> {
-        let filter = params.rule.map(|rule| RuleFilter {
+        let started_at = Instant::now();
+        let query = params.query.clone();
+        let top_k = params.top_k;
+        let rule = params.rule.clone();
+        let filter = rule.clone().map(|rule| RuleFilter {
             rule: Some(rule),
             ..RuleFilter::default()
         });
+        let hits = self.index.search(&query, top_k.unwrap_or(5), filter);
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": SEARCH_RULES_TOOL,
+                "query": query.clone(),
+                "params": {
+                    "query": query.clone(),
+                    "top_k": top_k,
+                    "rule": rule,
+                },
+                "result": {
+                    "article_ids": hits.iter().map(|hit| hit.article_id.as_str()).collect::<Vec<_>>(),
+                    "hit_count": hits.len(),
+                },
+            }),
+        );
         Json(SearchRulesResult {
-            hits: self
-                .index
-                .search(&params.query, params.top_k.unwrap_or(5), filter),
+            hits,
             meta: self.status_meta(None),
         })
     }
@@ -258,7 +365,20 @@ impl PublicRulesServer {
         &self,
         Parameters(params): Parameters<GetArticleParams>,
     ) -> Json<GetArticleResult> {
-        let article = self.index.get_article(&params.id);
+        let started_at = Instant::now();
+        let id = params.id;
+        let article = self.index.get_article(&id);
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": GET_ARTICLE_TOOL,
+                "params": { "id": id.clone() },
+                "result": {
+                    "id": id,
+                    "found": article.is_some(),
+                },
+            }),
+        );
         Json(GetArticleResult {
             prev_id: article.as_ref().and_then(|article| article.prev_id.clone()),
             next_id: article.as_ref().and_then(|article| article.next_id.clone()),
@@ -273,8 +393,20 @@ impl PublicRulesServer {
 
     #[tool(name = "list_rules", description = "List rules in the loaded pack.")]
     pub async fn list_rules(&self) -> Json<ListRulesResult> {
+        let started_at = Instant::now();
+        let rules = self.index.list_rules();
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": LIST_RULES_TOOL,
+                "params": {},
+                "result": {
+                    "count": rules.len(),
+                },
+            }),
+        );
         Json(ListRulesResult {
-            rules: self.index.list_rules(),
+            rules,
             meta: self.status_meta(None),
         })
     }
@@ -287,19 +419,44 @@ impl PublicRulesServer {
         &self,
         Parameters(params): Parameters<GetLegalBasisParams>,
     ) -> Json<GetLegalBasisResult> {
-        let article = self.index.get_article(&params.id);
+        let started_at = Instant::now();
+        let id = params.id;
+        let article = self.index.get_article(&id);
+        let basis = article
+            .as_ref()
+            .map(|article| article.legal_basis.clone())
+            .unwrap_or_else(|| self.index.related_laws(&id));
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": GET_LEGAL_BASIS_TOOL,
+                "params": { "id": id.clone() },
+                "result": {
+                    "count": basis.len(),
+                },
+            }),
+        );
         Json(GetLegalBasisResult {
-            basis: article
-                .as_ref()
-                .map(|article| article.legal_basis.clone())
-                .unwrap_or_else(|| self.index.related_laws(&params.id)),
+            basis,
             meta: self.status_meta(article.as_ref()),
         })
     }
 
     #[tool(name = "status", description = "Return loaded pack freshness status.")]
     pub async fn status(&self) -> Json<StatusResult> {
-        Json(StatusResult::from(self.index.status()))
+        let started_at = Instant::now();
+        let status = StatusResult::from(self.index.status());
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": STATUS_TOOL,
+                "params": {},
+                "result": {
+                    "count": 1,
+                },
+            }),
+        );
+        Json(status)
     }
 }
 
@@ -332,7 +489,19 @@ impl From<PackStatus> for StatusResult {
 }
 
 pub async fn run_stdio_server(config: ServerConfig) -> anyhow::Result<()> {
+    run_stdio_server_with_query_log(config, None).await
+}
+
+pub async fn run_stdio_server_with_query_log(
+    config: ServerConfig,
+    query_log_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let server = PublicRulesServer::from_config(config)?;
+    let server = if let Some(logger) = optional_query_logger(query_log_path) {
+        server.with_query_logger(logger)
+    } else {
+        server
+    };
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -347,7 +516,21 @@ pub async fn run_http_server_with_allowed_hosts(
     bind_addr: SocketAddr,
     extra_allowed_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
+    run_http_server_with_options(config, bind_addr, extra_allowed_hosts, None).await
+}
+
+pub async fn run_http_server_with_options(
+    config: ServerConfig,
+    bind_addr: SocketAddr,
+    extra_allowed_hosts: Vec<String>,
+    query_log_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let server = PublicRulesServer::from_config(config)?;
+    let server = if let Some(logger) = optional_query_logger(query_log_path) {
+        server.with_query_logger(logger)
+    } else {
+        server
+    };
     let cancellation_token = CancellationToken::new();
     let mut http_config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
@@ -382,6 +565,7 @@ pub async fn run_server(
             transport,
             bind_addr,
             allowed_hosts: Vec::new(),
+            query_log_path: None,
         },
     )
     .await
@@ -392,9 +576,17 @@ pub async fn run_server_with_transport_args(
     args: TransportArgs,
 ) -> anyhow::Result<()> {
     match args.transport {
-        ServerTransport::Stdio => run_stdio_server(config).await,
+        ServerTransport::Stdio => {
+            run_stdio_server_with_query_log(config, args.query_log_path).await
+        }
         ServerTransport::Http => {
-            run_http_server_with_allowed_hosts(config, args.bind_addr, args.allowed_hosts).await
+            run_http_server_with_options(
+                config,
+                args.bind_addr,
+                args.allowed_hosts,
+                args.query_log_path,
+            )
+            .await
         }
     }
 }
@@ -434,6 +626,7 @@ where
         transport: transport_args.transport,
         bind_addr: transport_args.bind_addr,
         allowed_hosts: transport_args.allowed_hosts,
+        query_log_path: transport_args.query_log_path,
     })
 }
 
@@ -481,6 +674,13 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--allowed-host requires <host>"))?,
             );
         }
+        "--query-log" => {
+            transport_args.query_log_path = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--query-log requires <path>"))?,
+            );
+        }
         _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
     }
     Ok(())
@@ -494,6 +694,7 @@ impl Default for TransportArgs {
                 .parse()
                 .expect("default HTTP bind address must be valid"),
             allowed_hosts: Vec::new(),
+            query_log_path: None,
         }
     }
 }
@@ -688,6 +889,79 @@ refs: []
                 "public.example.test:443".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parse_transport_args_accepts_query_log_path() {
+        let args = parse_transport_args(["--query-log", "/tmp/public-rules-query.jsonl"])
+            .expect("query log path must parse");
+
+        assert_eq!(
+            args.query_log_path.as_deref(),
+            Some(Path::new("/tmp/public-rules-query.jsonl"))
+        );
+    }
+
+    #[test]
+    fn query_logger_appends_jsonl_with_required_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "public-rules-mcp-query-log-{}-{}",
+            std::process::id(),
+            unix_epoch_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("queries.jsonl");
+        let logger = QueryLogger::new(&log_path).expect("query logger must open");
+
+        logger.log(
+            Instant::now(),
+            serde_json::json!({
+                "tool": SEARCH_RULES_TOOL,
+                "query": "항공운임",
+                "params": {
+                    "query": "항공운임",
+                    "top_k": 5,
+                    "rule": null,
+                },
+                "result": {
+                    "article_ids": ["여비지급규칙#제12조"],
+                    "hit_count": 1,
+                },
+            }),
+        );
+        logger.log(
+            Instant::now(),
+            serde_json::json!({
+                "tool": STATUS_TOOL,
+                "query": "",
+                "params": {},
+                "result": {
+                    "count": 1,
+                },
+            }),
+        );
+
+        let lines = fs::read_to_string(&log_path).unwrap();
+        let events = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert!(event
+                .get("ts_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some());
+            assert!(event
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .is_some());
+            assert!(event
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some());
+            assert!(event.get("query").is_some());
+        }
     }
 
     #[tokio::test]

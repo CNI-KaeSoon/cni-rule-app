@@ -1,6 +1,6 @@
 use public_rules_mcp::{
-    FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig, GET_ARTICLE_TOOL,
-    GET_LEGAL_BASIS_TOOL, LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
+    FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig, ServerTransport, TransportArgs,
+    GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
 };
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo, ContentBlock},
@@ -16,22 +16,24 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Result<()> {
     let fixture_root = make_fixture_pack()?;
-    let config = ServerConfig {
-        institution: "cni".to_string(),
-        pack: PackConfig {
-            path: Some(fixture_root.clone()),
-            url: None,
-            effective: Some("2026-02-27".to_string()),
-            source_commit: Some("http-fixture".to_string()),
-        },
-    };
+    let config = fixture_config(fixture_root.clone());
+    let query_log_path = fixture_root.join("query-log.jsonl");
 
     let addr = unused_loopback_addr().await?;
-    let server_handle = tokio::spawn(public_rules_mcp::run_http_server(config, addr));
+    let server_handle = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        config,
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: Vec::new(),
+            query_log_path: Some(query_log_path.clone()),
+        },
+    ));
     let url = format!("http://{addr}/mcp");
 
     let client = connect_with_retry(&url).await?;
@@ -79,6 +81,69 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     client.cancel().await?;
     server_handle.abort();
     let _ = server_handle.await;
+
+    let log_text = fs::read_to_string(query_log_path)?;
+    let events = log_text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line))
+        .collect::<Result<Vec<_>, _>>()?;
+    let search_event = events
+        .iter()
+        .find(|event| {
+            event.get("tool").and_then(serde_json::Value::as_str) == Some(SEARCH_RULES_TOOL)
+        })
+        .ok_or_else(|| anyhow::anyhow!("search_rules query log event missing"))?;
+    assert_eq!(
+        search_event
+            .pointer("/params/query")
+            .and_then(serde_json::Value::as_str),
+        Some("항공운임")
+    );
+    assert_eq!(
+        search_event
+            .pointer("/result/article_ids/0")
+            .and_then(serde_json::Value::as_str),
+        Some("여비지급규칙#제12조")
+    );
+    assert!(search_event
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamable_http_rejects_untrusted_host_header() -> anyhow::Result<()> {
+    let fixture_root = make_fixture_pack()?;
+    let addr = unused_loopback_addr().await?;
+    let server_handle = tokio::spawn(public_rules_mcp::run_http_server(
+        fixture_config(fixture_root),
+        addr,
+    ));
+
+    let status = raw_mcp_post_status(addr, "evil.example.com").await?;
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    assert_eq!(status, 403);
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamable_http_allows_configured_host_header() -> anyhow::Result<()> {
+    let fixture_root = make_fixture_pack()?;
+    let addr = unused_loopback_addr().await?;
+    let server_handle = tokio::spawn(public_rules_mcp::run_http_server_with_allowed_hosts(
+        fixture_config(fixture_root),
+        addr,
+        vec!["allowed.example.test".to_string()],
+    ));
+
+    let status = raw_mcp_post_status(addr, "allowed.example.test").await?;
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    assert_ne!(status, 403);
     Ok(())
 }
 
@@ -132,6 +197,51 @@ async fn unused_loopback_addr() -> anyhow::Result<SocketAddr> {
     let addr = listener.local_addr()?;
     drop(listener);
     Ok(addr)
+}
+
+async fn raw_mcp_post_status(addr: SocketAddr, host: &str) -> anyhow::Result<u16> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(mut stream) => {
+                let body = "{}";
+                let request = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(request.as_bytes()).await?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await?;
+                let response = String::from_utf8(response)?;
+                let status = response
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .ok_or_else(|| anyhow::anyhow!("HTTP response status line missing"))?
+                    .parse::<u16>()?;
+                return Ok(status);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("HTTP MCP server did not start")))
+}
+
+fn fixture_config(fixture_root: std::path::PathBuf) -> ServerConfig {
+    ServerConfig {
+        institution: "cni".to_string(),
+        pack: PackConfig {
+            path: Some(fixture_root),
+            url: None,
+            effective: Some("2026-02-27".to_string()),
+            source_commit: Some("http-fixture".to_string()),
+        },
+    }
 }
 
 fn make_fixture_pack() -> anyhow::Result<std::path::PathBuf> {
