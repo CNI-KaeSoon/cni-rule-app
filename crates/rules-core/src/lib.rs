@@ -61,6 +61,8 @@ pub struct SearchHit {
     pub rule: String,
     pub title: String,
     pub effective: String,
+    #[serde(default = "default_search_hit_kind")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -102,7 +104,38 @@ pub struct Article {
     pub refs: Vec<ArticleRef>,
     pub prev_id: Option<String>,
     pub next_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annex_refs: Vec<String>,
     pub meta: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Annex {
+    pub id: String,
+    pub institution: String,
+    pub rule: String,
+    pub annex: String,
+    pub title: String,
+    pub effective: String,
+    pub status: String,
+    pub body: String,
+    pub table_structured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_markdown: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<u32>,
+    pub meta: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SourcePage {
+    pub institution: String,
+    pub page: u32,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -142,6 +175,8 @@ pub struct PackStatus {
     pub source_commit: String,
     pub index_built_at: String,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -276,6 +311,26 @@ struct ArticleFrontmatter {
     legal_basis: Vec<LegalBasis>,
     #[serde(default)]
     refs: Vec<ArticleRef>,
+    #[serde(default)]
+    pages: Vec<u32>,
+    #[serde(default)]
+    source_pages: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AnnexFrontmatter {
+    institution: String,
+    rule: String,
+    annex: String,
+    title: String,
+    effective: String,
+    status: String,
+    #[serde(default)]
+    pages: Vec<u32>,
+    #[serde(default)]
+    source_pages: Vec<u32>,
+    #[serde(default)]
+    table_structured: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +344,9 @@ struct SearchFields {
 #[derive(Debug)]
 pub struct TantivyRulesIndex {
     articles: BTreeMap<String, Article>,
+    annexes: BTreeMap<String, Annex>,
+    pages: Option<BTreeMap<u32, String>>,
+    page_owners: BTreeMap<u32, Vec<String>>,
     summaries: Vec<RuleSummary>,
     status: PackStatus,
     graph: DiGraph<String, EdgeKind>,
@@ -304,12 +362,15 @@ impl TantivyRulesIndex {
     {
         let mut articles = articles.into_iter().map(|a| (a.id.clone(), a)).collect();
         link_neighbors(&mut articles);
-        let (index, fields) = build_search_index(articles.values())?;
+        let (index, fields) = build_search_index(articles.values(), [].iter())?;
         let summaries = build_rule_summaries(articles.values());
         let (graph, node_indices) = build_ref_graph(articles.values(), &[], &[]);
 
         Ok(Self {
             articles,
+            annexes: BTreeMap::new(),
+            pages: None,
+            page_owners: BTreeMap::new(),
             summaries,
             status,
             graph,
@@ -332,6 +393,8 @@ impl TantivyRulesIndex {
         verify_manifest(path, &manifest)?;
 
         let articles = load_articles_dir(path.join("articles"))?;
+        let annexes = load_annexes_dir(path.join("annexes"))?;
+        let pages = load_pages_dir(path.join("pages"))?;
         let nodes = load_jsonl::<GraphNode>(&path.join("graph/nodes.jsonl"))?;
         let edges = load_jsonl::<GraphEdge>(&path.join("graph/edges.jsonl"))?;
         let status = PackStatus {
@@ -340,9 +403,15 @@ impl TantivyRulesIndex {
             source_commit: manifest.source_commit,
             index_built_at: manifest.created_at,
             stale: false,
+            source_url: manifest.source_url,
         };
 
         let mut index = Self::from_articles(articles, status)?;
+        index.annexes = annexes.into_iter().map(|a| (a.id.clone(), a)).collect();
+        index.page_owners = build_page_owners(index.articles.values(), index.annexes.values());
+        index.pages = pages;
+        (index.index, index.fields) =
+            build_search_index(index.articles.values(), index.annexes.values())?;
         let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
         index.graph = graph;
         index.node_indices = node_indices;
@@ -396,21 +465,10 @@ impl TantivyRulesIndex {
             let Some(id) = first_text(&doc, self.fields.id) else {
                 continue;
             };
-            let Some(article) = self.articles.get(id) else {
+            let Some(hit) = self.search_hit_for_id(id, score, q, filter) else {
                 continue;
             };
-            if !matches_filter(article, filter) {
-                continue;
-            }
-            bm25_hits.push(SearchHit {
-                article_id: article.id.clone(),
-                institution: article.institution.clone(),
-                score,
-                snippet: snippet(&article.body, q),
-                rule: article.rule.clone(),
-                title: article.title.clone(),
-                effective: article.effective.clone(),
-            });
+            bm25_hits.push(hit);
         }
 
         let mut rule_hits = Vec::new();
@@ -427,21 +485,10 @@ impl TantivyRulesIndex {
                     let Some(id) = first_text(&doc, self.fields.id) else {
                         continue;
                     };
-                    let Some(article) = self.articles.get(id) else {
+                    let Some(hit) = self.search_hit_for_id(id, score, q, filter) else {
                         continue;
                     };
-                    if !matches_filter(article, filter) {
-                        continue;
-                    }
-                    rule_hits.push(SearchHit {
-                        article_id: article.id.clone(),
-                        institution: article.institution.clone(),
-                        score,
-                        snippet: snippet(&article.body, q),
-                        rule: article.rule.clone(),
-                        title: article.title.clone(),
-                        effective: article.effective.clone(),
-                    });
+                    rule_hits.push(hit);
                 }
             }
         }
@@ -508,6 +555,63 @@ impl RulesIndex for TantivyRulesIndex {
 }
 
 impl TantivyRulesIndex {
+    fn search_hit_for_id(
+        &self,
+        id: &str,
+        score: f32,
+        q: &str,
+        filter: Option<&RuleFilter>,
+    ) -> Option<SearchHit> {
+        if let Some(article) = self.articles.get(id) {
+            if !matches_filter(article, filter) {
+                return None;
+            }
+            return Some(SearchHit {
+                article_id: article.id.clone(),
+                institution: article.institution.clone(),
+                score,
+                snippet: snippet(&article.body, q),
+                rule: article.rule.clone(),
+                title: article.title.clone(),
+                effective: article.effective.clone(),
+                kind: "article".to_string(),
+            });
+        }
+        let annex = self.annexes.get(id)?;
+        if !matches_annex_filter(annex, filter) {
+            return None;
+        }
+        Some(SearchHit {
+            article_id: annex.id.clone(),
+            institution: annex.institution.clone(),
+            score,
+            snippet: snippet(&annex.body, q),
+            rule: annex.rule.clone(),
+            title: format!("{} {}", annex.annex, annex.title),
+            effective: annex.effective.clone(),
+            kind: "annex".to_string(),
+        })
+    }
+
+    pub fn get_annex(&self, id: &str) -> Option<Annex> {
+        self.annexes.get(id).cloned()
+    }
+
+    pub fn get_source_page(&self, page: u32) -> Option<SourcePage> {
+        let pages = self.pages.as_ref()?;
+        let text = pages.get(&page)?.clone();
+        Some(SourcePage {
+            institution: self.status.institution.clone(),
+            page,
+            text,
+            owner_ids: self.page_owners.get(&page).cloned().unwrap_or_default(),
+        })
+    }
+
+    pub fn has_source_pages(&self) -> bool {
+        self.pages.is_some()
+    }
+
     fn direct_article_hit(&self, q: &str, filter: Option<&RuleFilter>) -> Option<SearchHit> {
         let (rule_slug, article) = direct_article_ref(q, filter.and_then(|f| f.rule.as_deref()))?;
         let id = format!("{rule_slug}{ARTICLE_ID_SEPARATOR}{article}");
@@ -523,6 +627,7 @@ impl TantivyRulesIndex {
             rule: article.rule.clone(),
             title: article.title.clone(),
             effective: article.effective.clone(),
+            kind: "article".to_string(),
         })
     }
 
@@ -589,6 +694,16 @@ pub fn parse_article_markdown_str(input: &str) -> Result<Article> {
     if let Some(supersedes) = frontmatter.supersedes {
         meta.insert("supersedes".to_string(), supersedes);
     }
+    let pages = merged_pages(frontmatter.pages, frontmatter.source_pages);
+    if !pages.is_empty() {
+        meta.insert("pages".to_string(), page_range_string(&pages));
+    }
+    let annex_refs = frontmatter
+        .refs
+        .iter()
+        .filter(|reference| is_annex_id(&reference.target))
+        .map(|reference| reference.target.clone())
+        .collect::<Vec<_>>();
 
     Ok(Article {
         id,
@@ -604,6 +719,56 @@ pub fn parse_article_markdown_str(input: &str) -> Result<Article> {
         refs: frontmatter.refs,
         prev_id: None,
         next_id: None,
+        pages,
+        annex_refs,
+        meta,
+    })
+}
+
+pub fn parse_annex_markdown(path: impl AsRef<Path>) -> Result<Annex> {
+    parse_annex_markdown_str(&fs::read_to_string(path.as_ref())?)
+}
+
+pub fn parse_annex_markdown_str(input: &str) -> Result<Annex> {
+    let Some(rest) = input.strip_prefix("---\n") else {
+        return Err(RulesCoreError::InvalidArticle(
+            "missing YAML frontmatter".to_string(),
+        ));
+    };
+    let Some((frontmatter, body)) = rest.split_once("\n---") else {
+        return Err(RulesCoreError::InvalidArticle(
+            "unterminated YAML frontmatter".to_string(),
+        ));
+    };
+    let frontmatter: AnnexFrontmatter = serde_yaml::from_str(frontmatter)?;
+    let body = body.trim_start_matches('\n').to_string();
+    let id = format!(
+        "{}{}{}",
+        slugify_rule(&frontmatter.rule),
+        ARTICLE_ID_SEPARATOR,
+        frontmatter.annex
+    );
+    let pages = merged_pages(frontmatter.pages, frontmatter.source_pages);
+    let table_markdown = frontmatter
+        .table_structured
+        .then(|| extract_table_markdown(&body))
+        .flatten();
+    let mut meta = BTreeMap::new();
+    if !pages.is_empty() {
+        meta.insert("pages".to_string(), page_range_string(&pages));
+    }
+    Ok(Annex {
+        id,
+        institution: frontmatter.institution,
+        rule: frontmatter.rule,
+        annex: frontmatter.annex,
+        title: frontmatter.title,
+        effective: frontmatter.effective,
+        status: frontmatter.status,
+        body,
+        table_structured: frontmatter.table_structured,
+        table_markdown,
+        pages,
         meta,
     })
 }
@@ -627,6 +792,55 @@ pub fn load_articles_dir(path: impl AsRef<Path>) -> Result<Vec<Article>> {
             .then_with(|| article_sort_key(&a.article).cmp(&article_sort_key(&b.article)))
     });
     Ok(articles)
+}
+
+pub fn load_annexes_dir(path: impl AsRef<Path>) -> Result<Vec<Annex>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut annexes = Vec::new();
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|e| e.to_str()) != Some("md")
+        {
+            continue;
+        }
+        annexes.push(parse_annex_markdown(entry.path())?);
+    }
+    annexes.sort_by(|a, b| {
+        a.rule
+            .cmp(&b.rule)
+            .then_with(|| article_sort_key(&a.annex).cmp(&article_sort_key(&b.annex)))
+    });
+    Ok(annexes)
+}
+
+fn load_pages_dir(path: impl AsRef<Path>) -> Result<Option<BTreeMap<u32, String>>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut pages = BTreeMap::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() || path.extension().and_then(|e| e.to_str()) != Some("txt")
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(page) = stem.parse::<u32>() else {
+            continue;
+        };
+        pages.insert(page, fs::read_to_string(path)?);
+    }
+    Ok(Some(pages))
 }
 
 pub fn verify_manifest(root: impl AsRef<Path>, manifest: &PackManifest) -> Result<()> {
@@ -854,11 +1068,13 @@ pub fn default_pack_status(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string()),
         stale: false,
+        source_url: None,
     }
 }
 
 fn build_search_index<'a>(
     articles: impl Iterator<Item = &'a Article>,
+    annexes: impl Iterator<Item = &'a Annex>,
 ) -> Result<(Index, SearchFields)> {
     let mut schema_builder = Schema::builder();
     let ko_text = TextOptions::default()
@@ -884,17 +1100,50 @@ fn build_search_index<'a>(
         body,
     };
     let mut writer = index.writer(50_000_000)?;
-    for article in articles {
+    for entry in articles
+        .map(SearchEntry::from_article)
+        .chain(annexes.map(SearchEntry::from_annex))
+    {
         writer.add_document(doc!(
-            id => article.id.clone(),
-            rule => article.rule.clone(),
-            title => article.title.clone(),
-            effective => article.effective.clone(),
-            body => article.body.clone(),
+            id => entry.id,
+            rule => entry.rule,
+            title => entry.title,
+            effective => entry.effective,
+            body => entry.body,
         ))?;
     }
     writer.commit()?;
     Ok((index, fields))
+}
+
+struct SearchEntry {
+    id: String,
+    rule: String,
+    title: String,
+    effective: String,
+    body: String,
+}
+
+impl SearchEntry {
+    fn from_article(article: &Article) -> Self {
+        Self {
+            id: article.id.clone(),
+            rule: article.rule.clone(),
+            title: article.title.clone(),
+            effective: article.effective.clone(),
+            body: article.body.clone(),
+        }
+    }
+
+    fn from_annex(annex: &Annex) -> Self {
+        Self {
+            id: annex.id.clone(),
+            rule: annex.rule.clone(),
+            title: format!("{} {}", annex.annex, annex.title),
+            effective: annex.effective.clone(),
+            body: annex.body.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "korean-tokenizer")]
@@ -1133,6 +1382,7 @@ fn lexical_rank<'a>(
                 rule: article.rule.clone(),
                 title: article.title.clone(),
                 effective: article.effective.clone(),
+                kind: "article".to_string(),
             });
         }
     }
@@ -1197,6 +1447,83 @@ fn matches_filter(article: &Article, filter: Option<&RuleFilter>) -> bool {
             .effective
             .as_ref()
             .is_none_or(|v| &article.effective == v)
+}
+
+fn matches_annex_filter(annex: &Annex, filter: Option<&RuleFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    filter
+        .institution
+        .as_ref()
+        .is_none_or(|v| &annex.institution == v)
+        && filter.rule.as_ref().is_none_or(|v| &annex.rule == v)
+        && filter.status.as_ref().is_none_or(|v| &annex.status == v)
+        && filter
+            .effective
+            .as_ref()
+            .is_none_or(|v| &annex.effective == v)
+}
+
+fn default_search_hit_kind() -> String {
+    "article".to_string()
+}
+
+fn is_annex_id(id: &str) -> bool {
+    id.split_once(ARTICLE_ID_SEPARATOR)
+        .map(|(_, item)| item.starts_with("별표") || item.starts_with("별지"))
+        .unwrap_or(false)
+}
+
+fn page_range_string(pages: &[u32]) -> String {
+    match pages {
+        [] => String::new(),
+        [page] => page.to_string(),
+        [start, end, ..] => format!("{start}-{end}"),
+    }
+}
+
+fn merged_pages(pages: Vec<u32>, source_pages: Vec<u32>) -> Vec<u32> {
+    if pages.is_empty() {
+        source_pages
+    } else {
+        pages
+    }
+}
+
+fn extract_table_markdown(body: &str) -> Option<String> {
+    body.split_once("## Extracted tables")
+        .map(|(_, tables)| format!("## Extracted tables{}", tables.trim_end()))
+}
+
+fn build_page_owners<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    annexes: impl Iterator<Item = &'a Annex>,
+) -> BTreeMap<u32, Vec<String>> {
+    let mut owners = BTreeMap::<u32, BTreeSet<String>>::new();
+    for article in articles {
+        for page in expand_pages(&article.pages) {
+            owners.entry(page).or_default().insert(article.id.clone());
+        }
+    }
+    for annex in annexes {
+        for page in expand_pages(&annex.pages) {
+            owners.entry(page).or_default().insert(annex.id.clone());
+        }
+    }
+    owners
+        .into_iter()
+        .map(|(page, ids)| (page, ids.into_iter().collect()))
+        .collect()
+}
+
+fn expand_pages(pages: &[u32]) -> Vec<u32> {
+    match pages {
+        [] => Vec::new(),
+        [page] => vec![*page],
+        [start, end, ..] if start <= end => (*start..=*end).collect(),
+        [start, end, ..] => vec![*start, *end],
+    }
 }
 
 fn normalize_manifest_paths(manifest: &PackManifest) -> Result<BTreeSet<String>> {

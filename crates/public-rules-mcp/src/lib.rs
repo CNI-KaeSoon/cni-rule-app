@@ -8,8 +8,8 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, parse_article_markdown, Article, LegalBasis, PackStatus, RuleFilter,
-    RuleSummary, RulesIndex, SearchHit, TantivyRulesIndex,
+    default_pack_status, parse_article_markdown, Annex, Article, LegalBasis, PackStatus,
+    RuleFilter, RuleSummary, RulesIndex, SearchHit, SourcePage, TantivyRulesIndex,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub const SEARCH_RULES_TOOL: &str = "search_rules";
@@ -30,7 +31,10 @@ pub const GET_ARTICLE_TOOL: &str = "get_article";
 pub const LIST_RULES_TOOL: &str = "list_rules";
 pub const GET_LEGAL_BASIS_TOOL: &str = "get_legal_basis";
 pub const STATUS_TOOL: &str = "status";
+pub const GET_ANNEX_TOOL: &str = "get_annex";
+pub const GET_SOURCE_PAGE_TOOL: &str = "get_source_page";
 pub const DEFAULT_HTTP_BIND_ADDR: &str = "127.0.0.1:8787";
+const SEARCH_FANOUT_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerTransport {
@@ -110,6 +114,45 @@ pub struct GetArticleResult {
     pub prev_id: Option<String>,
     pub next_id: Option<String>,
     pub legal_basis: Vec<LegalBasis>,
+    pub meta: FreshnessMeta,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct GetAnnexParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct GetAnnexResult {
+    pub annex: Option<Annex>,
+    pub text: Option<String>,
+    pub table_structured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_markdown: Option<String>,
+    pub pages: Vec<u32>,
+    pub rule: Option<String>,
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    pub meta: FreshnessMeta,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct GetSourcePageParams {
+    #[serde(default)]
+    pub institution: Option<String>,
+    pub page: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct GetSourcePageResult {
+    pub page: u32,
+    pub institution: Option<String>,
+    pub text: Option<String>,
+    pub source_url: Option<String>,
+    pub owner_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub meta: FreshnessMeta,
 }
 
@@ -250,7 +293,17 @@ impl PublicRulesServer {
                 .map(|article| article.amended.clone())
                 .unwrap_or_else(|| status.effective_date.clone()),
             source_commit: status.source_commit,
-            extra: BTreeMap::new(),
+            extra: source_url_extra(status.source_url),
+        }
+    }
+
+    fn pack_meta(&self, pack: &LoadedPack) -> FreshnessMeta {
+        let status = pack.index.status();
+        FreshnessMeta {
+            effective: status.effective_date.clone(),
+            amended: status.effective_date,
+            source_commit: status.source_commit,
+            extra: source_url_extra(status.source_url),
         }
     }
 
@@ -290,13 +343,40 @@ impl PublicRulesServer {
             for reference in &mut article.refs {
                 reference.target = prefixed_article_id(institution, &reference.target);
             }
+            article.annex_refs = article
+                .annex_refs
+                .into_iter()
+                .map(|id| prefixed_article_id(institution, &id))
+                .collect();
         }
         article
     }
 
+    fn namespace_annex(&self, mut annex: Annex, institution: &str) -> Annex {
+        annex.institution = institution.to_string();
+        if self.multi_pack {
+            annex.id = prefixed_article_id(institution, &annex.id);
+        }
+        annex
+    }
+
+    fn namespace_source_page(&self, mut page: SourcePage, institution: &str) -> SourcePage {
+        page.institution = institution.to_string();
+        if self.multi_pack {
+            page.owner_ids = page
+                .owner_ids
+                .into_iter()
+                .map(|id| prefixed_article_id(institution, &id))
+                .collect();
+        }
+        page
+    }
+
     fn resolve_article_id<'a>(&'a self, id: &'a str) -> Option<(&'a LoadedPack, &'a str)> {
         if let Some((institution, local_id)) = id.split_once('/') {
-            if !institution.is_empty() && local_id.contains(rules_core::ARTICLE_ID_SEPARATOR) {
+            if self.pack_for_institution(institution).is_some()
+                && local_id.contains(rules_core::ARTICLE_ID_SEPARATOR)
+            {
                 return self
                     .pack_for_institution(institution)
                     .map(|pack| (pack, local_id));
@@ -316,7 +396,7 @@ impl PublicRulesServer {
                         effective: hit.effective.clone(),
                         amended: hit.effective.clone(),
                         source_commit: status.source_commit,
-                        extra: BTreeMap::new(),
+                        extra: source_url_extra(status.source_url),
                     },
                 ))
             })
@@ -427,6 +507,14 @@ fn prefixed_article_id(institution: &str, article_id: &str) -> String {
     format!("{institution}/{article_id}")
 }
 
+fn source_url_extra(source_url: Option<String>) -> BTreeMap<String, String> {
+    let mut extra = BTreeMap::new();
+    if let Some(source_url) = source_url {
+        extra.insert("source_url".to_string(), source_url);
+    }
+    extra
+}
+
 fn search_pack(
     pack: &LoadedPack,
     query: &str,
@@ -453,6 +541,34 @@ fn search_pack(
             hit
         })
         .collect()
+}
+
+async fn search_packs_blocking(
+    packs: Vec<&LoadedPack>,
+    query: String,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+) -> Vec<Vec<SearchHit>> {
+    let max_parallel = SEARCH_FANOUT_LIMIT.min(packs.len().max(1));
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let mut handles = Vec::with_capacity(packs.len());
+    for pack in packs {
+        let permit = semaphore.clone().acquire_owned().await;
+        let pack = pack.clone();
+        let query = query.clone();
+        let rule = rule.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit.ok();
+            search_pack(&pack, &query, limit, rule, multi_pack)
+        }));
+    }
+
+    let mut rankings = Vec::with_capacity(handles.len());
+    for handle in handles {
+        rankings.push(handle.await.unwrap_or_default());
+    }
+    rankings
 }
 
 fn most_frequent_effective(path: &Path) -> anyhow::Result<Option<String>> {
@@ -512,20 +628,14 @@ impl PublicRulesServer {
                 .map(|pack| search_pack(pack, &query, limit, rule.clone(), self.multi_pack))
                 .collect::<Vec<_>>()
         } else {
-            std::thread::scope(|scope| {
-                selected_packs
-                    .into_iter()
-                    .map(|pack| {
-                        let query = &query;
-                        let rule = rule.clone();
-                        let multi_pack = self.multi_pack;
-                        scope.spawn(move || search_pack(pack, query, limit, rule, multi_pack))
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|handle| handle.join().unwrap_or_default())
-                    .collect::<Vec<_>>()
-            })
+            search_packs_blocking(
+                selected_packs,
+                query.clone(),
+                limit,
+                rule.clone(),
+                self.multi_pack,
+            )
+            .await
         };
         let hits = if rankings.len() <= 1 {
             rankings.into_iter().next().unwrap_or_default()
@@ -558,6 +668,132 @@ impl PublicRulesServer {
             hits,
             meta: self.status_meta(None),
             hit_meta,
+        })
+    }
+
+    #[tool(
+        name = "get_annex",
+        description = "Get one annex/bylaw attachment with source metadata."
+    )]
+    pub async fn get_annex(
+        &self,
+        Parameters(params): Parameters<GetAnnexParams>,
+    ) -> Json<GetAnnexResult> {
+        let started_at = Instant::now();
+        let id = params.id;
+        let resolved = self.resolve_article_id(&id);
+        let annex = resolved.and_then(|(pack, local_id)| {
+            pack.index
+                .get_annex(local_id)
+                .map(|annex| self.namespace_annex(annex, &pack.institution))
+        });
+        let pack = annex
+            .as_ref()
+            .and_then(|annex| self.pack_for_institution(&annex.institution))
+            .or_else(|| resolved.map(|(pack, _)| pack))
+            .unwrap_or_else(|| self.default_pack());
+        let status = pack.index.status();
+        let warning = annex.as_ref().and_then(|annex| {
+            (!annex.table_structured).then(|| "표 구조 미보장 — 원문 페이지 확인 권장".to_string())
+        });
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": GET_ANNEX_TOOL,
+                "params": { "id": id.clone() },
+                "result": {
+                    "id": id,
+                    "found": annex.is_some(),
+                },
+            }),
+        );
+        Json(GetAnnexResult {
+            text: annex.as_ref().map(|annex| annex.body.clone()),
+            table_structured: annex
+                .as_ref()
+                .map(|annex| annex.table_structured)
+                .unwrap_or(false),
+            table_markdown: annex
+                .as_ref()
+                .and_then(|annex| annex.table_markdown.clone()),
+            pages: annex
+                .as_ref()
+                .map(|annex| annex.pages.clone())
+                .unwrap_or_default(),
+            rule: annex.as_ref().map(|annex| annex.rule.clone()),
+            source_url: status.source_url,
+            warning,
+            meta: self.pack_meta(pack),
+            annex,
+        })
+    }
+
+    #[tool(
+        name = "get_source_page",
+        description = "Get raw source text for one page."
+    )]
+    pub async fn get_source_page(
+        &self,
+        Parameters(params): Parameters<GetSourcePageParams>,
+    ) -> Json<GetSourcePageResult> {
+        let started_at = Instant::now();
+        let selected = if self.multi_pack && params.institution.is_none() {
+            None
+        } else {
+            params
+                .institution
+                .as_deref()
+                .and_then(|institution| self.pack_for_institution(institution))
+                .or_else(|| (!self.multi_pack).then(|| self.default_pack()))
+        };
+        let mut error = None;
+        let page = if self.multi_pack && params.institution.is_none() {
+            error = Some("다중 팩 모드에서는 institution이 필요합니다".to_string());
+            None
+        } else if let Some(pack) = selected {
+            if !pack.index.has_source_pages() {
+                error = Some("이 팩은 페이지 원문 미포함".to_string());
+                None
+            } else {
+                pack.index
+                    .get_source_page(params.page)
+                    .map(|page| self.namespace_source_page(page, &pack.institution))
+                    .or_else(|| {
+                        error = Some(format!("페이지 원문을 찾을 수 없습니다: {}", params.page));
+                        None
+                    })
+            }
+        } else {
+            error = Some("기관 팩을 찾을 수 없습니다".to_string());
+            None
+        };
+        let pack = selected.unwrap_or_else(|| self.default_pack());
+        let status = pack.index.status();
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": GET_SOURCE_PAGE_TOOL,
+                "params": {
+                    "institution": params.institution,
+                    "page": params.page,
+                },
+                "result": {
+                    "found": page.is_some(),
+                    "error": error,
+                },
+            }),
+        );
+        Json(GetSourcePageResult {
+            page: params.page,
+            institution: page
+                .as_ref()
+                .map(|page| page.institution.clone())
+                .or_else(|| selected.map(|pack| pack.institution.clone())),
+            text: page.as_ref().map(|page| page.text.clone()),
+            source_url: status.source_url,
+            owner_ids: page.map(|page| page.owner_ids).unwrap_or_default(),
+            error,
+            meta: self.pack_meta(pack),
         })
     }
 
@@ -708,7 +944,7 @@ impl PublicRulesServer {
                 effective: default_status.effective_date.clone(),
                 amended: default_status.effective_date,
                 source_commit: default_status.source_commit,
-                extra: BTreeMap::new(),
+                extra: source_url_extra(default_status.source_url),
             },
         }
     }
@@ -729,7 +965,7 @@ impl From<PackStatus> for StatusResult {
             effective: status.effective_date.clone(),
             amended: status.effective_date.clone(),
             source_commit: status.source_commit.clone(),
-            extra: BTreeMap::new(),
+            extra: source_url_extra(status.source_url.clone()),
         };
         Self {
             institution: status.institution,
@@ -1000,6 +1236,14 @@ fn parse_extra_pack_arg(value: &str) -> anyhow::Result<ExtraPackConfig> {
     if institution.trim().is_empty() || path.trim().is_empty() {
         return Err(anyhow::anyhow!("--extra-pack requires <slug>=<path>"));
     }
+    if !institution
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(anyhow::anyhow!(
+            "--extra-pack slug may contain only ASCII letters, digits, '_' or '-'"
+        ));
+    }
     Ok(ExtraPackConfig {
         institution: institution.to_string(),
         pack: PackConfig {
@@ -1031,6 +1275,7 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn fixture_server() -> PublicRulesServer {
         let articles = [r#"---
@@ -1129,6 +1374,124 @@ refs: []
             tool_router: PublicRulesServer::tool_router(),
             query_logger: None,
         }
+    }
+
+    fn unique_temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "public-rules-mcp-{name}-{}-{}",
+            std::process::id(),
+            unix_epoch_ms()
+        ))
+    }
+
+    fn write_manifest(root: &Path, institution: &str) {
+        let mut files = BTreeMap::<String, String>::new();
+        collect_fixture_files(root, root, &mut files);
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "institution": institution,
+            "effective_date": "2026-02-27",
+            "source_commit": format!("fixture-{institution}"),
+            "created_at": "2026-07-07T00:00:00Z",
+            "source_url": format!("https://example.test/{institution}.pdf"),
+            "files": files,
+        });
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn collect_fixture_files(root: &Path, current: &Path, files: &mut BTreeMap<String, String>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                collect_fixture_files(root, &path, files);
+            } else if path.file_name().and_then(|name| name.to_str()) != Some("manifest.json") {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.insert(relative, sha256_hex(&path));
+            }
+        }
+    }
+
+    fn sha256_hex(path: &Path) -> String {
+        let bytes = fs::read(path).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn make_r5_pack(institution: &str) -> PathBuf {
+        let root = unique_temp_root(institution);
+        let article_dir = root.join("articles/여비지급규칙");
+        let annex_dir = root.join("annexes/여비지급규칙");
+        let page_dir = root.join("pages");
+        fs::create_dir_all(&article_dir).unwrap();
+        fs::create_dir_all(&annex_dir).unwrap();
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(
+            article_dir.join("제10조.md"),
+            format!(
+                r#"---
+institution: {institution}
+rule: 여비지급규칙
+article: 제10조
+title: 국내여비
+effective: 2026-02-27
+amended: 2026-02-27
+status: active
+pages: [345, 345]
+legal_basis: []
+refs:
+  - target: "여비지급규칙#별표1"
+    type: "인용"
+---
+① 국내 출장 여비 지급 기준은 <별표 1>에 따른다.
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            annex_dir.join("별표1.md"),
+            format!(
+                r#"---
+type: annex
+institution: {institution}
+rule: 여비지급규칙
+annex: 별표1
+title: 국내출장여비
+effective: 2026-02-27
+status: active
+pages: [350, 350]
+table_structured: true
+---
+<별표 1>
+국내출장여비 지급 기준
+
+## Extracted tables
+
+| 구분 | 항공 |
+| --- | --- |
+| 원장 | 실비 |
+"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            page_dir.join("0350.txt"),
+            "- 350 -\n<별표 1>\n국내출장여비 지급 기준\n",
+        )
+        .unwrap();
+        write_manifest(&root, institution);
+        root
     }
 
     // §6 계약: "모든 응답 meta에 effective·amended·source_commit 포함(신선도 계약)."
@@ -1231,6 +1594,136 @@ refs: []
     }
 
     #[tokio::test]
+    async fn r5_pack_search_get_annex_and_source_page_round_trip() {
+        let root = make_r5_pack("cni");
+        let server = PublicRulesServer::from_config(ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(root),
+                ..PackConfig::default()
+            },
+            extra_packs: Vec::new(),
+        })
+        .unwrap();
+
+        let Json(search) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "국내출장여비 항공".to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: None,
+            }))
+            .await;
+        assert!(search
+            .hits
+            .iter()
+            .any(|hit| hit.article_id == "여비지급규칙#별표1" && hit.kind == "annex"));
+
+        let Json(article) = server
+            .get_article(Parameters(GetArticleParams {
+                id: "여비지급규칙#제10조".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            article.article.unwrap().annex_refs,
+            vec!["여비지급규칙#별표1".to_string()]
+        );
+
+        let Json(annex) = server
+            .get_annex(Parameters(GetAnnexParams {
+                id: "여비지급규칙#별표1".to_string(),
+            }))
+            .await;
+        assert!(annex.table_structured);
+        assert!(annex.table_markdown.unwrap().contains("| 구분 | 항공 |"));
+        assert_eq!(annex.pages, vec![350, 350]);
+        assert_eq!(
+            annex.source_url.as_deref(),
+            Some("https://example.test/cni.pdf")
+        );
+
+        let Json(page) = server
+            .get_source_page(Parameters(GetSourcePageParams {
+                institution: None,
+                page: 350,
+            }))
+            .await;
+        assert!(page.error.is_none());
+        assert!(page.text.unwrap().contains("국내출장여비"));
+        assert!(page.owner_ids.contains(&"여비지급규칙#별표1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn multi_pack_annex_ids_are_prefixed_round_trip() {
+        let cni_root = make_r5_pack("cni");
+        let ctp_root = make_r5_pack("ctp");
+        let mut config = ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(cni_root),
+                ..PackConfig::default()
+            },
+            extra_packs: Vec::new(),
+        };
+        config.extra_packs.push(ExtraPackConfig {
+            institution: "ctp".to_string(),
+            pack: PackConfig {
+                path: Some(ctp_root),
+                ..PackConfig::default()
+            },
+        });
+        let server = PublicRulesServer::from_config(config).unwrap();
+
+        let Json(search) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "국내출장여비 항공".to_string(),
+                top_k: Some(10),
+                rule: None,
+                institution: None,
+            }))
+            .await;
+        assert!(search
+            .hits
+            .iter()
+            .any(|hit| hit.article_id == "cni/여비지급규칙#별표1" && hit.kind == "annex"));
+        assert!(search
+            .hits
+            .iter()
+            .any(|hit| hit.article_id == "ctp/여비지급규칙#별표1" && hit.kind == "annex"));
+
+        let Json(annex) = server
+            .get_annex(Parameters(GetAnnexParams {
+                id: "ctp/여비지급규칙#별표1".to_string(),
+            }))
+            .await;
+        assert_eq!(annex.annex.unwrap().id, "ctp/여비지급규칙#별표1");
+
+        let Json(page) = server
+            .get_source_page(Parameters(GetSourcePageParams {
+                institution: Some("ctp".to_string()),
+                page: 350,
+            }))
+            .await;
+        assert!(page
+            .owner_ids
+            .contains(&"ctp/여비지급규칙#별표1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn source_page_reports_missing_pages_for_legacy_pack() {
+        let server = fixture_server();
+        let Json(page) = server
+            .get_source_page(Parameters(GetSourcePageParams {
+                institution: None,
+                page: 1,
+            }))
+            .await;
+
+        assert_eq!(page.error.as_deref(), Some("이 팩은 페이지 원문 미포함"));
+        assert!(page.text.is_none());
+    }
+
+    #[tokio::test]
     async fn get_article_missing_id_still_returns_pack_level_freshness_meta() {
         // Freshness metadata is a response-shape guarantee independent of
         // whether the requested article exists — callers must never receive
@@ -1327,6 +1820,27 @@ refs: []
             args.query_log_path.as_deref(),
             Some(Path::new("/tmp/public-rules-query.jsonl"))
         );
+    }
+
+    #[test]
+    fn parse_extra_pack_rejects_path_like_slug() {
+        let error = parse_extra_pack_arg("bad/slug=/tmp/pack")
+            .expect_err("path-like slug must fail")
+            .to_string();
+
+        assert!(error.contains("slug may contain only ASCII"));
+    }
+
+    #[tokio::test]
+    async fn resolve_article_id_treats_unknown_prefix_as_default_rule_name() {
+        let server = multi_pack_fixture_server();
+        let Json(result) = server
+            .get_article(Parameters(GetArticleParams {
+                id: "unknown/인사규정#제10조".to_string(),
+            }))
+            .await;
+
+        assert!(result.article.is_none());
     }
 
     #[test]

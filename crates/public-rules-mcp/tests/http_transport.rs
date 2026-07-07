@@ -1,6 +1,7 @@
 use public_rules_mcp::{
     FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig, ServerTransport, TransportArgs,
-    GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
+    GET_ANNEX_TOOL, GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LIST_RULES_TOOL,
+    SEARCH_RULES_TOOL, STATUS_TOOL,
 };
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo, ContentBlock},
@@ -51,6 +52,8 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
             LIST_RULES_TOOL.to_string(),
             GET_LEGAL_BASIS_TOOL.to_string(),
             STATUS_TOOL.to_string(),
+            GET_ANNEX_TOOL.to_string(),
+            GET_SOURCE_PAGE_TOOL.to_string(),
         ])
     );
 
