@@ -183,6 +183,10 @@ pub struct PackManifest {
     pub effective_date: String,
     pub source_commit: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<serde_json::Value>,
     pub files: BTreeMap<String, String>,
 }
 
@@ -1585,6 +1589,8 @@ refs:
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([("articles/제12조.md".to_string(), hash)]),
         };
         fs::write(

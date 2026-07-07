@@ -28,6 +28,7 @@ struct Args {
     created_at: String,
     golden_path: PathBuf,
     max_unresolved_refs: Option<usize>,
+    source_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,39 @@ struct SourceArticle {
     source_path: PathBuf,
     relative_path: PathBuf,
     source_pages: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct SourceAnnex {
+    id: String,
+    institution: String,
+    rule: String,
+    annex: String,
+    title: String,
+    status: String,
+    effective: String,
+    source_path: PathBuf,
+    relative_path: PathBuf,
+    source_pages: Vec<u32>,
+    table_structured: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AnnexFrontmatter {
+    #[serde(rename = "type")]
+    node_type: Option<String>,
+    institution: String,
+    rule: String,
+    annex: String,
+    title: Option<String>,
+    effective: Option<String>,
+    status: Option<String>,
+    #[serde(default)]
+    source_pages: Vec<u32>,
+    #[serde(default)]
+    pages: Vec<u32>,
+    #[serde(default)]
+    table_structured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,7 +102,13 @@ struct QualityReport {
     broken_edges: usize,
     orphans: usize,
     unresolved_refs: usize,
+    unresolved_refs_before_annex: usize,
+    unresolved_refs_after_annex: usize,
     external_ref_nodes: usize,
+    annex_count: usize,
+    annex_ref_edges: usize,
+    annex_table_structured: usize,
+    page_coverage: Option<serde_json::Value>,
     coverage: BTreeMap<&'static str, usize>,
 }
 
@@ -92,6 +132,8 @@ fn build_pack(args: &Args) -> Result<()> {
         );
     }
     articles.sort_by(|a, b| a.article.id.cmp(&b.article.id));
+    let mut annexes = load_source_annexes(&args.rules_dir)?;
+    annexes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let stage = args.output_dir.join(args.pack_name());
     if stage.exists() {
@@ -103,19 +145,46 @@ fn build_pack(args: &Args) -> Result<()> {
         .iter()
         .map(|source| source.article.id.clone())
         .collect::<BTreeSet<_>>();
+    let annex_ids = annexes
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<BTreeSet<_>>();
+    let document_ids = article_ids
+        .union(&annex_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let rule_ids = articles
         .iter()
         .map(|source| rule_node_id(&source.article.rule))
+        .chain(annexes.iter().map(|source| rule_node_id(&source.rule)))
         .collect::<BTreeSet<_>>();
 
     copy_articles(&articles, &stage.join("articles"))?;
-    let (nodes, edges, unresolved_refs) = build_graph(args, &articles, &article_ids, &rule_ids);
+    copy_annexes(&annexes, &stage.join("annexes"))?;
+    copy_pages_sidecar(&args.rules_dir, &stage)?;
+    let (nodes, edges, unresolved_before, unresolved_after) = build_graph(
+        args,
+        &articles,
+        &annexes,
+        &article_ids,
+        &document_ids,
+        &rule_ids,
+    );
     write_jsonl(&stage.join("graph/nodes.jsonl"), &nodes)?;
     write_jsonl(&stage.join("graph/edges.jsonl"), &edges)?;
     build_tantivy_index(&articles, &stage.join("tantivy"))?;
     File::create(stage.join("vectors.db"))?;
 
-    let quality = quality_report(args, &articles, &rule_ids, &nodes, &edges, unresolved_refs);
+    let quality = quality_report(
+        args,
+        &articles,
+        &annexes,
+        &rule_ids,
+        &nodes,
+        &edges,
+        unresolved_before,
+        unresolved_after,
+    );
     if quality.broken_edges != 0 || quality.orphans != 0 {
         bail!(
             "QA gate failed: broken_edges={} orphans={}",
@@ -148,15 +217,17 @@ fn build_pack(args: &Args) -> Result<()> {
     write_archive(&stage, &args.archive_path)?;
 
     println!(
-        "built {} articles={} rules={} nodes={} edges={} broken_edges={} orphans={} unresolved_refs={}",
+        "built {} articles={} annexes={} rules={} nodes={} edges={} broken_edges={} orphans={} unresolved_refs_before={} unresolved_refs_after={}",
         args.archive_path.display(),
         quality.article_count,
+        quality.annex_count,
         quality.rule_count,
         quality.node_count,
         quality.edge_count,
         quality.broken_edges,
         quality.orphans,
-        quality.unresolved_refs
+        quality.unresolved_refs_before_annex,
+        quality.unresolved_refs_after_annex
     );
     Ok(())
 }
@@ -178,6 +249,7 @@ impl Args {
         let mut created_at = None;
         let mut golden_path = project_root.join("01_docs/eval/golden.jsonl");
         let mut max_unresolved_refs = None;
+        let mut source_url = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -194,6 +266,7 @@ impl Args {
                 "--source-commit" => source_commit = Some(value),
                 "--created-at" => created_at = Some(value),
                 "--golden" => golden_path = PathBuf::from(value),
+                "--source-url" => source_url = Some(value),
                 "--max-unresolved-refs" => {
                     max_unresolved_refs = Some(
                         value
@@ -206,8 +279,9 @@ impl Args {
         }
         validate_slug(&institution)?;
         validate_effective_date(&effective_date)?;
-        let archive_path =
-            archive_path.unwrap_or_else(|| output_dir.join(format!("pack-{institution}-{effective_date}.tar.zst")));
+        let archive_path = archive_path.unwrap_or_else(|| {
+            output_dir.join(format!("pack-{institution}-{effective_date}.tar.zst"))
+        });
 
         Ok(Self {
             rules_dir,
@@ -220,6 +294,7 @@ impl Args {
             created_at: created_at.context("--created-at is required")?,
             golden_path,
             max_unresolved_refs,
+            source_url,
         })
     }
 
@@ -237,6 +312,9 @@ fn load_source_articles(rules_dir: &Path) -> Result<Vec<SourceArticle>> {
         {
             continue;
         }
+        if markdown_type(entry.path())?.as_deref() == Some("annex") {
+            continue;
+        }
         let article = parse_article_markdown(entry.path())?;
         let relative_path = entry
             .path()
@@ -252,6 +330,63 @@ fn load_source_articles(rules_dir: &Path) -> Result<Vec<SourceArticle>> {
         });
     }
     Ok(out)
+}
+
+fn load_source_annexes(rules_dir: &Path) -> Result<Vec<SourceAnnex>> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(rules_dir).sort_by_file_name() {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("md")
+        {
+            continue;
+        }
+        if markdown_type(entry.path())?.as_deref() != Some("annex") {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path())?;
+        let (frontmatter, _body) = split_frontmatter(&text)?;
+        let frontmatter: AnnexFrontmatter = serde_yaml::from_str(frontmatter)?;
+        if frontmatter.node_type.as_deref() != Some("annex") {
+            continue;
+        }
+        let relative_path = entry
+            .path()
+            .strip_prefix(rules_dir)
+            .with_context(|| format!("strip {}", entry.path().display()))?
+            .to_path_buf();
+        let source_pages = if frontmatter.source_pages.is_empty() {
+            frontmatter.pages
+        } else {
+            frontmatter.source_pages
+        };
+        out.push(SourceAnnex {
+            id: format!("{}#{}", slugify_rule(&frontmatter.rule), frontmatter.annex),
+            institution: frontmatter.institution,
+            rule: frontmatter.rule,
+            annex: frontmatter.annex,
+            title: frontmatter.title.unwrap_or_default(),
+            status: frontmatter.status.unwrap_or_else(|| "active".to_string()),
+            effective: frontmatter
+                .effective
+                .unwrap_or_else(|| EFFECTIVE_DATE.to_string()),
+            source_path: entry.path().to_path_buf(),
+            relative_path,
+            source_pages,
+            table_structured: frontmatter.table_structured,
+        });
+    }
+    Ok(out)
+}
+
+fn markdown_type(path: &Path) -> Result<Option<String>> {
+    let text = fs::read_to_string(path)?;
+    let (frontmatter, _) = split_frontmatter(&text)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(frontmatter)?;
+    Ok(value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string()))
 }
 
 fn validate_slug(value: &str) -> Result<()> {
@@ -281,10 +416,7 @@ fn validate_effective_date(value: &str) -> Result<()> {
 
 fn read_source_pages(path: &Path) -> Result<Vec<u32>> {
     let text = fs::read_to_string(path)?;
-    let frontmatter = text
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.split_once("\n---").map(|(frontmatter, _)| frontmatter))
-        .context("missing YAML frontmatter")?;
+    let (frontmatter, _) = split_frontmatter(&text)?;
     let value: serde_yaml::Value = serde_yaml::from_str(frontmatter)?;
     let pages = value
         .get("source_pages")
@@ -298,6 +430,12 @@ fn read_source_pages(path: &Path) -> Result<Vec<u32>> {
         })
         .unwrap_or_default();
     Ok(pages)
+}
+
+fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
+    text.strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---"))
+        .context("missing YAML frontmatter")
 }
 
 fn copy_articles(articles: &[SourceArticle], articles_dir: &Path) -> Result<()> {
@@ -317,12 +455,54 @@ fn copy_articles(articles: &[SourceArticle], articles_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+fn copy_annexes(annexes: &[SourceAnnex], annexes_dir: &Path) -> Result<()> {
+    for source in annexes {
+        let target = annexes_dir.join(&source.relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source.source_path, &target).with_context(|| {
+            format!(
+                "copy {} to {}",
+                source.source_path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn copy_pages_sidecar(rules_dir: &Path, stage: &Path) -> Result<()> {
+    let pages_dir = rules_dir
+        .parent()
+        .map(|parent| parent.join("pages"))
+        .context("rules dir must have parent")?;
+    if !pages_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(&pages_dir).sort_by_file_name() {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(&pages_dir)?;
+        let target = stage.join("pages").join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(entry.path(), target)?;
+    }
+    Ok(())
+}
+
 fn build_graph(
     args: &Args,
     articles: &[SourceArticle],
+    annexes: &[SourceAnnex],
     article_ids: &BTreeSet<String>,
+    document_ids: &BTreeSet<String>,
     rule_ids: &BTreeSet<String>,
-) -> (Vec<GraphNode>, Vec<GraphEdge>, usize) {
+) -> (Vec<GraphNode>, Vec<GraphEdge>, usize, usize) {
     let mut nodes = Vec::new();
     nodes.push(GraphNode {
         id: args.institution.clone(),
@@ -337,6 +517,9 @@ fn build_graph(
             rule_node_id(&source.article.rule),
             source.article.rule.as_str(),
         );
+    }
+    for source in annexes {
+        rule_labels.insert(rule_node_id(&source.rule), source.rule.as_str());
     }
     for (id, label) in &rule_labels {
         nodes.push(GraphNode {
@@ -362,9 +545,30 @@ fn build_graph(
             }),
         });
     }
+    for source in annexes {
+        nodes.push(GraphNode {
+            id: source.id.clone(),
+            kind: NodeKind::Annex,
+            label: if source.title.is_empty() {
+                source.annex.clone()
+            } else {
+                format!("{} {}", source.annex, source.title)
+            },
+            meta: json!({
+                "institution": source.institution,
+                "rule": source.rule,
+                "annex": source.annex,
+                "status": source.status,
+                "effective": source.effective,
+                "source_pages": source.source_pages,
+                "table_structured": source.table_structured,
+            }),
+        });
+    }
 
     let mut external_nodes = BTreeMap::<String, (NodeKind, String, bool)>::new();
-    let mut unresolved_refs = 0_usize;
+    let mut unresolved_before_annex = 0_usize;
+    let mut unresolved_after_annex = 0_usize;
     for source in articles {
         for basis in &source.article.legal_basis {
             let id = law_node_id(&basis.law, &basis.article);
@@ -379,7 +583,10 @@ fn build_graph(
         }
         for article_ref in &source.article.refs {
             if !article_ids.contains(&article_ref.target) {
-                unresolved_refs += 1;
+                unresolved_before_annex += 1;
+            }
+            if !document_ids.contains(&article_ref.target) {
+                unresolved_after_annex += 1;
                 external_nodes.insert(
                     article_ref.target.clone(),
                     (
@@ -420,6 +627,16 @@ fn build_graph(
             kind: EdgeKind::AppliesTo,
             meta: json!({ "source": "frontmatter.article" }),
         });
+    }
+    for source in annexes {
+        edges.push(GraphEdge {
+            src: rule_node_id(&source.rule),
+            dst: source.id.clone(),
+            kind: EdgeKind::AppliesTo,
+            meta: json!({ "source": "frontmatter.annex" }),
+        });
+    }
+    for source in articles {
         for article_ref in &source.article.refs {
             edges.push(GraphEdge {
                 src: source.article.id.clone(),
@@ -440,16 +657,23 @@ fn build_graph(
     edges.sort_by_key(edge_sort_key);
     edges.dedup_by(|a, b| edge_sort_key(a) == edge_sort_key(b));
 
-    (nodes, edges, unresolved_refs)
+    (
+        nodes,
+        edges,
+        unresolved_before_annex,
+        unresolved_after_annex,
+    )
 }
 
 fn quality_report(
     args: &Args,
     articles: &[SourceArticle],
+    annexes: &[SourceAnnex],
     rule_ids: &BTreeSet<String>,
     nodes: &[GraphNode],
     edges: &[GraphEdge],
-    unresolved_refs: usize,
+    unresolved_refs_before_annex: usize,
+    unresolved_refs_after_annex: usize,
 ) -> QualityReport {
     let node_ids = nodes
         .iter()
@@ -459,6 +683,7 @@ fn quality_report(
     let mut broken_edges = 0_usize;
     let mut ref_edge_count = 0_usize;
     let mut legal_basis_edge_count = 0_usize;
+    let mut annex_ref_edges = 0_usize;
     for edge in edges {
         if !node_ids.contains(&edge.src) || !node_ids.contains(&edge.dst) {
             broken_edges += 1;
@@ -470,6 +695,9 @@ fn quality_report(
             EdgeKind::Cites | EdgeKind::ApplyMutatis | EdgeKind::Delegates | EdgeKind::ExceptWhen
         ) {
             ref_edge_count += 1;
+            if edge.dst.contains("#별표") || edge.dst.contains("#별지제") {
+                annex_ref_edges += 1;
+            }
         }
         if edge.kind == EdgeKind::LegalBasis {
             legal_basis_edge_count += 1;
@@ -495,6 +723,8 @@ fn quality_report(
         .iter()
         .filter(|source| !source.article.legal_basis.is_empty())
         .count();
+    let page_coverage =
+        read_pipeline_qa(&args.rules_dir).and_then(|qa| qa.get("coverage").cloned());
 
     QualityReport {
         schema_version: 1,
@@ -508,8 +738,17 @@ fn quality_report(
         legal_basis_edge_count,
         broken_edges,
         orphans,
-        unresolved_refs,
-        external_ref_nodes: unresolved_refs,
+        unresolved_refs: unresolved_refs_after_annex,
+        unresolved_refs_before_annex,
+        unresolved_refs_after_annex,
+        external_ref_nodes: unresolved_refs_after_annex,
+        annex_count: annexes.len(),
+        annex_ref_edges,
+        annex_table_structured: annexes
+            .iter()
+            .filter(|source| source.table_structured)
+            .count(),
+        page_coverage,
         coverage: BTreeMap::from([
             ("active_articles", active_articles),
             ("with_source_pages", with_source_pages),
@@ -577,6 +816,12 @@ fn load_sample_queries(path: &Path, limit: usize) -> Result<Vec<GoldenCase>> {
     Ok(out)
 }
 
+fn read_pipeline_qa(rules_dir: &Path) -> Option<serde_json::Value> {
+    let path = rules_dir.parent()?.join("qa.json");
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn build_manifest(args: &Args, root: &Path) -> Result<PackManifest> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).sort_by_file_name() {
@@ -597,6 +842,10 @@ fn build_manifest(args: &Args, root: &Path) -> Result<PackManifest> {
         effective_date: args.effective_date.clone(),
         source_commit: args.source_commit.clone(),
         created_at: args.created_at.clone(),
+        source_url: args.source_url.clone(),
+        quality: read_pipeline_qa(&args.rules_dir)
+            .and_then(|qa| qa.get("coverage").cloned())
+            .map(|coverage| json!({ "page_coverage": coverage })),
         files,
     })
 }
@@ -734,6 +983,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             golden_path: PathBuf::from("unused-golden.jsonl"),
             max_unresolved_refs: None,
+            source_url: None,
         }
     }
 
@@ -766,17 +1016,161 @@ mod tests {
             .iter()
             .map(|source| source.article.id.clone())
             .collect::<BTreeSet<_>>();
+        let annexes = Vec::<SourceAnnex>::new();
+        let annex_ids = BTreeSet::<String>::new();
+        let document_ids = article_ids
+            .union(&annex_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let rule_ids = articles
             .iter()
             .map(|source| rule_node_id(&source.article.rule))
             .collect::<BTreeSet<_>>();
 
         let args = test_args();
-        let (nodes, edges, unresolved_refs) = build_graph(&args, &articles, &article_ids, &rule_ids);
-        let report = quality_report(&args, &articles, &rule_ids, &nodes, &edges, unresolved_refs);
+        let (nodes, edges, unresolved_before, unresolved_after) = build_graph(
+            &args,
+            &articles,
+            &annexes,
+            &article_ids,
+            &document_ids,
+            &rule_ids,
+        );
+        let report = quality_report(
+            &args,
+            &articles,
+            &annexes,
+            &rule_ids,
+            &nodes,
+            &edges,
+            unresolved_before,
+            unresolved_after,
+        );
 
         assert_eq!(report.broken_edges, 0);
         assert_eq!(report.unresolved_refs, 1);
         assert_eq!(report.external_ref_nodes, 1);
+    }
+
+    #[test]
+    fn annex_nodes_resolve_same_rule_annex_refs() {
+        let article = Article {
+            id: "여비규정#제12조".to_string(),
+            institution: "cni".to_string(),
+            rule: "여비규정".to_string(),
+            article: "제12조".to_string(),
+            title: "일비".to_string(),
+            effective: "2026-02-27".to_string(),
+            amended: "2026-02-27".to_string(),
+            status: "active".to_string(),
+            body: "일비는 별표 1에 따른다.".to_string(),
+            refs: vec![ArticleRef {
+                target: "여비규정#별표1".to_string(),
+                kind: "인용".to_string(),
+            }],
+            ..Article::default()
+        };
+        let articles = vec![SourceArticle {
+            article,
+            source_path: PathBuf::from("unused.md"),
+            relative_path: PathBuf::from("여비규정/제12조.md"),
+            source_pages: vec![1],
+        }];
+        let annexes = vec![SourceAnnex {
+            id: "여비규정#별표1".to_string(),
+            institution: "cni".to_string(),
+            rule: "여비규정".to_string(),
+            annex: "별표1".to_string(),
+            title: "여비 지급 기준".to_string(),
+            status: "active".to_string(),
+            effective: "2026-02-27".to_string(),
+            source_path: PathBuf::from("unused-annex.md"),
+            relative_path: PathBuf::from("여비규정/별표1.md"),
+            source_pages: vec![2],
+            table_structured: true,
+        }];
+        let article_ids = articles
+            .iter()
+            .map(|source| source.article.id.clone())
+            .collect::<BTreeSet<_>>();
+        let annex_ids = annexes
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<BTreeSet<_>>();
+        let document_ids = article_ids
+            .union(&annex_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let rule_ids = BTreeSet::from([rule_node_id("여비규정")]);
+        let args = test_args();
+
+        let (nodes, edges, unresolved_before, unresolved_after) = build_graph(
+            &args,
+            &articles,
+            &annexes,
+            &article_ids,
+            &document_ids,
+            &rule_ids,
+        );
+        let report = quality_report(
+            &args,
+            &articles,
+            &annexes,
+            &rule_ids,
+            &nodes,
+            &edges,
+            unresolved_before,
+            unresolved_after,
+        );
+
+        assert_eq!(report.unresolved_refs_before_annex, 1);
+        assert_eq!(report.unresolved_refs_after_annex, 0);
+        assert_eq!(report.annex_count, 1);
+        assert_eq!(report.annex_ref_edges, 1);
+        assert!(nodes
+            .iter()
+            .any(|node| node.id == "여비규정#별표1" && node.kind == NodeKind::Annex));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.src == "rule:여비규정" && edge.dst == "여비규정#별표1"));
+    }
+
+    #[test]
+    fn annex_only_rules_get_rule_nodes() {
+        let articles = Vec::<SourceArticle>::new();
+        let annexes = vec![SourceAnnex {
+            id: "서식규정#별지제1호".to_string(),
+            institution: "cni".to_string(),
+            rule: "서식규정".to_string(),
+            annex: "별지제1호".to_string(),
+            title: "신청서".to_string(),
+            status: "active".to_string(),
+            effective: "2026-02-27".to_string(),
+            source_path: PathBuf::from("unused-annex.md"),
+            relative_path: PathBuf::from("서식규정/별지제1호.md"),
+            source_pages: vec![2],
+            table_structured: false,
+        }];
+        let article_ids = BTreeSet::<String>::new();
+        let document_ids = BTreeSet::from(["서식규정#별지제1호".to_string()]);
+        let rule_ids = BTreeSet::from([rule_node_id("서식규정")]);
+        let args = test_args();
+
+        let (nodes, edges, _, _) = build_graph(
+            &args,
+            &articles,
+            &annexes,
+            &article_ids,
+            &document_ids,
+            &rule_ids,
+        );
+
+        assert!(nodes
+            .iter()
+            .any(|node| node.id == "rule:서식규정" && node.kind == NodeKind::Rule));
+        assert!(edges
+            .iter()
+            .all(|edge| nodes.iter().any(|node| node.id == edge.src)
+                && nodes.iter().any(|node| node.id == edge.dst)));
     }
 }

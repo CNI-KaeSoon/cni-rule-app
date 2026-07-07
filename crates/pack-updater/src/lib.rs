@@ -433,6 +433,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([(
                 "articles/test.md".to_string(),
                 "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
@@ -456,6 +458,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([("articles/test.md".to_string(), sha256_hex(b"body"))]),
         };
         write_pack_with_manifest(
@@ -477,6 +481,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([("../escape.txt".to_string(), sha256_hex(b"escape"))]),
         };
 
@@ -494,6 +500,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([("articles/test.md".to_string(), sha256_hex(b"body"))]),
         };
         write_pack_with_manifest(&archive, &[("articles/test.md", b"body")], &manifest);
@@ -513,6 +521,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::from([
                 ("articles/test.md".to_string(), sha256_hex(b"body")),
                 (
@@ -555,6 +565,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: BTreeMap::new(),
         };
         append_bytes(
@@ -609,6 +621,8 @@ mod tests {
             effective_date: "2026-02-27".to_string(),
             source_commit: "abc123".to_string(),
             created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
             files: manifest_files,
         };
         write_pack_with_manifest(path, files, &manifest);

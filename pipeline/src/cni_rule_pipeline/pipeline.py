@@ -4,6 +4,8 @@ import argparse
 import dataclasses
 import datetime as dt
 import hashlib
+import json
+import os
 import re
 import sys
 import unicodedata
@@ -35,6 +37,15 @@ TOC_SLASH_RE = re.compile(
 ARTICLE_RE = re.compile(
     r"(?m)^제\s*(?P<num>\d+)\s*조(?:\s*의\s*(?P<sub>\d+))?\s*(?:\((?P<title>[^)\n]+)\))?"
 )
+ANNEX_HEADING_RE = re.compile(
+    r"^\s*[\[\(<【〔]?\s*"
+    r"(?P<label>"
+    r"별\s*표\s*(?:제\s*)?(?P<table_no>\d+)(?:\s*호)?"
+    r"|별\s*지\s*(?:제\s*)?(?P<form_no>\d+)\s*호\s*서\s*식"
+    r")"
+    r"\s*[\]\)>】〕]?"
+    r"\s*(?P<title>[^\n]*)$"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,6 +55,7 @@ class BuildConfig:
     effective_date: str = SOURCE_EFFECTIVE_DATE
     footers: tuple[str, ...] = (INSTITUTION_NAME,)
     legacy_cni_report: bool = False
+    source_url: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,14 +134,53 @@ class Article:
         return Path("rules") / self.rule.slug / f"{self.article}.md"
 
 
+@dataclasses.dataclass(frozen=True)
+class Annex:
+    rule: TocEntry
+    annex: str
+    title: str
+    body: str
+    source_pages: tuple[int, int]
+    table_structured: bool
+    structured_tables: tuple[str, ...] = ()
+
+    @property
+    def annex_id(self) -> str:
+        return f"{self.rule.slug}#{self.annex}"
+
+    @property
+    def relative_path(self) -> Path:
+        return Path("rules") / self.rule.slug / f"{self.annex}.md"
+
+
+@dataclasses.dataclass(frozen=True)
+class CoverageReport:
+    eligible_pages: tuple[int, ...]
+    covered_pages: tuple[int, ...]
+    uncovered_pages: tuple[tuple[int, int], ...]
+    percent: float
+
+
+@dataclasses.dataclass(frozen=True)
+class SuspiciousRule:
+    rule: TocEntry
+    article_count: int
+    annex_count: int
+    page_count: int
+    reason: str
+
+
 @dataclasses.dataclass
 class BuildResult:
     rules: list[TocEntry]
     articles: list[Article]
+    annexes: list[Annex]
     no_article_rules: list[TocEntry]
     ambiguous_basis: list[Article]
     table_review: list[Article]
     skipped_duplicate_articles: list[Article]
+    coverage: CoverageReport
+    suspicious_rules: list[SuspiciousRule]
     output_dir: Path
     toc_profile: str
     toc_match_count: int
@@ -184,6 +235,28 @@ def read_pages(doc: fitz.Document) -> dict[int, str]:
     }
 
 
+def write_page_sidecars(pages: dict[int, str], output_dir: Path) -> None:
+    pages_dir = output_dir / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    for page_no, text in sorted(pages.items()):
+        (pages_dir / f"{page_no:04d}.txt").write_text(text, encoding="utf-8")
+
+
+def move_existing_aside(path: Path) -> None:
+    if not path.exists():
+        return
+    backup = path.with_name(f"{path.name}.previous-{os.getpid()}")
+    if backup.exists():
+        raise FileExistsError(f"backup path already exists: {backup}")
+    path.rename(backup)
+
+
+def prepare_output_tree(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    move_existing_aside(output_dir / "rules")
+    move_existing_aside(output_dir / "pages")
+
+
 def parse_toc(pages: dict[int, str], toc_pages: Iterable[int] = (3, 4, 5)) -> list[TocEntry]:
     return parse_toc_with_profile(pages, toc_pages=tuple(toc_pages)).entries
 
@@ -191,7 +264,7 @@ def parse_toc(pages: dict[int, str], toc_pages: Iterable[int] = (3, 4, 5)) -> li
 def parse_toc_with_profile(pages: dict[int, str], toc_pages: Iterable[int] | None = None) -> TocParseResult:
     selected_pages = tuple(toc_pages) if toc_pages is not None else auto_detect_toc_pages(pages)
     profile, raw = best_toc_profile(pages, selected_pages)
-    entries = toc_entries_from_candidates(raw, profile.name, max(pages))
+    entries = toc_entries_from_candidates(raw, profile.name, max(pages), printed_page_map(pages))
     return TocParseResult(entries=entries, profile=profile.name, match_count=len(raw), toc_pages=selected_pages)
 
 
@@ -248,20 +321,53 @@ def should_skip_toc_title(title: str, profile: TocProfile) -> bool:
     return False
 
 
-def toc_entries_from_candidates(raw: list[TocCandidate], profile_name: str, max_page: int) -> list[TocEntry]:
+def toc_entries_from_candidates(
+    raw: list[TocCandidate],
+    profile_name: str,
+    max_page: int,
+    page_map: dict[int, int] | None = None,
+) -> list[TocEntry]:
     entries: list[TocEntry] = []
+    page_map = page_map or {}
     for index, candidate in enumerate(raw):
-        next_start = raw[index + 1].start_page if index + 1 < len(raw) else max_page
+        next_start_label = raw[index + 1].start_page if index + 1 < len(raw) else None
+        start_page = page_map.get(candidate.start_page, candidate.start_page)
+        if next_start_label is not None:
+            next_start_page = page_map.get(next_start_label, next_start_label)
+            end_page = max(start_page, next_start_page - 1)
+        else:
+            end_page = max_page
         code = candidate.code or f"{profile_name}-{index + 1:03d}"
         entries.append(
             TocEntry(
                 code=code,
                 rule=candidate.title,
-                start_page=candidate.start_page,
-                end_page=max(candidate.start_page, next_start - 1),
+                start_page=start_page,
+                end_page=end_page,
             )
         )
     return entries
+
+
+def printed_page_map(pages: dict[int, str]) -> dict[int, int]:
+    mapped: dict[int, int] = {}
+    for physical_page, text in pages.items():
+        printed = extract_printed_page_number(text)
+        if printed is None:
+            continue
+        mapped.setdefault(printed, physical_page)
+    return mapped
+
+
+def extract_printed_page_number(text: str) -> int | None:
+    lines = [normalize_spaces(line).strip() for line in text.splitlines() if line.strip()]
+    for line in [*lines[:5], *lines[-5:]]:
+        match = re.fullmatch(r"-\s*(?P<num>\d{1,4})\s*-", line)
+        if match:
+            return int(match.group("num"))
+        if re.fullmatch(r"\d{1,4}", line):
+            return int(line)
+    return None
 
 
 def normalize_rule_title(title: str) -> str:
@@ -310,7 +416,51 @@ def rule_text_with_page_spans(
         cursor += len(part)
         spans.append(PageSpan(page_no=page_no, start=start, end=cursor))
     text = "".join(parts)
-    return re.sub(r"\n{3,}", "\n\n", text).strip(), spans
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return trim_text_to_rule_heading(entry, text, spans)
+
+
+def trim_text_to_rule_heading(entry: TocEntry, text: str, spans: list[PageSpan]) -> tuple[str, list[PageSpan]]:
+    offset = find_rule_heading_offset(entry.rule, text)
+    if offset <= 0:
+        return text, spans
+    trimmed = text[offset:].lstrip()
+    whitespace_shift = len(text[offset:]) - len(trimmed)
+    total_offset = offset + whitespace_shift
+    return trimmed, shift_page_spans(spans, total_offset, len(trimmed))
+
+
+def find_rule_heading_offset(rule_name: str, text: str) -> int:
+    target = comparable_heading(rule_name)
+    if not target:
+        return 0
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        stripped = normalize_rule_title(line.strip())
+        comparable = comparable_heading(stripped)
+        if comparable and (comparable == target or comparable.endswith(target)):
+            return cursor + line.find(line.strip())
+        cursor += len(line)
+    return 0
+
+
+def comparable_heading(value: str) -> str:
+    value = normalize_rule_title(value)
+    value = re.sub(r"^[\dIVX]+\s*[-.]\s*", "", value)
+    value = re.sub(r"^(?:제\s*)?\d+\s*[편장절]\s*", "", value)
+    return re.sub(r"[\s·ㆍ․]+", "", value)
+
+
+def shift_page_spans(spans: list[PageSpan], offset: int, text_len: int) -> list[PageSpan]:
+    shifted: list[PageSpan] = []
+    for span in spans:
+        if span.end <= offset:
+            continue
+        start = max(0, span.start - offset)
+        end = min(text_len, span.end - offset)
+        if end > start:
+            shifted.append(PageSpan(page_no=span.page_no, start=start, end=end))
+    return shifted
 
 
 def parse_articles(
@@ -320,19 +470,23 @@ def parse_articles(
     page_spans: list[PageSpan] | None = None,
     effective_date: str = SOURCE_EFFECTIVE_DATE,
 ) -> list[Article]:
-    matches = list(ARTICLE_RE.finditer(text))
+    raw_matches = list(ARTICLE_RE.finditer(text))
+    annex_spans = annex_block_spans(text, raw_matches)
+    matches = [match for match in raw_matches if not position_in_spans(match.start(), annex_spans)]
     articles: list[Article] = []
     if not matches:
         return articles
 
-    prefix = text[: matches[0].start()]
+    prefix = text_without_spans(text[: matches[0].start()], [(start, end) for start, end in annex_spans if end <= matches[0].start()])
     amended = latest_date(prefix) or effective_date
 
     article_page_offsets = map_article_pages(entry, text, matches, page_spans)
     seen_keys: set[str] = set()
     for idx, match in enumerate(matches):
         start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        next_article = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        next_annex = next((span_start for span_start, _span_end in annex_spans if span_start > start), len(text))
+        end = min(next_article, next_annex)
         body = text[start:end].strip()
         key = article_key(match.group("num"), match.group("sub"))
         if key in seen_keys:
@@ -356,6 +510,180 @@ def parse_articles(
             )
         )
     return articles
+
+
+def split_annex_text(text: str) -> tuple[str, str, int]:
+    raw_articles = list(ARTICLE_RE.finditer(text))
+    spans = annex_block_spans(text, raw_articles)
+    if not spans:
+        return text, "", len(text)
+    article_text = text_without_spans(text, spans).strip()
+    annex_text = "\n".join(text[start:end].strip() for start, end in spans if include_annex_span(start, raw_articles)).strip()
+    return article_text, annex_text, spans[0][0]
+
+
+def iter_annex_heading_matches(text: str) -> Iterable[re.Match[str]]:
+    for match in re.finditer(r"(?m)^.*$", text):
+        line = match.group(0)
+        heading = ANNEX_HEADING_RE.match(line)
+        title_tail = normalize_spaces(heading.group("title") or "").lstrip() if heading else ""
+        if heading and not is_inline_annex_reference_tail(title_tail):
+            yield match
+
+
+def is_inline_annex_reference_tail(title_tail: str) -> bool:
+    return bool(re.match(r"^(?:에|의)(?:\s|한|하여|해|의|를|을|로|으로|$)", title_tail))
+
+
+def annex_block_spans(text: str, article_matches: list[re.Match[str]] | None = None) -> list[tuple[int, int]]:
+    annex_matches = list(iter_annex_heading_matches(text))
+    if not annex_matches:
+        return []
+    article_matches = article_matches if article_matches is not None else list(ARTICLE_RE.finditer(text))
+    first_article = article_matches[0].start() if article_matches else None
+    annex_starts = [match.start() for match in annex_matches]
+    spans: list[tuple[int, int]] = []
+    for match in annex_matches:
+        following_annexes = [start for start in annex_starts if start > match.start()]
+        if first_article is not None and match.start() < first_article:
+            following_articles = [article.start() for article in article_matches if article.start() > match.start()]
+            end = following_articles[0] if following_articles else (following_annexes[0] if following_annexes else len(text))
+        else:
+            end = following_annexes[0] if following_annexes else len(text)
+        spans.append((match.start(), end))
+    return spans
+
+
+def include_annex_span(start: int, article_matches: list[re.Match[str]]) -> bool:
+    if not article_matches:
+        return True
+    return start > article_matches[0].start()
+
+
+def position_in_spans(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def text_without_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in sorted(spans):
+        parts.append(text[cursor:start])
+        cursor = max(cursor, end)
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def normalize_annex_key(match: re.Match[str]) -> str:
+    heading = ANNEX_HEADING_RE.match(match.group(0).strip())
+    if heading is None:
+        raise ValueError("annex heading match did not match ANNEX_HEADING_RE")
+    if heading.group("table_no"):
+        return f"별표{int(heading.group('table_no'))}"
+    return f"별지제{int(heading.group('form_no'))}호"
+
+
+def annex_title(match: re.Match[str]) -> str:
+    heading = ANNEX_HEADING_RE.match(match.group(0).strip())
+    if heading is None:
+        return ""
+    title = normalize_spaces(heading.group("title") or "").strip()
+    return title.strip(" -:：")
+
+
+def parse_annexes(
+    entry: TocEntry,
+    text: str,
+    page_spans: list[PageSpan],
+    doc: fitz.Document | None = None,
+    offset: int = 0,
+) -> list[Annex]:
+    raw_articles = list(ARTICLE_RE.finditer(text))
+    spans = annex_block_spans(text, raw_articles)
+    matches = [match for match in iter_annex_heading_matches(text) if include_annex_span(match.start(), raw_articles)]
+    span_by_start = {start: end for start, end in spans}
+    annexes: list[Annex] = []
+    seen: Counter[str] = Counter()
+    for match in matches:
+        start = match.start()
+        end = span_by_start.get(start, len(text))
+        body = text[start:end].strip()
+        key = normalize_annex_key(match)
+        seen[key] += 1
+        if seen[key] > 1:
+            key = f"{key}-{seen[key]}"
+        pages = pages_for_text_span(entry, offset + start, offset + end, page_spans)
+        structured_tables = extract_tables_markdown(doc, pages) if doc is not None else ()
+        annexes.append(
+            Annex(
+                rule=entry,
+                annex=key,
+                title=annex_title(match),
+                body=body,
+                source_pages=pages,
+                table_structured=bool(structured_tables),
+                structured_tables=structured_tables,
+            )
+        )
+    return annexes
+
+
+def pages_for_text_span(
+    entry: TocEntry,
+    start: int,
+    end: int,
+    page_spans: list[PageSpan],
+) -> tuple[int, int]:
+    overlapping = [span.page_no for span in page_spans if span.start < end and span.end > start]
+    if overlapping:
+        return (min(overlapping), max(overlapping))
+    return (entry.start_page, entry.end_page)
+
+
+def extract_tables_markdown(doc: fitz.Document | None, pages: tuple[int, int]) -> tuple[str, ...]:
+    if doc is None:
+        return ()
+    rendered: list[str] = []
+    for page_no in range(pages[0], pages[1] + 1):
+        try:
+            page = doc.load_page(page_no - 1)
+            finder = getattr(page, "find_tables", None)
+            if finder is None:
+                continue
+            tables = finder()
+            for table in getattr(tables, "tables", []):
+                markdown = table_to_markdown(table.extract())
+                if markdown:
+                    rendered.append(markdown)
+        except Exception:
+            continue
+    return tuple(rendered)
+
+
+def table_to_markdown(rows: list[list[object]]) -> str:
+    clean_rows = [
+        [normalize_spaces("" if cell is None else str(cell)).replace("\n", "<br>").strip() for cell in row]
+        for row in rows
+        if any(str(cell or "").strip() for cell in row)
+    ]
+    if not clean_rows:
+        return ""
+    width = max(len(row) for row in clean_rows)
+    clean_rows = [row + [""] * (width - len(row)) for row in clean_rows]
+    header = clean_rows[0]
+    lines = [
+        "| " + " | ".join(escape_md_cell(cell) for cell in header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in clean_rows[1:]:
+        lines.append("| " + " | ".join(escape_md_cell(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def escape_md_cell(value: str) -> str:
+    return value.replace("|", "\\|")
 
 
 def map_article_pages(
@@ -476,6 +804,29 @@ def extract_refs(
             continue
         add(f"{current_slug}#{article_key(match.group('num'), match.group('sub'))}", ref_type(window))
 
+    for ref in extract_annex_refs(text, current_slug):
+        add(ref["target"], ref["type"])
+
+    return refs
+
+
+def extract_annex_refs(text: str, current_slug: str) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    patterns = (
+        re.compile(r"별\s*표\s*(?:제\s*)?(?P<num>\d+)(?:\s*호)?"),
+        re.compile(r"별\s*지\s*(?:제\s*)?(?P<num>\d+)\s*호(?:\s*서\s*식)?"),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            if pattern.pattern.startswith("별\\s*표"):
+                target = f"{current_slug}#별표{int(match.group('num'))}"
+            else:
+                target = f"{current_slug}#별지제{int(match.group('num'))}호"
+            if target in seen:
+                continue
+            seen.add(target)
+            refs.append({"target": target, "type": "인용"})
     return refs
 
 
@@ -573,6 +924,7 @@ def render_markdown(article: Article, config: BuildConfig = BuildConfig()) -> st
         f"amended: {article.amended}",
         "status: active",
         f"source_pages: [{article.source_pages[0]}, {article.source_pages[1]}]",
+        f"pages: [{article.source_pages[0]}, {article.source_pages[1]}]",
         "supersedes: null",
         "legal_basis:",
     ]
@@ -602,6 +954,33 @@ def render_markdown(article: Article, config: BuildConfig = BuildConfig()) -> st
     return "\n".join(lines)
 
 
+def render_annex_markdown(annex: Annex, config: BuildConfig = BuildConfig()) -> str:
+    lines = [
+        "---",
+        "type: annex",
+        f"institution: {config.institution}",
+        f"rule: {yaml_scalar(annex.rule.rule)}",
+        f"annex: {yaml_scalar(annex.annex)}",
+        f"title: {yaml_scalar(annex.title)}",
+        f"effective: {config.effective_date}",
+        "status: active",
+        f"source_pages: [{annex.source_pages[0]}, {annex.source_pages[1]}]",
+        f"pages: [{annex.source_pages[0]}, {annex.source_pages[1]}]",
+        f"table_structured: {str(annex.table_structured).lower()}",
+        "---",
+        annex.body.strip(),
+    ]
+    if annex.structured_tables:
+        lines.extend(["", "## Extracted tables", ""])
+        for idx, table in enumerate(annex.structured_tables, start=1):
+            if len(annex.structured_tables) > 1:
+                lines.extend([f"### Table {idx}", ""])
+            lines.extend([table, ""])
+    else:
+        lines.append("")
+    return "\n".join(lines)
+
+
 def build(
     pdf_path: Path,
     output_dir: Path,
@@ -610,6 +989,8 @@ def build(
 ) -> BuildResult:
     doc = fitz.open(pdf_path)
     pages = read_pages(doc)
+    prepare_output_tree(output_dir)
+    write_page_sidecars(pages, output_dir)
     toc_result = parse_toc_with_profile(pages, toc_pages=toc_pages)
     rules = toc_result.entries
     if not rules:
@@ -618,6 +999,7 @@ def build(
             f"matches={toc_result.match_count} toc_pages={format_page_range(toc_result.toc_pages)}"
         )
     articles: list[Article] = []
+    annexes: list[Annex] = []
     no_article_rules: list[TocEntry] = []
     known_rule_names = {entry.rule for entry in rules}
     for entry in rules:
@@ -629,9 +1011,11 @@ def build(
             page_spans=page_spans,
             effective_date=config.effective_date,
         )
+        parsed_annexes = parse_annexes(entry, text, page_spans, doc=doc)
         if not parsed:
             no_article_rules.append(entry)
         articles.extend(parsed)
+        annexes.extend(parsed_annexes)
     if not articles:
         raise ValueError(
             f"Article parsing found 0 rules with articles: profile={toc_result.profile} "
@@ -648,14 +1032,24 @@ def build(
         dest = output_dir / article.relative_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(render_markdown(article, config=config), encoding="utf-8")
+    for annex in annexes:
+        dest = output_dir / annex.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(render_annex_markdown(annex, config=config), encoding="utf-8")
+
+    coverage = calculate_page_coverage(rules, articles, annexes, toc_result.toc_pages)
+    suspicious_rules = find_suspicious_rules(rules, articles, annexes)
 
     result = BuildResult(
         rules=rules,
         articles=articles,
+        annexes=annexes,
         no_article_rules=no_article_rules,
         ambiguous_basis=ambiguous_basis,
         table_review=table_review,
         skipped_duplicate_articles=skipped_duplicate_articles,
+        coverage=coverage,
+        suspicious_rules=suspicious_rules,
         output_dir=output_dir,
         toc_profile=toc_result.profile,
         toc_match_count=toc_result.match_count,
@@ -663,7 +1057,78 @@ def build(
         config=config,
     )
     (output_dir / "qa-report.md").write_text(render_qa_report(result, pdf_path), encoding="utf-8")
+    (output_dir / "qa.json").write_text(json.dumps(render_qa_json(result, pdf_path), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return result
+
+
+def find_suspicious_rules(
+    rules: list[TocEntry],
+    articles: list[Article],
+    annexes: list[Annex],
+    *,
+    min_pages: int = 10,
+    max_articles: int = 3,
+) -> list[SuspiciousRule]:
+    article_counts = Counter(article.rule.rule for article in articles)
+    annex_counts = Counter(annex.rule.rule for annex in annexes)
+    suspicious: list[SuspiciousRule] = []
+    for rule in rules:
+        page_count = rule.end_page - rule.start_page + 1
+        article_count = article_counts[rule.rule]
+        if page_count >= min_pages and article_count <= max_articles:
+            suspicious.append(
+                SuspiciousRule(
+                    rule=rule,
+                    article_count=article_count,
+                    annex_count=annex_counts[rule.rule],
+                    page_count=page_count,
+                    reason=f"{page_count} pages but only {article_count} parsed articles",
+                )
+            )
+    return suspicious
+
+
+def calculate_page_coverage(
+    rules: list[TocEntry],
+    articles: list[Article],
+    annexes: list[Annex],
+    toc_pages: Iterable[int] = (),
+) -> CoverageReport:
+    toc_page_set = set(toc_pages)
+    eligible = {
+        page
+        for rule in rules
+        for page in range(rule.start_page, rule.end_page + 1)
+        if page not in toc_page_set
+    }
+    covered = set()
+    for item in [*articles, *annexes]:
+        for page in range(item.source_pages[0], item.source_pages[1] + 1):
+            if page in eligible:
+                covered.add(page)
+    uncovered = tuple(ranges_from_pages(sorted(eligible - covered)))
+    percent = round((len(covered) / len(eligible) * 100.0), 2) if eligible else 100.0
+    return CoverageReport(
+        eligible_pages=tuple(sorted(eligible)),
+        covered_pages=tuple(sorted(covered)),
+        uncovered_pages=uncovered,
+        percent=percent,
+    )
+
+
+def ranges_from_pages(pages: list[int]) -> list[tuple[int, int]]:
+    if not pages:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = pages[0]
+    for page in pages[1:]:
+        if page == prev + 1:
+            prev = page
+            continue
+        ranges.append((start, prev))
+        start = prev = page
+    ranges.append((start, prev))
+    return ranges
 
 
 def find_skipped_duplicate_articles(
@@ -705,6 +1170,8 @@ def find_skipped_duplicate_articles(
 
 def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
     rule_counts = Counter(article.rule.rule for article in result.articles)
+    annex_counts = Counter(annex.rule.rule for annex in result.annexes)
+    extracted_rules = {article.rule.rule for article in result.articles} | {annex.rule.rule for annex in result.annexes}
     source_pages_covered = sum(1 for article in result.articles if article.source_pages)
     article_level_pages = sum(
         1
@@ -713,6 +1180,7 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
     )
     amended_extracted = sum(1 for article in result.articles if extract_article_amended(article.body))
     legal_basis_filled = sum(1 for article in result.articles if article.legal_basis)
+    structured_annexes = sum(1 for annex in result.annexes if annex.table_structured)
     lines = [
         f"# {result.config.institution.upper()} rule Markdown build QA report",
         "",
@@ -725,6 +1193,8 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
             f"- Source effective date: `{result.config.effective_date}`",
         ]
     )
+    if result.config.source_url:
+        lines.append(f"- Source URL: {result.config.source_url}")
     if not result.config.legacy_cni_report:
         lines.extend(
             [
@@ -736,7 +1206,9 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
     lines.extend(
         [
         f"- Rule units from TOC: {len(result.rules)}",
+        f"- Extracted rule units with articles or annexes: {len(extracted_rules)}",
         f"- Article Markdown files emitted: {len(result.articles)}",
+        f"- Annex Markdown files emitted: {len(result.annexes)}",
         f"- Rules without parsed articles: {len(result.no_article_rules)}",
         f"- Skipped duplicate article headings: {len(result.skipped_duplicate_articles)}",
         f"- First articles without extracted legal_basis: {len(result.ambiguous_basis)}",
@@ -745,15 +1217,54 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
         f"- source_pages narrowed below rule range: {article_level_pages}",
         f"- amended markers extracted: {amended_extracted}",
         f"- legal_basis filled: {legal_basis_filled}",
+        f"- Page coverage: {result.coverage.percent:.2f}% ({len(result.coverage.covered_pages)}/{len(result.coverage.eligible_pages)})",
+        f"- Uncovered page ranges: {format_ranges(result.coverage.uncovered_pages) or 'None'}",
+        f"- Annex table_structured success: {structured_annexes}/{len(result.annexes)}",
+        f"- Suspicious low-density rules: {len(result.suspicious_rules)}",
         "",
         "## Rule article counts",
         "",
-        "| rule | slug | articles | pages |",
-        "| --- | --- | ---: | --- |",
+        "| rule | slug | articles | annexes | pages |",
+        "| --- | --- | ---: | ---: | --- |",
         ]
     )
     for entry in result.rules:
-        lines.append(f"| {entry.rule} | `{entry.slug}` | {rule_counts[entry.rule]} | {entry.start_page}-{entry.end_page} |")
+        lines.append(
+            f"| {entry.rule} | `{entry.slug}` | {rule_counts[entry.rule]} | {annex_counts[entry.rule]} | {entry.start_page}-{entry.end_page} |"
+        )
+
+    lines.extend(["", "## Page coverage", ""])
+    lines.extend(
+        [
+            f"- Eligible pages: {len(result.coverage.eligible_pages)}",
+            f"- Covered pages: {len(result.coverage.covered_pages)}",
+            f"- Coverage: {result.coverage.percent:.2f}%",
+            f"- Uncovered ranges: {format_ranges(result.coverage.uncovered_pages) or 'None'}",
+        ]
+    )
+
+    lines.extend(["", "## Annex statistics", ""])
+    if result.annexes:
+        lines.extend(["| rule | annexes | table_structured |", "| --- | ---: | ---: |"])
+        for entry in result.rules:
+            rule_annexes = [annex for annex in result.annexes if annex.rule.rule == entry.rule]
+            if not rule_annexes:
+                continue
+            lines.append(
+                f"| {entry.rule} | {len(rule_annexes)} | {sum(1 for annex in rule_annexes if annex.table_structured)} |"
+            )
+    else:
+        lines.append("- None.")
+
+    lines.extend(["", "## Suspicious low-density rules", ""])
+    if result.suspicious_rules:
+        lines.extend(["| rule | slug | pages | articles | annexes | reason |", "| --- | --- | ---: | ---: | ---: | --- |"])
+        for item in result.suspicious_rules:
+            lines.append(
+                f"| {item.rule.rule} | `{item.rule.slug}` | {item.page_count} | {item.article_count} | {item.annex_count} | {item.reason} |"
+            )
+    else:
+        lines.append("- None.")
 
     lines.extend(["", "## Parsing failures", ""])
     if result.no_article_rules:
@@ -800,6 +1311,68 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_ranges(ranges: Iterable[tuple[int, int]]) -> str:
+    return ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in ranges)
+
+
+def render_qa_json(result: BuildResult, pdf_path: Path) -> dict[str, object]:
+    rule_counts = Counter(article.rule.rule for article in result.articles)
+    annex_counts = Counter(annex.rule.rule for annex in result.annexes)
+    extracted_rules = {article.rule.rule for article in result.articles} | {annex.rule.rule for annex in result.annexes}
+    return {
+        "schema_version": 1,
+        "institution": result.config.institution,
+        "source_pdf": str(pdf_path),
+        "source_url": result.config.source_url,
+        "effective_date": result.config.effective_date,
+        "toc": {
+            "profile": result.toc_profile,
+            "pages": list(result.toc_pages),
+            "expected_rule_count": len(result.rules),
+            "extracted_rule_count": len(extracted_rules),
+            "match_count": result.toc_match_count,
+        },
+        "articles": {
+            "count": len(result.articles),
+            "by_rule": {entry.rule: rule_counts[entry.rule] for entry in result.rules},
+        },
+        "annexes": {
+            "count": len(result.annexes),
+            "by_rule": {entry.rule: annex_counts[entry.rule] for entry in result.rules},
+            "table_structured": sum(1 for annex in result.annexes if annex.table_structured),
+            "table_structured_rate": round(
+                sum(1 for annex in result.annexes if annex.table_structured) / len(result.annexes), 4
+            )
+            if result.annexes
+            else 0.0,
+        },
+        "coverage": {
+            "eligible_pages": list(result.coverage.eligible_pages),
+            "covered_pages": list(result.coverage.covered_pages),
+            "uncovered_ranges": [list(item) for item in result.coverage.uncovered_pages],
+            "percent": result.coverage.percent,
+        },
+        "quality_flags": {
+            "rules_without_parsed_articles": [entry.rule for entry in result.no_article_rules],
+            "ambiguous_basis_count": len(result.ambiguous_basis),
+            "table_review_count": len(result.table_review),
+            "skipped_duplicate_articles": len(result.skipped_duplicate_articles),
+            "suspicious_low_density_rules": [
+                {
+                    "rule": item.rule.rule,
+                    "slug": item.rule.slug,
+                    "pages": [item.rule.start_page, item.rule.end_page],
+                    "page_count": item.page_count,
+                    "articles": item.article_count,
+                    "annexes": item.annex_count,
+                    "reason": item.reason,
+                }
+                for item in result.suspicious_rules
+            ],
+        },
+    }
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     root = project_root()
     parser = argparse.ArgumentParser(description="Build CNI rule Markdown files from the PDF rule book.")
@@ -810,6 +1383,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--effective-date", type=parse_effective_date, default=SOURCE_EFFECTIVE_DATE)
     parser.add_argument("--footer", action="append", default=[])
     parser.add_argument("--toc-pages", type=parse_page_range)
+    parser.add_argument("--source-url")
     args = parser.parse_args(argv)
     if args.output is None:
         base_output = root / "04_data" / "90_index-build"
@@ -828,6 +1402,7 @@ def main(argv: list[str] | None = None) -> int:
         effective_date=args.effective_date,
         footers=tuple(args.footer) if args.footer else (args.institution_name,),
         legacy_cni_report=(not argv and args.institution == INSTITUTION),
+        source_url=args.source_url,
     )
     try:
         result = build(args.pdf.resolve(), args.output.resolve(), config=config, toc_pages=args.toc_pages)
@@ -844,6 +1419,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"toc_matches={result.toc_match_count}")
     print(f"rules={len(result.rules)}")
     print(f"articles={len(result.articles)}")
+    print(f"annexes={len(result.annexes)}")
+    print(f"coverage_percent={result.coverage.percent:.2f}")
     print(f"no_article_rules={len(result.no_article_rules)}")
     print(f"legal_basis_review={len(result.ambiguous_basis)}")
     print(f"table_review={len(result.table_review)}")
