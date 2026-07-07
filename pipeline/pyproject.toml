@@ -13,6 +13,7 @@ cni-rule-pipeline = "cni_rule_pipeline.pipeline:main"
 
 [dependency-groups]
 dev = [
+    "pdfplumber>=0.11.7",
     "pytest>=8.4.1",
 ]
 
