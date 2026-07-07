@@ -1,7 +1,11 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ServerHandler, ServiceExt,
+    tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
+    ServerHandler, ServiceExt,
 };
 use rules_core::{
     default_pack_status, parse_article_markdown, Article, LegalBasis, PackStatus, RuleFilter,
@@ -11,14 +15,36 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub const SEARCH_RULES_TOOL: &str = "search_rules";
 pub const GET_ARTICLE_TOOL: &str = "get_article";
 pub const LIST_RULES_TOOL: &str = "list_rules";
 pub const GET_LEGAL_BASIS_TOOL: &str = "get_legal_basis";
 pub const STATUS_TOOL: &str = "status";
+pub const DEFAULT_HTTP_BIND_ADDR: &str = "127.0.0.1:8787";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTransport {
+    Stdio,
+    Http,
+}
+
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    pub config_path: PathBuf,
+    pub transport: ServerTransport,
+    pub bind_addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TransportArgs {
+    pub transport: ServerTransport,
+    pub bind_addr: SocketAddr,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -310,22 +336,134 @@ pub async fn run_stdio_server(config: ServerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn run_http_server(config: ServerConfig, bind_addr: SocketAddr) -> anyhow::Result<()> {
+    let server = PublicRulesServer::from_config(config)?;
+    let cancellation_token = CancellationToken::new();
+    let service: StreamableHttpService<PublicRulesServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .disable_allowed_hosts()
+                .with_cancellation_token(cancellation_token.child_token()),
+        );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancellation_token.cancel();
+        })
+        .await?;
+    Ok(())
+}
+
+pub async fn run_server(
+    config: ServerConfig,
+    transport: ServerTransport,
+    bind_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    match transport {
+        ServerTransport::Stdio => run_stdio_server(config).await,
+        ServerTransport::Http => run_http_server(config, bind_addr).await,
+    }
+}
+
 pub async fn run_stdio_server_from_toml(toml_text: &str) -> anyhow::Result<()> {
     run_stdio_server(toml::from_str(toml_text)?).await
 }
 
 pub fn load_config_arg() -> anyhow::Result<ServerConfig> {
+    let args = load_cli_args()?;
+    Ok(toml::from_str(&fs::read_to_string(args.config_path)?)?)
+}
+
+pub fn load_cli_args() -> anyhow::Result<CliArgs> {
     let mut args = std::env::args().skip(1);
     let mut config_path = None;
+    let mut transport_args = TransportArgs::default();
     while let Some(arg) = args.next() {
-        if arg == "--config" {
-            config_path = args.next().map(PathBuf::from);
-            break;
+        match arg.as_str() {
+            "--config" => {
+                config_path = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a TOML path"))?,
+                );
+            }
+            "--transport" => {
+                transport_args.transport = parse_transport(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--transport requires stdio or http"))?,
+                )?;
+            }
+            "--bind" => {
+                transport_args.bind_addr = parse_bind_addr(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--bind requires <addr:port>"))?,
+                )?;
+            }
+            _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
         }
     }
     let path =
         config_path.ok_or_else(|| anyhow::anyhow!("usage: public-rules-mcp --config <toml>"))?;
-    Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    Ok(CliArgs {
+        config_path: path,
+        transport: transport_args.transport,
+        bind_addr: transport_args.bind_addr,
+    })
+}
+
+pub fn load_transport_args() -> anyhow::Result<TransportArgs> {
+    let mut args = std::env::args().skip(1);
+    let mut transport_args = TransportArgs::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--transport" => {
+                transport_args.transport = parse_transport(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--transport requires stdio or http"))?,
+                )?;
+            }
+            "--bind" => {
+                transport_args.bind_addr = parse_bind_addr(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--bind requires <addr:port>"))?,
+                )?;
+            }
+            _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
+        }
+    }
+    Ok(transport_args)
+}
+
+impl Default for TransportArgs {
+    fn default() -> Self {
+        Self {
+            transport: ServerTransport::Stdio,
+            bind_addr: DEFAULT_HTTP_BIND_ADDR
+                .parse()
+                .expect("default HTTP bind address must be valid"),
+        }
+    }
+}
+
+fn parse_transport(value: String) -> anyhow::Result<ServerTransport> {
+    match value.as_str() {
+        "stdio" => Ok(ServerTransport::Stdio),
+        "http" => Ok(ServerTransport::Http),
+        _ => Err(anyhow::anyhow!(
+            "--transport must be either stdio or http, got {value}"
+        )),
+    }
+}
+
+fn parse_bind_addr(value: String) -> anyhow::Result<SocketAddr> {
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid --bind address {value}: {error}"))
 }
 
 #[cfg(test)]
