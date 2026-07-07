@@ -13,6 +13,7 @@ use tantivy::Index;
 use walkdir::WalkDir;
 
 const INSTITUTION: &str = "cni";
+const INSTITUTION_NAME: &str = "충남연구원";
 const EFFECTIVE_DATE: &str = "2026-02-27";
 
 #[derive(Debug)]
@@ -20,6 +21,9 @@ struct Args {
     rules_dir: PathBuf,
     output_dir: PathBuf,
     archive_path: PathBuf,
+    institution: String,
+    institution_name: String,
+    effective_date: String,
     source_commit: String,
     created_at: String,
     golden_path: PathBuf,
@@ -53,8 +57,8 @@ struct GraphEdge {
 #[derive(Debug, Serialize)]
 struct QualityReport {
     schema_version: u32,
-    institution: &'static str,
-    effective_date: &'static str,
+    institution: String,
+    effective_date: String,
     article_count: usize,
     rule_count: usize,
     node_count: usize,
@@ -89,7 +93,7 @@ fn build_pack(args: &Args) -> Result<()> {
     }
     articles.sort_by(|a, b| a.article.id.cmp(&b.article.id));
 
-    let stage = args.output_dir.join("pack-cni-2026-02-27");
+    let stage = args.output_dir.join(args.pack_name());
     if stage.exists() {
         move_existing_aside(&stage)?;
     }
@@ -105,13 +109,13 @@ fn build_pack(args: &Args) -> Result<()> {
         .collect::<BTreeSet<_>>();
 
     copy_articles(&articles, &stage.join("articles"))?;
-    let (nodes, edges, unresolved_refs) = build_graph(&articles, &article_ids, &rule_ids);
+    let (nodes, edges, unresolved_refs) = build_graph(args, &articles, &article_ids, &rule_ids);
     write_jsonl(&stage.join("graph/nodes.jsonl"), &nodes)?;
     write_jsonl(&stage.join("graph/edges.jsonl"), &edges)?;
     build_tantivy_index(&articles, &stage.join("tantivy"))?;
     File::create(stage.join("vectors.db"))?;
 
-    let quality = quality_report(&articles, &rule_ids, &nodes, &edges, unresolved_refs);
+    let quality = quality_report(args, &articles, &rule_ids, &nodes, &edges, unresolved_refs);
     if quality.broken_edges != 0 || quality.orphans != 0 {
         bail!(
             "QA gate failed: broken_edges={} orphans={}",
@@ -139,7 +143,7 @@ fn build_pack(args: &Args) -> Result<()> {
         &load_sample_queries(&args.golden_path, 5)?,
     )?;
 
-    let manifest = build_manifest(&stage, &args.source_commit, &args.created_at)?;
+    let manifest = build_manifest(args, &stage)?;
     write_json_pretty(&stage.join("manifest.json"), &manifest)?;
     write_archive(&stage, &args.archive_path)?;
 
@@ -166,7 +170,10 @@ impl Args {
             .to_path_buf();
         let mut rules_dir = project_root.join("04_data/90_index-build/rules");
         let mut output_dir = project_root.join("04_data/90_index-build");
-        let mut archive_path = output_dir.join("pack-cni-2026-02-27.tar.zst");
+        let mut institution = INSTITUTION.to_string();
+        let mut institution_name = INSTITUTION_NAME.to_string();
+        let mut effective_date = EFFECTIVE_DATE.to_string();
+        let mut archive_path = None;
         let mut source_commit = None;
         let mut created_at = None;
         let mut golden_path = project_root.join("01_docs/eval/golden.jsonl");
@@ -179,11 +186,11 @@ impl Args {
                 .with_context(|| format!("{flag} requires a value"))?;
             match flag.as_str() {
                 "--rules-dir" => rules_dir = PathBuf::from(value),
-                "--output-dir" => {
-                    output_dir = PathBuf::from(value);
-                    archive_path = output_dir.join("pack-cni-2026-02-27.tar.zst");
-                }
-                "--archive" => archive_path = PathBuf::from(value),
+                "--output-dir" => output_dir = PathBuf::from(value),
+                "--archive" => archive_path = Some(PathBuf::from(value)),
+                "--institution" => institution = value,
+                "--institution-name" => institution_name = value,
+                "--effective-date" => effective_date = value,
                 "--source-commit" => source_commit = Some(value),
                 "--created-at" => created_at = Some(value),
                 "--golden" => golden_path = PathBuf::from(value),
@@ -197,16 +204,27 @@ impl Args {
                 _ => bail!("unknown argument: {flag}"),
             }
         }
+        validate_slug(&institution)?;
+        validate_effective_date(&effective_date)?;
+        let archive_path =
+            archive_path.unwrap_or_else(|| output_dir.join(format!("pack-{institution}-{effective_date}.tar.zst")));
 
         Ok(Self {
             rules_dir,
             output_dir,
             archive_path,
+            institution,
+            institution_name,
+            effective_date,
             source_commit: source_commit.context("--source-commit is required")?,
             created_at: created_at.context("--created-at is required")?,
             golden_path,
             max_unresolved_refs,
         })
+    }
+
+    fn pack_name(&self) -> String {
+        format!("pack-{}-{}", self.institution, self.effective_date)
     }
 }
 
@@ -234,6 +252,31 @@ fn load_source_articles(rules_dir: &Path) -> Result<Vec<SourceArticle>> {
         });
     }
     Ok(out)
+}
+
+fn validate_slug(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        bail!("--institution must contain only lowercase ASCII letters, digits, or hyphens");
+    }
+    Ok(())
+}
+
+fn validate_effective_date(value: &str) -> Result<()> {
+    let valid = value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .chars()
+            .enumerate()
+            .all(|(idx, ch)| idx == 4 || idx == 7 || ch.is_ascii_digit());
+    if !valid {
+        bail!("--effective-date must use YYYY-MM-DD");
+    }
+    Ok(())
 }
 
 fn read_source_pages(path: &Path) -> Result<Vec<u32>> {
@@ -275,16 +318,17 @@ fn copy_articles(articles: &[SourceArticle], articles_dir: &Path) -> Result<()> 
 }
 
 fn build_graph(
+    args: &Args,
     articles: &[SourceArticle],
     article_ids: &BTreeSet<String>,
     rule_ids: &BTreeSet<String>,
 ) -> (Vec<GraphNode>, Vec<GraphEdge>, usize) {
     let mut nodes = Vec::new();
     nodes.push(GraphNode {
-        id: INSTITUTION.to_string(),
+        id: args.institution.clone(),
         kind: NodeKind::Institution,
-        label: "충남연구원".to_string(),
-        meta: json!({ "institution": INSTITUTION }),
+        label: args.institution_name.clone(),
+        meta: json!({ "institution": args.institution }),
     });
 
     let mut rule_labels = BTreeMap::<String, &str>::new();
@@ -363,7 +407,7 @@ fn build_graph(
     let mut edges = Vec::<GraphEdge>::new();
     for rule_id in rule_ids {
         edges.push(GraphEdge {
-            src: INSTITUTION.to_string(),
+            src: args.institution.clone(),
             dst: rule_id.clone(),
             kind: EdgeKind::AppliesTo,
             meta: json!({ "source": "frontmatter.rule" }),
@@ -400,6 +444,7 @@ fn build_graph(
 }
 
 fn quality_report(
+    args: &Args,
     articles: &[SourceArticle],
     rule_ids: &BTreeSet<String>,
     nodes: &[GraphNode],
@@ -453,8 +498,8 @@ fn quality_report(
 
     QualityReport {
         schema_version: 1,
-        institution: INSTITUTION,
-        effective_date: EFFECTIVE_DATE,
+        institution: args.institution.clone(),
+        effective_date: args.effective_date.clone(),
         article_count: articles.len(),
         rule_count: rule_ids.len(),
         node_count: nodes.len(),
@@ -532,7 +577,7 @@ fn load_sample_queries(path: &Path, limit: usize) -> Result<Vec<GoldenCase>> {
     Ok(out)
 }
 
-fn build_manifest(root: &Path, source_commit: &str, created_at: &str) -> Result<PackManifest> {
+fn build_manifest(args: &Args, root: &Path) -> Result<PackManifest> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).sort_by_file_name() {
         let entry = entry?;
@@ -548,10 +593,10 @@ fn build_manifest(root: &Path, source_commit: &str, created_at: &str) -> Result<
     }
     Ok(PackManifest {
         schema_version: 1,
-        institution: INSTITUTION.to_string(),
-        effective_date: EFFECTIVE_DATE.to_string(),
-        source_commit: source_commit.to_string(),
-        created_at: created_at.to_string(),
+        institution: args.institution.clone(),
+        effective_date: args.effective_date.clone(),
+        source_commit: args.source_commit.clone(),
+        created_at: args.created_at.clone(),
         files,
     })
 }
@@ -677,6 +722,21 @@ mod tests {
     use super::*;
     use rules_core::ArticleRef;
 
+    fn test_args() -> Args {
+        Args {
+            rules_dir: PathBuf::from("unused-rules"),
+            output_dir: PathBuf::from("unused-output"),
+            archive_path: PathBuf::from("unused.tar.zst"),
+            institution: INSTITUTION.to_string(),
+            institution_name: INSTITUTION_NAME.to_string(),
+            effective_date: EFFECTIVE_DATE.to_string(),
+            source_commit: "test".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            golden_path: PathBuf::from("unused-golden.jsonl"),
+            max_unresolved_refs: None,
+        }
+    }
+
     #[test]
     fn quality_report_counts_unresolved_refs_even_when_placeholder_nodes_hide_broken_edges() {
         let article = Article {
@@ -711,8 +771,9 @@ mod tests {
             .map(|source| rule_node_id(&source.article.rule))
             .collect::<BTreeSet<_>>();
 
-        let (nodes, edges, unresolved_refs) = build_graph(&articles, &article_ids, &rule_ids);
-        let report = quality_report(&articles, &rule_ids, &nodes, &edges, unresolved_refs);
+        let args = test_args();
+        let (nodes, edges, unresolved_refs) = build_graph(&args, &articles, &article_ids, &rule_ids);
+        let report = quality_report(&args, &articles, &rule_ids, &nodes, &edges, unresolved_refs);
 
         assert_eq!(report.broken_edges, 0);
         assert_eq!(report.unresolved_refs, 1);

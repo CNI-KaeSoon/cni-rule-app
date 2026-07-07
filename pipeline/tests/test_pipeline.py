@@ -4,6 +4,7 @@ from cni_rule_pipeline.pipeline import (
     extract_refs,
     parse_articles,
     parse_toc,
+    parse_toc_with_profile,
     render_markdown,
     slugify,
 )
@@ -24,6 +25,51 @@ def test_parse_toc_entries_from_pdf_text_page():
     assert entries[0].rule == "직제규정"
     assert entries[0].start_page == 91
     assert entries[0].end_page == 97
+
+
+def test_toc_profile_selects_dotted_no_code_and_skips_chapter_lines():
+    pages = {
+        1: "이사회 규정 …………………………………………………………………… 35\n"
+        "제2장 제안의 접수·심사 ……………………………………………………………… 360\n"
+        "운영위원회 규정 ……………………………………………………………… 40\n",
+        40: "",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(1,))
+
+    assert result.profile == "dotted-no-code"
+    assert result.match_count == 2
+    assert [entry.rule for entry in result.entries] == ["이사회 규정", "운영위원회 규정"]
+
+
+def test_toc_profile_selects_numbered_dotted():
+    pages = {
+        3: "제1편 조례 및 정관\n"
+        "1. 충청남도역사문화연구원 설립 및 지원조례······································· 3\n"
+        "2. 충청남도역사문화연구원 정관·························································· 9\n",
+        9: "",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(3,))
+
+    assert result.profile == "numbered-dotted"
+    assert result.match_count == 2
+    assert result.entries[0].start_page == 3
+
+
+def test_toc_profile_selects_numbered_slash():
+    pages = {
+        2: "□ 제3편 규정\n"
+        "1. 제규정의 제정규정  /   69\n"
+        "2. 직제규정  /   73\n",
+        73: "",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(2,))
+
+    assert result.profile == "numbered-slash"
+    assert result.match_count == 2
+    assert [entry.start_page for entry in result.entries] == [69, 73]
 
 
 def test_parse_articles_keeps_article_keys_and_titles():
@@ -178,7 +224,7 @@ def test_analyze_qlogs_groups_normalized_questions_and_miss_candidates(tmp_path)
     qlog.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
 
     entries = module.read_qlogs(tmp_path)
-    rendered = module.render_markdown(entries, limit=5, include_miss=True)
+    rendered = module.render_markdown(entries, diagnostics=[], limit=5, include_miss=True)
 
     assert "| 1 | 2 | 국내 출장 일비는 얼마인가요? | `국내 출장 일비는 얼마인가요` |" in rendered
     assert "## 실검색 Miss 후보" in rendered

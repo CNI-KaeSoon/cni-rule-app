@@ -15,15 +15,65 @@ import fitz
 
 SOURCE_EFFECTIVE_DATE = "2026-02-27"
 INSTITUTION = "cni"
+INSTITUTION_NAME = "충남연구원"
 
-TOC_ENTRY_RE = re.compile(
+TOC_CNI_RE = re.compile(
     r"^(?P<code>[IVX]+\s*-\s*\d+)\s+"
     r"(?P<title>.+?)"
     r"[·.]{3,}\s*"
     r"(?P<page>\d+)\s*$"
 )
+TOC_DOTTED_NO_CODE_RE = re.compile(
+    r"^(?P<title>.+?)\s*[·.․…]{3,}\s*(?P<page>\d+)\s*$"
+)
+TOC_NUMBERED_DOTTED_RE = re.compile(
+    r"^(?P<num>\d+)\.\s*(?P<title>.+?)\s*[·.․…]{3,}\s*(?P<page>\d+)\s*$"
+)
+TOC_SLASH_RE = re.compile(
+    r"^(?P<num>\d+)\.\s*(?P<title>.+?)\s*/\s*(?P<page>\d+)\s*$"
+)
 ARTICLE_RE = re.compile(
     r"(?m)^제\s*(?P<num>\d+)\s*조(?:\s*의\s*(?P<sub>\d+))?\s*(?:\((?P<title>[^)\n]+)\))?"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildConfig:
+    institution: str = INSTITUTION
+    institution_name: str = INSTITUTION_NAME
+    effective_date: str = SOURCE_EFFECTIVE_DATE
+    footers: tuple[str, ...] = (INSTITUTION_NAME,)
+    legacy_cni_report: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class TocProfile:
+    name: str
+    pattern: re.Pattern[str]
+    code_group: str | None = None
+    skip_numbered_chapters: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class TocCandidate:
+    code: str | None
+    title: str
+    start_page: int
+
+
+@dataclasses.dataclass(frozen=True)
+class TocParseResult:
+    entries: list["TocEntry"]
+    profile: str
+    match_count: int
+    toc_pages: tuple[int, ...]
+
+
+TOC_PROFILES = (
+    TocProfile("cni-roman-dotted", TOC_CNI_RE, code_group="code"),
+    TocProfile("dotted-no-code", TOC_DOTTED_NO_CODE_RE, skip_numbered_chapters=True),
+    TocProfile("numbered-dotted", TOC_NUMBERED_DOTTED_RE),
+    TocProfile("numbered-slash", TOC_SLASH_RE),
 )
 LAW_QUOTE_REF_RE = re.compile(
     r"「(?P<law>[^」]+)」\s*제\s*(?P<num>\d+)\s*조(?:\s*의\s*(?P<sub>\d+))?"
@@ -81,6 +131,10 @@ class BuildResult:
     table_review: list[Article]
     skipped_duplicate_articles: list[Article]
     output_dir: Path
+    toc_profile: str
+    toc_match_count: int
+    toc_pages: tuple[int, ...]
+    config: BuildConfig
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,25 +185,82 @@ def read_pages(doc: fitz.Document) -> dict[int, str]:
 
 
 def parse_toc(pages: dict[int, str], toc_pages: Iterable[int] = (3, 4, 5)) -> list[TocEntry]:
-    raw: list[tuple[str, str, int]] = []
+    return parse_toc_with_profile(pages, toc_pages=tuple(toc_pages)).entries
+
+
+def parse_toc_with_profile(pages: dict[int, str], toc_pages: Iterable[int] | None = None) -> TocParseResult:
+    selected_pages = tuple(toc_pages) if toc_pages is not None else auto_detect_toc_pages(pages)
+    profile, raw = best_toc_profile(pages, selected_pages)
+    entries = toc_entries_from_candidates(raw, profile.name, max(pages))
+    return TocParseResult(entries=entries, profile=profile.name, match_count=len(raw), toc_pages=selected_pages)
+
+
+def auto_detect_toc_pages(pages: dict[int, str], scan_pages: int = 30) -> tuple[int, ...]:
+    candidates: list[tuple[int, int, int]] = []
+    max_page = min(max(pages), scan_pages)
+    for start in range(1, max_page + 1):
+        for end in range(start, max_page + 1):
+            page_range = tuple(range(start, end + 1))
+            _profile, raw = best_toc_profile(pages, page_range)
+            if raw:
+                candidates.append((len(raw), -(end - start + 1), start))
+    if not candidates:
+        return (3, 4, 5)
+    _count, neg_len, start = max(candidates)
+    return tuple(range(start, start - neg_len))
+
+
+def best_toc_profile(pages: dict[int, str], toc_pages: Iterable[int]) -> tuple[TocProfile, list[TocCandidate]]:
+    page_tuple = tuple(toc_pages)
+    scored: list[tuple[int, int, TocProfile, list[TocCandidate]]] = []
+    for order, profile in enumerate(TOC_PROFILES):
+        raw = collect_toc_candidates(pages, page_tuple, profile)
+        scored.append((len(raw), -order, profile, raw))
+    _count, _order, profile, raw = max(scored, key=lambda item: (item[0], item[1]))
+    return profile, raw
+
+
+def collect_toc_candidates(pages: dict[int, str], toc_pages: Iterable[int], profile: TocProfile) -> list[TocCandidate]:
+    raw: list[TocCandidate] = []
     for page_no in toc_pages:
         for line in pages.get(page_no, "").splitlines():
             line = normalize_spaces(line).strip()
-            match = TOC_ENTRY_RE.match(line)
+            match = profile.pattern.match(line)
             if not match:
                 continue
-            raw.append(
-                (
-                    re.sub(r"\s+", "", match.group("code")),
-                    normalize_rule_title(match.group("title")),
-                    int(match.group("page")),
-                )
-            )
+            title = normalize_rule_title(match.group("title"))
+            if should_skip_toc_title(title, profile):
+                continue
+            code = None
+            if profile.code_group:
+                code = re.sub(r"\s+", "", match.group(profile.code_group))
+            raw.append(TocCandidate(code=code, title=title, start_page=int(match.group("page"))))
+    return raw
 
+
+def should_skip_toc_title(title: str, profile: TocProfile) -> bool:
+    if profile.skip_numbered_chapters and re.match(r"^제\s*\d+\s*[장절]\b", title):
+        return True
+    if profile.skip_numbered_chapters and re.match(r"^\d+\.", title):
+        return True
+    if not re.search(r"(규정|규칙|정관|조례|강령|지침|법|법률|시행령|요령|발췌)$", title):
+        return True
+    return False
+
+
+def toc_entries_from_candidates(raw: list[TocCandidate], profile_name: str, max_page: int) -> list[TocEntry]:
     entries: list[TocEntry] = []
-    for index, (code, title, start_page) in enumerate(raw):
-        next_start = raw[index + 1][2] if index + 1 < len(raw) else max(pages)
-        entries.append(TocEntry(code=code, rule=title, start_page=start_page, end_page=max(start_page, next_start - 1)))
+    for index, candidate in enumerate(raw):
+        next_start = raw[index + 1].start_page if index + 1 < len(raw) else max_page
+        code = candidate.code or f"{profile_name}-{index + 1:03d}"
+        entries.append(
+            TocEntry(
+                code=code,
+                rule=candidate.title,
+                start_page=candidate.start_page,
+                end_page=max(candidate.start_page, next_start - 1),
+            )
+        )
     return entries
 
 
@@ -160,30 +271,35 @@ def normalize_rule_title(title: str) -> str:
     return title
 
 
-def clean_page_text(text: str) -> str:
+def clean_page_text(text: str, footers: Iterable[str] = (INSTITUTION_NAME,)) -> str:
+    footer_set = {normalize_spaces(footer).strip() for footer in footers if footer.strip()}
     cleaned: list[str] = []
     for line in text.splitlines():
         line = normalize_spaces(line).rstrip()
         stripped = line.strip()
         if re.fullmatch(r"-\s*\d+\s*-", stripped):
             continue
-        if stripped == "충남연구원":
+        if stripped in footer_set:
             continue
         cleaned.append(line)
     return "\n".join(cleaned).strip()
 
 
-def rule_text(entry: TocEntry, pages: dict[int, str]) -> str:
-    text, _ = rule_text_with_page_spans(entry, pages)
+def rule_text(entry: TocEntry, pages: dict[int, str], footers: Iterable[str] = (INSTITUTION_NAME,)) -> str:
+    text, _ = rule_text_with_page_spans(entry, pages, footers=footers)
     return text
 
 
-def rule_text_with_page_spans(entry: TocEntry, pages: dict[int, str]) -> tuple[str, list[PageSpan]]:
+def rule_text_with_page_spans(
+    entry: TocEntry,
+    pages: dict[int, str],
+    footers: Iterable[str] = (INSTITUTION_NAME,),
+) -> tuple[str, list[PageSpan]]:
     parts: list[str] = []
     spans: list[PageSpan] = []
     cursor = 0
     for page_no in range(entry.start_page, entry.end_page + 1):
-        part = clean_page_text(pages.get(page_no, ""))
+        part = clean_page_text(pages.get(page_no, ""), footers=footers)
         if not part:
             continue
         if parts:
@@ -202,6 +318,7 @@ def parse_articles(
     text: str,
     known_rule_names: set[str] | None = None,
     page_spans: list[PageSpan] | None = None,
+    effective_date: str = SOURCE_EFFECTIVE_DATE,
 ) -> list[Article]:
     matches = list(ARTICLE_RE.finditer(text))
     articles: list[Article] = []
@@ -209,7 +326,7 @@ def parse_articles(
         return articles
 
     prefix = text[: matches[0].start()]
-    amended = latest_date(prefix) or SOURCE_EFFECTIVE_DATE
+    amended = latest_date(prefix) or effective_date
 
     article_page_offsets = map_article_pages(entry, text, matches, page_spans)
     seen_keys: set[str] = set()
@@ -418,14 +535,41 @@ def yaml_scalar(value: str | None) -> str:
     return f'"{escaped}"'
 
 
-def render_markdown(article: Article) -> str:
+def format_page_range(pages: Iterable[int]) -> str:
+    page_tuple = tuple(pages)
+    if not page_tuple:
+        return ""
+    if page_tuple == tuple(range(page_tuple[0], page_tuple[-1] + 1)):
+        return f"{page_tuple[0]}-{page_tuple[-1]}"
+    return ",".join(str(page) for page in page_tuple)
+
+
+def parse_page_range(value: str) -> tuple[int, ...]:
+    match = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError("--toc-pages must use START-END")
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if start < 1 or end < start:
+        raise argparse.ArgumentTypeError("--toc-pages must have 1 <= START <= END")
+    return tuple(range(start, end + 1))
+
+
+def parse_effective_date(value: str) -> str:
+    try:
+        return dt.date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--effective-date must use YYYY-MM-DD") from exc
+
+
+def render_markdown(article: Article, config: BuildConfig = BuildConfig()) -> str:
     lines = [
         "---",
-        f"institution: {INSTITUTION}",
+        f"institution: {config.institution}",
         f"rule: {yaml_scalar(article.rule.rule)}",
         f"article: {yaml_scalar(article.article)}",
         f"title: {yaml_scalar(article.title)}",
-        f"effective: {SOURCE_EFFECTIVE_DATE}",
+        f"effective: {config.effective_date}",
         f"amended: {article.amended}",
         "status: active",
         f"source_pages: [{article.source_pages[0]}, {article.source_pages[1]}]",
@@ -458,21 +602,43 @@ def render_markdown(article: Article) -> str:
     return "\n".join(lines)
 
 
-def build(pdf_path: Path, output_dir: Path) -> BuildResult:
+def build(
+    pdf_path: Path,
+    output_dir: Path,
+    config: BuildConfig = BuildConfig(),
+    toc_pages: Iterable[int] | None = (3, 4, 5),
+) -> BuildResult:
     doc = fitz.open(pdf_path)
     pages = read_pages(doc)
-    rules = parse_toc(pages)
+    toc_result = parse_toc_with_profile(pages, toc_pages=toc_pages)
+    rules = toc_result.entries
+    if not rules:
+        raise ValueError(
+            f"TOC parsing found 0 rules: profile={toc_result.profile} "
+            f"matches={toc_result.match_count} toc_pages={format_page_range(toc_result.toc_pages)}"
+        )
     articles: list[Article] = []
     no_article_rules: list[TocEntry] = []
     known_rule_names = {entry.rule for entry in rules}
     for entry in rules:
-        text, page_spans = rule_text_with_page_spans(entry, pages)
-        parsed = parse_articles(entry, text, known_rule_names=known_rule_names, page_spans=page_spans)
+        text, page_spans = rule_text_with_page_spans(entry, pages, footers=config.footers)
+        parsed = parse_articles(
+            entry,
+            text,
+            known_rule_names=known_rule_names,
+            page_spans=page_spans,
+            effective_date=config.effective_date,
+        )
         if not parsed:
             no_article_rules.append(entry)
         articles.extend(parsed)
+    if not articles:
+        raise ValueError(
+            f"Article parsing found 0 rules with articles: profile={toc_result.profile} "
+            f"matches={toc_result.match_count} toc_pages={format_page_range(toc_result.toc_pages)}"
+        )
 
-    skipped_duplicate_articles = find_skipped_duplicate_articles(rules, pages, articles)
+    skipped_duplicate_articles = find_skipped_duplicate_articles(rules, pages, articles, config=config)
     ambiguous_basis = [article for article in articles if article.article == "제1조" and not article.legal_basis]
     table_review = [article for article in articles if looks_table_sensitive(article)]
 
@@ -481,7 +647,7 @@ def build(pdf_path: Path, output_dir: Path) -> BuildResult:
     for article in articles:
         dest = output_dir / article.relative_path
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(render_markdown(article), encoding="utf-8")
+        dest.write_text(render_markdown(article, config=config), encoding="utf-8")
 
     result = BuildResult(
         rules=rules,
@@ -491,18 +657,25 @@ def build(pdf_path: Path, output_dir: Path) -> BuildResult:
         table_review=table_review,
         skipped_duplicate_articles=skipped_duplicate_articles,
         output_dir=output_dir,
+        toc_profile=toc_result.profile,
+        toc_match_count=toc_result.match_count,
+        toc_pages=toc_result.toc_pages,
+        config=config,
     )
     (output_dir / "qa-report.md").write_text(render_qa_report(result, pdf_path), encoding="utf-8")
     return result
 
 
 def find_skipped_duplicate_articles(
-    rules: list[TocEntry], pages: dict[int, str], emitted_articles: list[Article]
+    rules: list[TocEntry],
+    pages: dict[int, str],
+    emitted_articles: list[Article],
+    config: BuildConfig = BuildConfig(),
 ) -> list[Article]:
     emitted = {(article.rule.code, article.article) for article in emitted_articles}
     skipped: list[Article] = []
     for entry in rules:
-        text, page_spans = rule_text_with_page_spans(entry, pages)
+        text, page_spans = rule_text_with_page_spans(entry, pages, footers=config.footers)
         seen: set[str] = set()
         matches = list(ARTICLE_RE.finditer(text))
         page_offsets = map_article_pages(entry, text, matches, page_spans)
@@ -521,7 +694,7 @@ def find_skipped_duplicate_articles(
                     article=key,
                     title=title,
                     body=text[start:end].strip(),
-                    amended=amended or SOURCE_EFFECTIVE_DATE,
+                    amended=amended or config.effective_date,
                     refs=(),
                     legal_basis=(),
                     source_pages=page_offsets.get(key, (entry.start_page, entry.end_page)),
@@ -541,10 +714,27 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
     amended_extracted = sum(1 for article in result.articles if extract_article_amended(article.body))
     legal_basis_filled = sum(1 for article in result.articles if article.legal_basis)
     lines = [
-        "# CNI rule Markdown build QA report",
+        f"# {result.config.institution.upper()} rule Markdown build QA report",
         "",
-        f"- Source PDF: `{pdf_path}`",
-        f"- Source effective date: `{SOURCE_EFFECTIVE_DATE}`",
+    ]
+    if not result.config.legacy_cni_report:
+        lines.append(f"- Institution: `{result.config.institution}` ({result.config.institution_name})")
+    lines.extend(
+        [
+            f"- Source PDF: `{pdf_path}`",
+            f"- Source effective date: `{result.config.effective_date}`",
+        ]
+    )
+    if not result.config.legacy_cni_report:
+        lines.extend(
+            [
+                f"- TOC profile: `{result.toc_profile}`",
+                f"- TOC pages: {format_page_range(result.toc_pages)}",
+                f"- TOC matches: {result.toc_match_count}",
+            ]
+        )
+    lines.extend(
+        [
         f"- Rule units from TOC: {len(result.rules)}",
         f"- Article Markdown files emitted: {len(result.articles)}",
         f"- Rules without parsed articles: {len(result.no_article_rules)}",
@@ -560,7 +750,8 @@ def render_qa_report(result: BuildResult, pdf_path: Path) -> str:
         "",
         "| rule | slug | articles | pages |",
         "| --- | --- | ---: | --- |",
-    ]
+        ]
+    )
     for entry in result.rules:
         lines.append(f"| {entry.rule} | `{entry.slug}` | {rule_counts[entry.rule]} | {entry.start_page}-{entry.end_page} |")
 
@@ -613,15 +804,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     root = project_root()
     parser = argparse.ArgumentParser(description="Build CNI rule Markdown files from the PDF rule book.")
     parser.add_argument("--pdf", type=Path, default=default_pdf_path(root))
-    parser.add_argument("--output", type=Path, default=root / "04_data" / "90_index-build")
-    return parser.parse_args(argv)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--institution", default=INSTITUTION)
+    parser.add_argument("--institution-name", default=INSTITUTION_NAME)
+    parser.add_argument("--effective-date", type=parse_effective_date, default=SOURCE_EFFECTIVE_DATE)
+    parser.add_argument("--footer", action="append", default=[])
+    parser.add_argument("--toc-pages", type=parse_page_range)
+    args = parser.parse_args(argv)
+    if args.output is None:
+        base_output = root / "04_data" / "90_index-build"
+        args.output = base_output if args.institution == INSTITUTION else base_output / args.institution
+    if args.toc_pages is None and args.institution == INSTITUTION:
+        args.toc_pages = (3, 4, 5)
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
-    result = build(args.pdf.resolve(), args.output.resolve())
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(argv)
+    config = BuildConfig(
+        institution=args.institution,
+        institution_name=args.institution_name,
+        effective_date=args.effective_date,
+        footers=tuple(args.footer) if args.footer else (args.institution_name,),
+        legacy_cni_report=(not argv and args.institution == INSTITUTION),
+    )
+    try:
+        result = build(args.pdf.resolve(), args.output.resolve(), config=config, toc_pages=args.toc_pages)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(f"source_pdf={args.pdf}")
     print(f"output_dir={result.output_dir}")
+    print(f"institution={result.config.institution}")
+    print(f"institution_name={result.config.institution_name}")
+    print(f"effective_date={result.config.effective_date}")
+    print(f"toc_profile={result.toc_profile}")
+    print(f"toc_pages={format_page_range(result.toc_pages)}")
+    print(f"toc_matches={result.toc_match_count}")
     print(f"rules={len(result.rules)}")
     print(f"articles={len(result.articles)}")
     print(f"no_article_rules={len(result.no_article_rules)}")
