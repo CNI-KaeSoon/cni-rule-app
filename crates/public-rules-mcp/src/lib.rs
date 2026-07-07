@@ -38,12 +38,14 @@ pub struct CliArgs {
     pub config_path: PathBuf,
     pub transport: ServerTransport,
     pub bind_addr: SocketAddr,
+    pub allowed_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TransportArgs {
     pub transport: ServerTransport,
     pub bind_addr: SocketAddr,
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -337,22 +339,32 @@ pub async fn run_stdio_server(config: ServerConfig) -> anyhow::Result<()> {
 }
 
 pub async fn run_http_server(config: ServerConfig, bind_addr: SocketAddr) -> anyhow::Result<()> {
+    run_http_server_with_allowed_hosts(config, bind_addr, Vec::<String>::new()).await
+}
+
+pub async fn run_http_server_with_allowed_hosts(
+    config: ServerConfig,
+    bind_addr: SocketAddr,
+    extra_allowed_hosts: Vec<String>,
+) -> anyhow::Result<()> {
     let server = PublicRulesServer::from_config(config)?;
     let cancellation_token = CancellationToken::new();
+    let mut http_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_cancellation_token(cancellation_token.child_token());
+    if !extra_allowed_hosts.is_empty() {
+        let mut allowed_hosts = default_allowed_hosts();
+        allowed_hosts.extend(extra_allowed_hosts);
+        http_config = http_config.with_allowed_hosts(allowed_hosts);
+    }
     let service: StreamableHttpService<PublicRulesServer, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Default::default(),
-            StreamableHttpServerConfig::default()
-                .disable_allowed_hosts()
-                .with_cancellation_token(cancellation_token.child_token()),
-        );
+        StreamableHttpService::new(move || Ok(server.clone()), Default::default(), http_config);
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            wait_for_shutdown_signal().await;
             cancellation_token.cancel();
         })
         .await?;
@@ -364,9 +376,26 @@ pub async fn run_server(
     transport: ServerTransport,
     bind_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    match transport {
+    run_server_with_transport_args(
+        config,
+        TransportArgs {
+            transport,
+            bind_addr,
+            allowed_hosts: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub async fn run_server_with_transport_args(
+    config: ServerConfig,
+    args: TransportArgs,
+) -> anyhow::Result<()> {
+    match args.transport {
         ServerTransport::Stdio => run_stdio_server(config).await,
-        ServerTransport::Http => run_http_server(config, bind_addr).await,
+        ServerTransport::Http => {
+            run_http_server_with_allowed_hosts(config, args.bind_addr, args.allowed_hosts).await
+        }
     }
 }
 
@@ -374,13 +403,16 @@ pub async fn run_stdio_server_from_toml(toml_text: &str) -> anyhow::Result<()> {
     run_stdio_server(toml::from_str(toml_text)?).await
 }
 
-pub fn load_config_arg() -> anyhow::Result<ServerConfig> {
-    let args = load_cli_args()?;
-    Ok(toml::from_str(&fs::read_to_string(args.config_path)?)?)
+pub fn load_cli_args() -> anyhow::Result<CliArgs> {
+    parse_cli_args(std::env::args().skip(1))
 }
 
-pub fn load_cli_args() -> anyhow::Result<CliArgs> {
-    let mut args = std::env::args().skip(1);
+fn parse_cli_args<I, S>(args: I) -> anyhow::Result<CliArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into);
     let mut config_path = None;
     let mut transport_args = TransportArgs::default();
     while let Some(arg) = args.next() {
@@ -392,19 +424,7 @@ pub fn load_cli_args() -> anyhow::Result<CliArgs> {
                         .ok_or_else(|| anyhow::anyhow!("--config requires a TOML path"))?,
                 );
             }
-            "--transport" => {
-                transport_args.transport = parse_transport(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--transport requires stdio or http"))?,
-                )?;
-            }
-            "--bind" => {
-                transport_args.bind_addr = parse_bind_addr(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--bind requires <addr:port>"))?,
-                )?;
-            }
-            _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
+            _ => parse_transport_arg(&arg, &mut args, &mut transport_args)?,
         }
     }
     let path =
@@ -413,30 +433,57 @@ pub fn load_cli_args() -> anyhow::Result<CliArgs> {
         config_path: path,
         transport: transport_args.transport,
         bind_addr: transport_args.bind_addr,
+        allowed_hosts: transport_args.allowed_hosts,
     })
 }
 
 pub fn load_transport_args() -> anyhow::Result<TransportArgs> {
-    let mut args = std::env::args().skip(1);
+    parse_transport_args(std::env::args().skip(1))
+}
+
+fn parse_transport_args<I, S>(args: I) -> anyhow::Result<TransportArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into);
     let mut transport_args = TransportArgs::default();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--transport" => {
-                transport_args.transport = parse_transport(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--transport requires stdio or http"))?,
-                )?;
-            }
-            "--bind" => {
-                transport_args.bind_addr = parse_bind_addr(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--bind requires <addr:port>"))?,
-                )?;
-            }
-            _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
-        }
+        parse_transport_arg(&arg, &mut args, &mut transport_args)?;
     }
     Ok(transport_args)
+}
+
+fn parse_transport_arg<I>(
+    arg: &str,
+    args: &mut I,
+    transport_args: &mut TransportArgs,
+) -> anyhow::Result<()>
+where
+    I: Iterator<Item = String>,
+{
+    match arg {
+        "--transport" => {
+            transport_args.transport = parse_transport(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("--transport requires stdio or http"))?,
+            )?;
+        }
+        "--bind" => {
+            transport_args.bind_addr = parse_bind_addr(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("--bind requires <addr:port>"))?,
+            )?;
+        }
+        "--allowed-host" => {
+            transport_args.allowed_hosts.push(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("--allowed-host requires <host>"))?,
+            );
+        }
+        _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
+    }
+    Ok(())
 }
 
 impl Default for TransportArgs {
@@ -446,6 +493,7 @@ impl Default for TransportArgs {
             bind_addr: DEFAULT_HTTP_BIND_ADDR
                 .parse()
                 .expect("default HTTP bind address must be valid"),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -461,9 +509,30 @@ fn parse_transport(value: String) -> anyhow::Result<ServerTransport> {
 }
 
 fn parse_bind_addr(value: String) -> anyhow::Result<SocketAddr> {
-    value
-        .parse()
-        .map_err(|error| anyhow::anyhow!("invalid --bind address {value}: {error}"))
+    value.parse().map_err(|error| {
+        anyhow::anyhow!(
+            "invalid --bind address {value}: expected numeric IP:port (예: 0.0.0.0:8787): {error}"
+        )
+    })
+}
+
+fn default_allowed_hosts() -> Vec<String> {
+    StreamableHttpServerConfig::default().allowed_hosts
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler must install");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]
@@ -573,6 +642,52 @@ refs: []
         assert_eq!(result.institution, "cni");
         assert_eq!(result.effective_date, "2026-02-27");
         assert!(!result.stale);
+    }
+
+    #[test]
+    fn parse_transport_args_rejects_unknown_transport() {
+        let error = parse_transport_args(["--transport", "websocket"])
+            .expect_err("unknown transport must fail")
+            .to_string();
+
+        assert!(error.contains("--transport must be either stdio or http"));
+    }
+
+    #[test]
+    fn parse_transport_args_rejects_missing_bind_value() {
+        let error = parse_transport_args(["--bind"])
+            .expect_err("missing bind value must fail")
+            .to_string();
+
+        assert!(error.contains("--bind requires <addr:port>"));
+    }
+
+    #[test]
+    fn parse_transport_args_rejects_non_numeric_bind_address() {
+        let error = parse_transport_args(["--bind", "localhost:8787"])
+            .expect_err("non-numeric bind host must fail")
+            .to_string();
+
+        assert!(error.contains("expected numeric IP:port"));
+    }
+
+    #[test]
+    fn parse_transport_args_accumulates_allowed_hosts() {
+        let args = parse_transport_args([
+            "--allowed-host",
+            "public.example.test",
+            "--allowed-host",
+            "public.example.test:443",
+        ])
+        .expect("allowed hosts must parse");
+
+        assert_eq!(
+            args.allowed_hosts,
+            vec![
+                "public.example.test".to_string(),
+                "public.example.test:443".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

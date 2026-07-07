@@ -67,6 +67,15 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     assert_eq!(search_result.hits[0].article_id, "여비지급규칙#제12조");
     assert_freshness_meta(search_result.meta);
 
+    let result = client
+        .call_tool(CallToolRequestParams::new(STATUS_TOOL))
+        .await?;
+    assert_ne!(result.is_error, Some(true));
+    let payload = tool_result_json(result)?;
+    let status: public_rules_mcp::StatusResult = serde_json::from_value(payload)?;
+    assert_eq!(status.institution, "cni");
+    assert_eq!(status.source_commit, "http-fixture");
+
     client.cancel().await?;
     server_handle.abort();
     let _ = server_handle.await;
