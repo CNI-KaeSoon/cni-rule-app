@@ -10,7 +10,7 @@ use rmcp::{
 use rules_core::{
     default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
     LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchRouteReport, SourcePage, TantivyRulesIndex,
+    SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,8 @@ pub struct ServerConfig {
     pub pack: PackConfig,
     #[serde(default)]
     pub extra_packs: Vec<ExtraPackConfig>,
+    #[serde(default)]
+    pub vectors: VectorConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -83,6 +85,32 @@ pub struct ExtraPackConfig {
     pub institution: String,
     #[serde(default)]
     pub pack: PackConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VectorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub model_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub rrf_k: Option<usize>,
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
+}
+
+impl VectorConfig {
+    fn to_search_options(&self) -> VectorSearchOptions {
+        VectorSearchOptions {
+            enabled: self.enabled,
+            cache_dir: self.cache_dir.clone(),
+            model_dir: self.model_dir.clone(),
+            rrf_k: self.rrf_k.unwrap_or(rules_core::DEFAULT_RRF_K),
+            vector_weight: self.vector_weight.unwrap_or(1.0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -252,8 +280,13 @@ impl PublicRulesServer {
         let default_institution = config.institution.clone();
         let mut seen = BTreeMap::new();
         seen.insert(default_institution.clone(), ());
+        let vector_options = config.vectors.to_search_options();
         let default_pack_path = config.pack.path.clone();
-        let default_index = load_pack(default_institution.clone(), config.pack)?;
+        let default_index = load_pack(
+            default_institution.clone(),
+            config.pack,
+            vector_options.clone(),
+        )?;
         let mut packs = vec![LoadedPack {
             institution: default_institution.clone(),
             aliases: institution_aliases(
@@ -271,7 +304,11 @@ impl PublicRulesServer {
                 ));
             }
             let extra_pack_path = extra.pack.path.clone();
-            let extra_index = load_pack(extra.institution.clone(), extra.pack)?;
+            let extra_index = load_pack(
+                extra.institution.clone(),
+                extra.pack,
+                vector_options.clone(),
+            )?;
             packs.push(LoadedPack {
                 institution: extra.institution.clone(),
                 aliases: institution_aliases(
@@ -518,15 +555,22 @@ fn optional_query_logger(path: Option<PathBuf>) -> Option<QueryLogger> {
     }
 }
 
-fn load_pack(institution: String, pack: PackConfig) -> anyhow::Result<TantivyRulesIndex> {
+fn load_pack(
+    institution: String,
+    pack: PackConfig,
+    vector_options: VectorSearchOptions,
+) -> anyhow::Result<TantivyRulesIndex> {
     let path = pack
         .path
         .ok_or_else(|| anyhow::anyhow!("pack.path is required for M0 local stdio server"))?;
     let index = if path.is_file() {
-        TantivyRulesIndex::from_pack_archive(path)?
+        TantivyRulesIndex::from_pack_archive_with_vector_options(path, vector_options)?
     } else if path.join("manifest.json").is_file() {
-        TantivyRulesIndex::from_pack_dir(path)?
+        TantivyRulesIndex::from_pack_dir_with_vector_options(path, vector_options)?
     } else {
+        if vector_options.enabled {
+            eprintln!("vector search disabled for bare articles dir: pack manifest is required for a stable cache key");
+        }
         let effective = if let Some(effective) = pack.effective.clone() {
             effective
         } else {
@@ -1729,6 +1773,7 @@ table_structured: true
                 ..PackConfig::default()
             },
             extra_packs: Vec::new(),
+            vectors: VectorConfig::default(),
         })
         .unwrap();
 
@@ -1790,6 +1835,7 @@ table_structured: true
                 ..PackConfig::default()
             },
             extra_packs: Vec::new(),
+            vectors: VectorConfig::default(),
         };
         config.extra_packs.push(ExtraPackConfig {
             institution: "ctp".to_string(),
@@ -2107,6 +2153,7 @@ refs: []
                 source_commit: Some("local-test".to_string()),
             },
             extra_packs: Vec::new(),
+            vectors: VectorConfig::default(),
         })
         .unwrap();
         let Json(result) = server.status().await;

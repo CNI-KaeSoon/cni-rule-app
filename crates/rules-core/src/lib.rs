@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
@@ -19,10 +19,10 @@ use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
-// Vector fusion is intentionally deferred: the M1 quality gate was met with
-// BM25 plus the Korean tokenizer path, so the optional `vectors` feature stays
-// inactive until a later quality or latency gate needs it.
 pub const ARTICLE_ID_SEPARATOR: &str = "#";
+pub const DEFAULT_RRF_K: usize = 60;
+const VECTOR_CACHE_VERSION: u32 = 1;
+const VECTOR_MODEL_ID: &str = "multilingual-e5-small";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum NodeKind {
@@ -251,8 +251,39 @@ pub struct GraphEdge {
     pub meta: BTreeMap<String, serde_json::Value>,
 }
 
-pub trait EmbeddingProvider {
+pub trait EmbeddingProvider: Send + Sync {
     fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchOptions {
+    pub enabled: bool,
+    pub cache_dir: Option<PathBuf>,
+    pub model_dir: Option<PathBuf>,
+    pub rrf_k: usize,
+    pub vector_weight: f32,
+}
+
+impl Default for VectorSearchOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_dir: None,
+            model_dir: None,
+            rrf_k: DEFAULT_RRF_K,
+            vector_weight: 1.0,
+        }
+    }
+}
+
+impl VectorSearchOptions {
+    pub fn enabled(cache_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            enabled: true,
+            cache_dir: Some(cache_dir.into()),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -272,12 +303,18 @@ pub struct FastEmbedEmbeddingProvider {
 #[cfg(feature = "vectors")]
 impl FastEmbedEmbeddingProvider {
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_model_dir(None)
+    }
+
+    pub fn with_model_dir(model_dir: Option<&Path>) -> anyhow::Result<Self> {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::MultilingualE5Small)
-                .with_show_download_progress(false),
-        )?;
+        let mut options = InitOptions::new(EmbeddingModel::MultilingualE5Small)
+            .with_show_download_progress(false);
+        if let Some(model_dir) = model_dir {
+            options = options.with_cache_dir(model_dir.to_path_buf());
+        }
+        let model = TextEmbedding::try_new(options)?;
         Ok(Self {
             model: std::sync::Mutex::new(model),
         })
@@ -341,6 +378,36 @@ struct SearchFields {
     body: Field,
 }
 
+#[derive(Debug, Clone)]
+struct VectorCorpus {
+    entries: Vec<VectorEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorEntry {
+    id: String,
+    kind: String,
+    text_hash: String,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorCacheFile {
+    version: u32,
+    model: String,
+    cache_key: String,
+    entries: Vec<VectorEntry>,
+}
+
+#[derive(Clone)]
+struct StoredEmbeddingProvider(std::sync::Arc<dyn EmbeddingProvider>);
+
+impl std::fmt::Debug for StoredEmbeddingProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoredEmbeddingProvider")
+    }
+}
+
 #[derive(Debug)]
 pub struct TantivyRulesIndex {
     articles: BTreeMap<String, Article>,
@@ -353,6 +420,10 @@ pub struct TantivyRulesIndex {
     node_indices: HashMap<String, NodeIndex>,
     index: Index,
     fields: SearchFields,
+    vector_corpus: Option<VectorCorpus>,
+    vector_provider: Option<StoredEmbeddingProvider>,
+    rrf_k: usize,
+    vector_weight: f32,
 }
 
 impl TantivyRulesIndex {
@@ -377,6 +448,10 @@ impl TantivyRulesIndex {
             node_indices,
             index,
             fields,
+            vector_corpus: None,
+            vector_provider: None,
+            rrf_k: DEFAULT_RRF_K,
+            vector_weight: 1.0,
         })
     }
 
@@ -385,12 +460,42 @@ impl TantivyRulesIndex {
         Self::from_articles(articles, status)
     }
 
+    pub fn enable_vectors_for_test<P: EmbeddingProvider + 'static>(
+        &mut self,
+        provider: P,
+        cache_key: &str,
+        cache_dir: Option<&Path>,
+        rrf_k: usize,
+        vector_weight: f32,
+    ) -> anyhow::Result<()> {
+        self.rrf_k = rrf_k;
+        self.vector_weight = vector_weight;
+        let provider = std::sync::Arc::new(provider);
+        self.vector_corpus = Some(build_or_load_vector_corpus(
+            self.articles.values(),
+            self.annexes.values(),
+            provider.as_ref(),
+            cache_key,
+            cache_dir,
+        )?);
+        self.vector_provider = Some(StoredEmbeddingProvider(provider));
+        Ok(())
+    }
+
     pub fn from_pack_dir(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_pack_dir_with_vector_options(path, VectorSearchOptions::default())
+    }
+
+    pub fn from_pack_dir_with_vector_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let mut manifest: PackManifest =
             serde_json::from_reader(File::open(path.join("manifest.json"))?)?;
         manifest.normalize_hashes();
         verify_manifest(path, &manifest)?;
+        let cache_key = pack_vector_cache_key(&manifest);
 
         let articles = load_articles_dir(path.join("articles"))?;
         let annexes = load_annexes_dir(path.join("annexes"))?;
@@ -415,6 +520,14 @@ impl TantivyRulesIndex {
         let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
         index.graph = graph;
         index.node_indices = node_indices;
+        index.rrf_k = vector_options.rrf_k;
+        index.vector_weight = vector_options.vector_weight;
+        if let Some((corpus, provider)) =
+            index.try_build_vector_corpus_from_options(&cache_key, &vector_options)
+        {
+            index.vector_corpus = Some(corpus);
+            index.vector_provider = Some(provider);
+        }
         Ok(index)
     }
 
@@ -422,6 +535,15 @@ impl TantivyRulesIndex {
         let tmp = tempfile::tempdir()?;
         unpack_pack_archive(path, tmp.path())?;
         Self::from_pack_dir(tmp.path())
+    }
+
+    pub fn from_pack_archive_with_vector_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+    ) -> Result<Self> {
+        let tmp = tempfile::tempdir()?;
+        unpack_pack_archive(path, tmp.path())?;
+        Self::from_pack_dir_with_vector_options(tmp.path(), vector_options)
     }
 
     pub fn search_with_routes(
@@ -520,18 +642,26 @@ impl TantivyRulesIndex {
         );
         let annex_ref_hits = self.annex_reference_rank(q, candidate_limit, filter);
         let semantic_hits = self.semantic_rank(q, &query_terms, candidate_limit, filter);
-        let rankings = if bm25_hits.is_empty() {
-            vec![semantic_hits, annex_ref_hits, rule_hits, lexical_hits]
-        } else {
-            vec![
-                semantic_hits,
-                annex_ref_hits,
-                bm25_hits,
-                rule_hits,
-                lexical_hits,
-            ]
-        };
-        rrf_fuse(rankings, k)
+        let vector_hits = self.vector_rank(q, candidate_limit, filter);
+        let mut rankings = Vec::new();
+        let mut weights = Vec::new();
+        rankings.push(semantic_hits);
+        weights.push(1.0);
+        rankings.push(annex_ref_hits);
+        weights.push(1.0);
+        if !bm25_hits.is_empty() {
+            rankings.push(bm25_hits);
+            weights.push(1.0);
+        }
+        if !vector_hits.is_empty() {
+            rankings.push(vector_hits);
+            weights.push(self.vector_weight);
+        }
+        rankings.push(rule_hits);
+        weights.push(1.0);
+        rankings.push(lexical_hits);
+        weights.push(1.0);
+        rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
     }
 }
 
@@ -814,6 +944,113 @@ impl TantivyRulesIndex {
         sort_hits_by_score_and_id(&mut hits);
         hits.truncate(k);
         hits
+    }
+
+    fn vector_rank(&self, q: &str, k: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        let Some(corpus) = &self.vector_corpus else {
+            return Vec::new();
+        };
+        let Some(provider) = &self.vector_provider else {
+            return Vec::new();
+        };
+        let Ok(query) = provider.0.embed(q) else {
+            eprintln!("vector search query embedding failed; falling back for this query");
+            return Vec::new();
+        };
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = corpus
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let score = cosine_similarity(&query, &entry.embedding)?;
+                self.vector_hit_for_id(&entry.id, score, q, filter)
+            })
+            .collect::<Vec<_>>();
+        sort_hits_by_score_and_id(&mut hits);
+        hits.truncate(k);
+        hits
+    }
+
+    fn vector_hit_for_id(
+        &self,
+        id: &str,
+        score: f32,
+        q: &str,
+        filter: Option<&RuleFilter>,
+    ) -> Option<SearchHit> {
+        if let Some(article) = self.articles.get(id) {
+            if !matches_filter(article, filter) {
+                return None;
+            }
+            return Some(SearchHit {
+                article_id: article.id.clone(),
+                institution: article.institution.clone(),
+                score,
+                snippet: snippet(&article.body, q),
+                rule: article.rule.clone(),
+                title: article.title.clone(),
+                effective: article.effective.clone(),
+                kind: "article".to_string(),
+            });
+        }
+        let annex = self.annexes.get(id)?;
+        if !matches_annex_filter(annex, filter) {
+            return None;
+        }
+        Some(search_hit_for_annex(annex, score, q))
+    }
+
+    fn try_build_vector_corpus_from_options(
+        &self,
+        cache_key: &str,
+        options: &VectorSearchOptions,
+    ) -> Option<(VectorCorpus, StoredEmbeddingProvider)> {
+        if !options.enabled {
+            return None;
+        }
+        let Some(cache_dir) = options.cache_dir.as_deref() else {
+            eprintln!("vector search disabled: cache_dir is required");
+            return None;
+        };
+        match self.build_vector_corpus_with_fastembed(cache_key, cache_dir, options) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                eprintln!("vector search disabled: {error}");
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "vectors")]
+    fn build_vector_corpus_with_fastembed(
+        &self,
+        cache_key: &str,
+        cache_dir: &Path,
+        options: &VectorSearchOptions,
+    ) -> anyhow::Result<(VectorCorpus, StoredEmbeddingProvider)> {
+        let env_model_dir = std::env::var_os("CNI_RULES_FASTEMBED_MODEL_DIR").map(PathBuf::from);
+        let model_dir = options.model_dir.as_deref().or(env_model_dir.as_deref());
+        let provider = std::sync::Arc::new(FastEmbedEmbeddingProvider::with_model_dir(model_dir)?);
+        let corpus = build_or_load_vector_corpus(
+            self.articles.values(),
+            self.annexes.values(),
+            provider.as_ref(),
+            cache_key,
+            Some(cache_dir),
+        )?;
+        Ok((corpus, StoredEmbeddingProvider(provider)))
+    }
+
+    #[cfg(not(feature = "vectors"))]
+    fn build_vector_corpus_with_fastembed(
+        &self,
+        _cache_key: &str,
+        _cache_dir: &Path,
+        _options: &VectorSearchOptions,
+    ) -> anyhow::Result<(VectorCorpus, StoredEmbeddingProvider)> {
+        anyhow::bail!("rules-core was built without the vectors feature")
     }
 
     fn reverse_neighbors(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
@@ -1106,10 +1343,24 @@ pub fn slugify_rule(rule: &str) -> String {
 }
 
 pub fn rrf_fuse(rankings: Vec<Vec<SearchHit>>, k: usize) -> Vec<SearchHit> {
+    rrf_fuse_weighted(rankings, k, DEFAULT_RRF_K, &[])
+}
+
+pub fn rrf_fuse_weighted(
+    rankings: Vec<Vec<SearchHit>>,
+    k: usize,
+    rrf_k: usize,
+    weights: &[f32],
+) -> Vec<SearchHit> {
     let mut scored: BTreeMap<String, (SearchHit, f32)> = BTreeMap::new();
-    for ranking in rankings {
+    let rrf_k = rrf_k as f32;
+    for (list_idx, ranking) in rankings.into_iter().enumerate() {
+        let weight = weights.get(list_idx).copied().unwrap_or(1.0);
+        if weight <= 0.0 {
+            continue;
+        }
         for (rank, hit) in ranking.into_iter().enumerate() {
-            let score = 1.0 / (60.0 + rank as f32 + 1.0);
+            let score = weight / (rrf_k + rank as f32 + 1.0);
             scored
                 .entry(hit.article_id.clone())
                 .and_modify(|(existing, total)| {
@@ -1678,6 +1929,166 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn sha256_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn pack_vector_cache_key(manifest: &PackManifest) -> String {
+    let value = serde_json::json!({
+        "schema_version": manifest.schema_version,
+        "institution": manifest.institution,
+        "effective_date": manifest.effective_date,
+        "source_commit": manifest.source_commit,
+        "files": manifest.files,
+    });
+    sha256_text(&serde_json::to_string(&value).unwrap_or_default())
+}
+
+fn vector_cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    cache_dir.join(format!("{VECTOR_MODEL_ID}-{cache_key}.json"))
+}
+
+fn build_or_load_vector_corpus<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    annexes: impl Iterator<Item = &'a Annex>,
+    provider: &dyn EmbeddingProvider,
+    cache_key: &str,
+    cache_dir: Option<&Path>,
+) -> anyhow::Result<VectorCorpus> {
+    let entries = vector_source_entries(articles, annexes);
+    if let Some(cache_dir) = cache_dir {
+        let path = vector_cache_path(cache_dir, cache_key);
+        if let Some(corpus) = load_vector_corpus_cache(&path, cache_key, &entries)? {
+            return Ok(corpus);
+        }
+        let corpus = compute_vector_corpus(entries, provider)?;
+        write_vector_corpus_cache(&path, cache_key, &corpus)?;
+        return Ok(corpus);
+    }
+    compute_vector_corpus(entries, provider)
+}
+
+fn load_vector_corpus_cache(
+    path: &Path,
+    cache_key: &str,
+    sources: &[(String, String, String, String)],
+) -> anyhow::Result<Option<VectorCorpus>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let cache: VectorCacheFile = serde_json::from_reader(File::open(path)?)?;
+    if cache.version != VECTOR_CACHE_VERSION
+        || cache.model != VECTOR_MODEL_ID
+        || cache.cache_key != cache_key
+        || cache.entries.len() != sources.len()
+    {
+        return Ok(None);
+    }
+    for (entry, (id, kind, text_hash, _)) in cache.entries.iter().zip(sources.iter()) {
+        if &entry.id != id || &entry.kind != kind || &entry.text_hash != text_hash {
+            return Ok(None);
+        }
+    }
+    Ok(Some(VectorCorpus {
+        entries: cache.entries,
+    }))
+}
+
+fn write_vector_corpus_cache(
+    path: &Path,
+    cache_key: &str,
+    corpus: &VectorCorpus,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    let cache = VectorCacheFile {
+        version: VECTOR_CACHE_VERSION,
+        model: VECTOR_MODEL_ID.to_string(),
+        cache_key: cache_key.to_string(),
+        entries: corpus.entries.clone(),
+    };
+    let mut file = File::create(&tmp_path)?;
+    serde_json::to_writer(&mut file, &cache)?;
+    file.write_all(b"\n")?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn compute_vector_corpus(
+    sources: Vec<(String, String, String, String)>,
+    provider: &dyn EmbeddingProvider,
+) -> anyhow::Result<VectorCorpus> {
+    let mut entries = Vec::with_capacity(sources.len());
+    for (id, kind, text_hash, text) in sources {
+        let embedding = provider.embed(&text)?;
+        if embedding.is_empty() {
+            anyhow::bail!("embedding provider returned an empty vector for {id}");
+        }
+        entries.push(VectorEntry {
+            id,
+            kind,
+            text_hash,
+            embedding,
+        });
+    }
+    Ok(VectorCorpus { entries })
+}
+
+fn vector_source_entries<'a>(
+    articles: impl Iterator<Item = &'a Article>,
+    annexes: impl Iterator<Item = &'a Annex>,
+) -> Vec<(String, String, String, String)> {
+    let mut entries = articles
+        .map(|article| {
+            let text = format!("{} {}\n{}", article.rule, article.title, article.body);
+            (
+                article.id.clone(),
+                "article".to_string(),
+                sha256_text(&text),
+                text,
+            )
+        })
+        .chain(annexes.map(|annex| {
+            let text = format!(
+                "{} {}\n{}",
+                annex.rule,
+                annex_search_title(annex),
+                annex.body
+            );
+            (
+                annex.id.clone(),
+                "annex".to_string(),
+                sha256_text(&text),
+                text,
+            )
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return None;
+    }
+    Some(dot / (left_norm.sqrt() * right_norm.sqrt()))
+}
+
 fn lexical_fallback<'a>(
     articles: impl Iterator<Item = &'a Article>,
     q: &str,
@@ -2055,6 +2466,10 @@ fn byte_index_after(s: &str, pos: usize, char_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn fixture_articles() -> Vec<Article> {
         [
@@ -2127,6 +2542,34 @@ refs:
         .unwrap()
     }
 
+    #[derive(Clone)]
+    struct MockEmbeddingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockEmbeddingProvider {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl EmbeddingProvider for MockEmbeddingProvider {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if text.contains("semantic-query") || text.contains("semantic-target") {
+                Ok(vec![1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+    }
+
     #[test]
     fn parses_frontmatter_article_id_and_refs() {
         let article = fixture_articles().remove(1);
@@ -2156,6 +2599,126 @@ refs:
             }),
         );
         assert_eq!(filtered[0].article_id, "복무규정#제18조");
+    }
+
+    #[test]
+    fn vector_rank_is_fused_when_enabled_with_mock_provider() {
+        let articles = vec![
+            article_fixture(
+                "cni",
+                "의미규정",
+                "제1조",
+                "대상",
+                "semantic-target only appears in this provision.",
+            ),
+            article_fixture("cni", "일반규정", "제2조", "기타", "unrelated body text"),
+        ];
+        let mut index =
+            TantivyRulesIndex::from_articles(articles, default_pack_status("cni", "2026-03-01"))
+                .unwrap();
+        index
+            .enable_vectors_for_test(MockEmbeddingProvider::new(), "mock-key", None, 60, 2.0)
+            .unwrap();
+
+        let hits = index.search("semantic-query", 5, None);
+
+        assert_eq!(hits[0].article_id, "의미규정#제1조");
+    }
+
+    #[test]
+    fn disabled_vector_path_preserves_existing_order() {
+        let articles = fixture_articles();
+        let left =
+            TantivyRulesIndex::from_articles(articles.clone(), default_pack_status("cni", "base"))
+                .unwrap();
+        let right =
+            TantivyRulesIndex::from_articles(articles, default_pack_status("cni", "base")).unwrap();
+
+        let left_ids = left
+            .search("일비 출장", 5, None)
+            .into_iter()
+            .map(|hit| hit.article_id)
+            .collect::<Vec<_>>();
+        let right_ids = right
+            .search("일비 출장", 5, None)
+            .into_iter()
+            .map(|hit| hit.article_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(left_ids, right_ids);
+        assert!(left.vector_corpus.is_none());
+        assert!(right.vector_corpus.is_none());
+    }
+
+    #[test]
+    fn vector_cache_miss_then_hit_avoids_reembedding_corpus() {
+        let temp = tempfile::tempdir().unwrap();
+        let articles = vec![article_fixture(
+            "cni",
+            "의미규정",
+            "제1조",
+            "대상",
+            "semantic-target body",
+        )];
+        let first_provider = MockEmbeddingProvider::new();
+        let mut first =
+            TantivyRulesIndex::from_articles(articles.clone(), default_pack_status("cni", "base"))
+                .unwrap();
+        first
+            .enable_vectors_for_test(
+                first_provider.clone(),
+                "cache-key",
+                Some(temp.path()),
+                60,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(first_provider.calls(), 1);
+
+        let second_provider = MockEmbeddingProvider::new();
+        let mut second =
+            TantivyRulesIndex::from_articles(articles.clone(), default_pack_status("cni", "base"))
+                .unwrap();
+        second
+            .enable_vectors_for_test(
+                second_provider.clone(),
+                "cache-key",
+                Some(temp.path()),
+                60,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(second_provider.calls(), 0);
+
+        let miss_provider = MockEmbeddingProvider::new();
+        let mut miss =
+            TantivyRulesIndex::from_articles(articles, default_pack_status("cni", "base")).unwrap();
+        miss.enable_vectors_for_test(
+            miss_provider.clone(),
+            "different-cache-key",
+            Some(temp.path()),
+            60,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(miss_provider.calls(), 1);
+    }
+
+    #[cfg(not(feature = "vectors"))]
+    #[test]
+    fn vector_opt_in_without_feature_falls_back_to_lexical_index() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pack_fixture(temp.path());
+
+        let index = TantivyRulesIndex::from_pack_dir_with_vector_options(
+            temp.path(),
+            VectorSearchOptions::enabled(temp.path().join("vector-cache")),
+        )
+        .unwrap();
+
+        assert!(index.vector_corpus.is_none());
+        let hits = index.search("항공운임", 5, None);
+        assert_eq!(hits[0].article_id, "여비지급규칙#제12조");
     }
 
     #[test]

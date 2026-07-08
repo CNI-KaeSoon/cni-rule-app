@@ -1,6 +1,7 @@
 use rules_core::{
     default_pack_status, merge_search_route_reports, namespace_search_route_report, GraphNode,
     NodeKind, RuleFilter, RulesIndex, SearchHit, SearchRouteReport, TantivyRulesIndex,
+    VectorSearchOptions,
 };
 use serde::Deserialize;
 use std::fs::File;
@@ -21,6 +22,7 @@ struct EvalArgs {
     packs: Vec<PackArg>,
     institution: String,
     per_question: bool,
+    vector_options: VectorSearchOptions,
 }
 
 #[derive(Debug)]
@@ -120,6 +122,13 @@ fn parse_args() -> anyhow::Result<EvalArgs> {
     let mut packs = Vec::new();
     let mut institution = "cni".to_string();
     let mut per_question = false;
+    let mut vector_options = VectorSearchOptions {
+        cache_dir: std::env::var_os("CNI_RULES_VECTOR_CACHE_DIR")
+            .or_else(|| std::env::var_os("CNI_RAG_VECTOR_CACHE_DIR"))
+            .map(PathBuf::from),
+        model_dir: std::env::var_os("CNI_RULES_FASTEMBED_MODEL_DIR").map(PathBuf::from),
+        ..VectorSearchOptions::default()
+    };
     let mut positional = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -149,6 +158,31 @@ fn parse_args() -> anyhow::Result<EvalArgs> {
                 packs.push(parse_pack_arg(&value)?);
             }
             "--per-question" => per_question = true,
+            "--vectors" => vector_options.enabled = true,
+            "--vector-cache" => {
+                vector_options.cache_dir =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--vector-cache requires a directory")
+                    })?));
+            }
+            "--vector-model-dir" => {
+                vector_options.model_dir =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--vector-model-dir requires a directory")
+                    })?));
+            }
+            "--rrf-k" => {
+                vector_options.rrf_k = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--rrf-k requires a number"))?
+                    .parse()?;
+            }
+            "--vector-weight" => {
+                vector_options.vector_weight = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--vector-weight requires a float"))?
+                    .parse()?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -173,6 +207,7 @@ fn parse_args() -> anyhow::Result<EvalArgs> {
         packs,
         institution,
         per_question,
+        vector_options,
     })
 }
 
@@ -191,7 +226,7 @@ fn parse_pack_arg(value: &str) -> anyhow::Result<PackArg> {
 
 fn print_usage() {
     eprintln!(
-        "usage: eval [--golden PATH] [--rules DIR] [--institution SLUG] [--per-question] [--pack SLUG=DIR ...]"
+        "usage: eval [--golden PATH] [--rules DIR] [--institution SLUG] [--per-question] [--vectors] [--vector-cache DIR] [--vector-model-dir DIR] [--rrf-k N] [--vector-weight F] [--pack SLUG=DIR ...]"
     );
     eprintln!("legacy positional usage is still supported: eval <golden.jsonl> <rules-dir>");
 }
@@ -215,23 +250,40 @@ fn load_indexes(args: &EvalArgs) -> anyhow::Result<Vec<(String, Vec<String>, Tan
     packs
         .into_iter()
         .map(|pack| {
-            let index = load_index_for_eval(&pack.institution, &pack.rules_dir)?;
+            let index = load_index_for_eval(
+                &pack.institution,
+                &pack.rules_dir,
+                args.vector_options.clone(),
+            )?;
             let aliases = institution_aliases(&pack.institution, &pack.rules_dir, &index);
             Ok((pack.institution, aliases, index))
         })
         .collect()
 }
 
-fn load_index_for_eval(institution: &str, path: &PathBuf) -> anyhow::Result<TantivyRulesIndex> {
+fn load_index_for_eval(
+    institution: &str,
+    path: &PathBuf,
+    vector_options: VectorSearchOptions,
+) -> anyhow::Result<TantivyRulesIndex> {
     if path.join("manifest.json").is_file() {
-        return Ok(TantivyRulesIndex::from_pack_dir(path)?);
+        return Ok(TantivyRulesIndex::from_pack_dir_with_vector_options(
+            path,
+            vector_options,
+        )?);
     }
     if path.file_name().and_then(|name| name.to_str()) == Some("articles") {
         if let Some(parent) = path.parent() {
             if parent.join("manifest.json").is_file() {
-                return Ok(TantivyRulesIndex::from_pack_dir(parent)?);
+                return Ok(TantivyRulesIndex::from_pack_dir_with_vector_options(
+                    parent,
+                    vector_options,
+                )?);
             }
         }
+    }
+    if vector_options.enabled {
+        eprintln!("vector search disabled for bare articles dir: pack manifest is required for a stable cache key");
     }
     Ok(TantivyRulesIndex::from_articles_dir(
         path,
