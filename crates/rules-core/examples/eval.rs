@@ -1,4 +1,7 @@
-use rules_core::{default_pack_status, TantivyRulesIndex};
+use rules_core::{
+    default_pack_status, merge_search_route_reports, namespace_search_route_report, RuleFilter,
+    SearchHit, SearchRouteReport, TantivyRulesIndex,
+};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -11,50 +14,43 @@ struct GoldenCase {
     expect: Vec<String>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .expect("crates/rules-core has a repository ancestor")
-        .to_path_buf();
-    let golden_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("01_docs/eval/golden.jsonl"));
-    let rules_dir = std::env::args()
-        .nth(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("04_data/90_index-build/rules"));
+#[derive(Debug)]
+struct EvalArgs {
+    golden_path: PathBuf,
+    rules_dir: PathBuf,
+    packs: Vec<PackArg>,
+    institution: String,
+    per_question: bool,
+}
 
-    let cases = load_golden(&golden_path)?;
-    let index =
-        TantivyRulesIndex::from_articles_dir(&rules_dir, default_pack_status("cni", "2026-02-27"))?;
+#[derive(Debug)]
+struct PackArg {
+    institution: String,
+    rules_dir: PathBuf,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = parse_args()?;
+    let cases = load_golden(&args.golden_path)?;
+    let multi_pack = args.packs.len() > 1;
+    let indexes = load_indexes(&args)?;
 
     let mut hit_count = 0_usize;
     let mut pin_hit_count = 0_usize;
     let mut retrieval_hit_count = 0_usize;
     let mut latencies = Vec::with_capacity(cases.len());
-    for case in &cases {
+    for (idx, case) in cases.iter().enumerate() {
         let start = Instant::now();
-        let report = index.search_with_routes(&case.q, 5, None);
+        let report = search_indexes(&indexes, &case.q, 5, multi_pack);
         let elapsed = start.elapsed().as_micros();
         latencies.push(elapsed);
 
-        let hit = report.hits.iter().any(|result| {
-            case.expect
-                .iter()
-                .any(|expected| expected == &result.article_id)
-        });
-        let pin_hit = report.pin_hit.as_ref().is_some_and(|result| {
-            case.expect
-                .iter()
-                .any(|expected| expected == &result.article_id)
-        });
-        let retrieval_hit = report.retrieval_hits.iter().any(|result| {
-            case.expect
-                .iter()
-                .any(|expected| expected == &result.article_id)
-        });
+        let hit = any_expected_hit(&case.expect, &report.hits);
+        let pin_hit = report
+            .pin_hit
+            .as_ref()
+            .is_some_and(|result| expected_matches_any(&case.expect, result));
+        let retrieval_hit = any_expected_hit(&case.expect, &report.retrieval_hits);
         if hit {
             hit_count += 1;
         }
@@ -65,7 +61,7 @@ fn main() -> anyhow::Result<()> {
             retrieval_hit_count += 1;
         }
 
-        println!(
+        print!(
             "{}\t{}\t{}\t{}",
             if hit { "hit" } else { "miss" },
             if pin_hit { "pin-hit" } else { "pin-miss" },
@@ -81,6 +77,10 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        if args.per_question {
+            print!("\t{}\t{}\t{}", idx + 1, case.q, case.expect.join(","));
+        }
+        println!();
         eprintln!("case_latency_us={elapsed}");
     }
 
@@ -107,6 +107,169 @@ fn main() -> anyhow::Result<()> {
         cases.len()
     );
     Ok(())
+}
+
+fn parse_args() -> anyhow::Result<EvalArgs> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("crates/rules-core has a repository ancestor")
+        .to_path_buf();
+    let mut golden_path = None;
+    let mut rules_dir = None;
+    let mut packs = Vec::new();
+    let mut institution = "cni".to_string();
+    let mut per_question = false;
+    let mut positional = Vec::new();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--golden" => {
+                golden_path =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--golden requires a path")
+                    })?));
+            }
+            "--rules" => {
+                rules_dir =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--rules requires a directory")
+                    })?));
+            }
+            "--institution" => {
+                institution = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--institution requires a slug"))?;
+            }
+            "--pack" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--pack requires <slug>=<rules-dir>"))?;
+                packs.push(parse_pack_arg(&value)?);
+            }
+            "--per-question" => per_question = true,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ if arg.starts_with("--") => {
+                anyhow::bail!("unknown argument: {arg}");
+            }
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+
+    if golden_path.is_none() {
+        golden_path = positional.first().cloned();
+    }
+    if rules_dir.is_none() {
+        rules_dir = positional.get(1).cloned();
+    }
+
+    Ok(EvalArgs {
+        golden_path: golden_path.unwrap_or_else(|| workspace.join("01_docs/eval/golden.jsonl")),
+        rules_dir: rules_dir.unwrap_or_else(|| workspace.join("04_data/90_index-build/rules")),
+        packs,
+        institution,
+        per_question,
+    })
+}
+
+fn parse_pack_arg(value: &str) -> anyhow::Result<PackArg> {
+    let (institution, rules_dir) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--pack requires <slug>=<rules-dir>"))?;
+    if institution.trim().is_empty() || rules_dir.trim().is_empty() {
+        anyhow::bail!("--pack requires <slug>=<rules-dir>");
+    }
+    Ok(PackArg {
+        institution: institution.to_string(),
+        rules_dir: PathBuf::from(rules_dir),
+    })
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: eval [--golden PATH] [--rules DIR] [--institution SLUG] [--per-question] [--pack SLUG=DIR ...]"
+    );
+    eprintln!("legacy positional usage is still supported: eval <golden.jsonl> <rules-dir>");
+}
+
+fn load_indexes(args: &EvalArgs) -> anyhow::Result<Vec<(String, TantivyRulesIndex)>> {
+    let packs = if args.packs.is_empty() {
+        vec![PackArg {
+            institution: args.institution.clone(),
+            rules_dir: args.rules_dir.clone(),
+        }]
+    } else {
+        args.packs
+            .iter()
+            .map(|pack| PackArg {
+                institution: pack.institution.clone(),
+                rules_dir: pack.rules_dir.clone(),
+            })
+            .collect()
+    };
+
+    packs
+        .into_iter()
+        .map(|pack| {
+            let index = TantivyRulesIndex::from_articles_dir(
+                &pack.rules_dir,
+                default_pack_status(&pack.institution, "eval"),
+            )?;
+            Ok((pack.institution, index))
+        })
+        .collect()
+}
+
+fn search_indexes(
+    indexes: &[(String, TantivyRulesIndex)],
+    query: &str,
+    k: usize,
+    multi_pack: bool,
+) -> SearchRouteReport {
+    let reports = indexes
+        .iter()
+        .map(|(institution, index)| {
+            let report = index.search_with_routes(
+                query,
+                k,
+                Some(RuleFilter {
+                    institution: None,
+                    ..RuleFilter::default()
+                }),
+            );
+            namespace_search_route_report(report, institution, multi_pack)
+        })
+        .collect();
+    merge_search_route_reports(reports, k)
+}
+
+fn any_expected_hit(expected: &[String], hits: &[SearchHit]) -> bool {
+    hits.iter()
+        .any(|result| expected_matches_any(expected, result))
+}
+
+fn expected_matches_any(expected: &[String], hit: &SearchHit) -> bool {
+    expected
+        .iter()
+        .any(|expected_id| expected_matches_hit(expected_id, hit))
+}
+
+fn expected_matches_hit(expected_id: &str, hit: &SearchHit) -> bool {
+    if expected_id == hit.article_id {
+        return true;
+    }
+    let hit_local_id = hit
+        .article_id
+        .split_once('/')
+        .map_or(hit.article_id.as_str(), |(_, id)| id);
+    match expected_id.split_once('/') {
+        Some((institution, local_id)) => institution == hit.institution && local_id == hit_local_id,
+        None => expected_id == hit_local_id,
+    }
 }
 
 fn load_golden(path: &PathBuf) -> anyhow::Result<Vec<GoldenCase>> {

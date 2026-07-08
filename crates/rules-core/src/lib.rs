@@ -960,6 +960,75 @@ pub fn rrf_fuse(rankings: Vec<Vec<SearchHit>>, k: usize) -> Vec<SearchHit> {
     hits
 }
 
+pub fn prefixed_article_id(institution: &str, article_id: &str) -> String {
+    format!("{institution}/{article_id}")
+}
+
+pub fn namespace_search_route_report(
+    mut report: SearchRouteReport,
+    institution: &str,
+    prefix_article_ids: bool,
+) -> SearchRouteReport {
+    for hit in &mut report.hits {
+        namespace_search_hit(hit, institution, prefix_article_ids);
+    }
+    if let Some(hit) = &mut report.pin_hit {
+        namespace_search_hit(hit, institution, prefix_article_ids);
+    }
+    for hit in &mut report.retrieval_hits {
+        namespace_search_hit(hit, institution, prefix_article_ids);
+    }
+    report
+}
+
+pub fn merge_search_route_reports(reports: Vec<SearchRouteReport>, k: usize) -> SearchRouteReport {
+    if reports.is_empty() || k == 0 {
+        return SearchRouteReport::default();
+    }
+    if reports.len() == 1 {
+        let mut report = reports.into_iter().next().expect("report exists");
+        sort_hits_by_score_and_id(&mut report.hits);
+        report.hits.truncate(k);
+        sort_hits_by_score_and_id(&mut report.retrieval_hits);
+        report.retrieval_hits.truncate(k);
+        return report;
+    }
+
+    let hits = rrf_fuse(
+        reports.iter().map(|report| report.hits.clone()).collect(),
+        k,
+    );
+    let retrieval_hits = rrf_fuse(
+        reports
+            .iter()
+            .map(|report| report.retrieval_hits.clone())
+            .collect(),
+        k,
+    );
+    let pin_hit = rrf_fuse(
+        reports
+            .iter()
+            .filter_map(|report| report.pin_hit.clone().map(|hit| vec![hit]))
+            .collect(),
+        1,
+    )
+    .into_iter()
+    .next();
+
+    SearchRouteReport {
+        hits,
+        pin_hit,
+        retrieval_hits,
+    }
+}
+
+fn namespace_search_hit(hit: &mut SearchHit, institution: &str, prefix_article_ids: bool) {
+    hit.institution = institution.to_string();
+    if prefix_article_ids {
+        hit.article_id = prefixed_article_id(institution, &hit.article_id);
+    }
+}
+
 fn merge_pinned_hits(
     pinned: Option<SearchHit>,
     mut ranked: Vec<SearchHit>,
@@ -1720,6 +1789,19 @@ refs:
         .unwrap()
     }
 
+    fn article_fixture(
+        institution: &str,
+        rule: &str,
+        article: &str,
+        title: &str,
+        body: &str,
+    ) -> Article {
+        parse_article_markdown_str(&format!(
+            "---\ninstitution: {institution}\nrule: {rule}\narticle: {article}\ntitle: {title}\neffective: 2026-03-01\namended: 2026-03-01\nstatus: active\nsupersedes: null\nlegal_basis: []\nrefs: []\n---\n{body}\n"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn parses_frontmatter_article_id_and_refs() {
         let article = fixture_articles().remove(1);
@@ -1800,6 +1882,41 @@ refs:
             .iter()
             .any(|hit| hit.article_id == "여비규정#제13조"));
         assert_eq!(report.hits[0].article_id, "여비규정#제13조");
+    }
+
+    #[test]
+    fn merges_namespaced_multi_pack_route_reports() {
+        let cni = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let ctp = TantivyRulesIndex::from_articles(
+            vec![article_fixture(
+                "ctp",
+                "인사규정",
+                "제10조",
+                "육아휴직",
+                "① 직원은 자녀 양육을 위해 육아휴직을 신청할 수 있다.",
+            )],
+            default_pack_status("ctp", "2026-03-01"),
+        )
+        .unwrap();
+
+        let reports = vec![
+            namespace_search_route_report(cni.search_with_routes("육아휴직", 5, None), "cni", true),
+            namespace_search_route_report(ctp.search_with_routes("육아휴직", 5, None), "ctp", true),
+        ];
+        let report = merge_search_route_reports(reports, 5);
+
+        assert!(report
+            .hits
+            .iter()
+            .any(|hit| hit.article_id == "ctp/인사규정#제10조" && hit.institution == "ctp"));
+        assert!(report
+            .retrieval_hits
+            .iter()
+            .all(|hit| hit.article_id.starts_with("cni/") || hit.article_id.starts_with("ctp/")));
     }
 
     #[test]

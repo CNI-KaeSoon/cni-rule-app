@@ -8,8 +8,9 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, parse_article_markdown, Annex, Article, LegalBasis, PackStatus,
-    RuleFilter, RuleSummary, RulesIndex, SearchHit, SourcePage, TantivyRulesIndex,
+    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, LegalBasis,
+    PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit, SearchRouteReport, SourcePage,
+    TantivyRulesIndex,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -503,10 +504,6 @@ fn load_pack(institution: String, pack: PackConfig) -> anyhow::Result<TantivyRul
     Ok(index)
 }
 
-fn prefixed_article_id(institution: &str, article_id: &str) -> String {
-    format!("{institution}/{article_id}")
-}
-
 fn source_url_extra(source_url: Option<String>) -> BTreeMap<String, String> {
     let mut extra = BTreeMap::new();
     if let Some(source_url) = source_url {
@@ -515,44 +512,32 @@ fn source_url_extra(source_url: Option<String>) -> BTreeMap<String, String> {
     extra
 }
 
-fn search_pack(
+fn search_pack_report(
     pack: &LoadedPack,
     query: &str,
     limit: usize,
     rule: Option<String>,
     multi_pack: bool,
-) -> Vec<SearchHit> {
-    let mut hits = pack
-        .index
-        .search(
-            query,
-            limit,
-            Some(RuleFilter {
-                institution: None,
-                rule,
-                ..RuleFilter::default()
-            }),
-        )
-        .into_iter()
-        .map(|mut hit| {
-            hit.institution = pack.institution.clone();
-            if multi_pack {
-                hit.article_id = prefixed_article_id(&hit.institution, &hit.article_id);
-            }
-            hit
-        })
-        .collect::<Vec<_>>();
-    rules_core::sort_hits_by_score_and_id(&mut hits);
-    hits
+) -> SearchRouteReport {
+    let report = pack.index.search_with_routes(
+        query,
+        limit,
+        Some(RuleFilter {
+            institution: None,
+            rule,
+            ..RuleFilter::default()
+        }),
+    );
+    rules_core::namespace_search_route_report(report, &pack.institution, multi_pack)
 }
 
-async fn search_packs_blocking(
+async fn search_pack_reports_blocking(
     packs: Vec<&LoadedPack>,
     query: String,
     limit: usize,
     rule: Option<String>,
     multi_pack: bool,
-) -> Vec<Vec<SearchHit>> {
+) -> Vec<SearchRouteReport> {
     let max_parallel = SEARCH_FANOUT_LIMIT.min(packs.len().max(1));
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut handles = Vec::with_capacity(packs.len());
@@ -563,7 +548,7 @@ async fn search_packs_blocking(
         let rule = rule.clone();
         handles.push(tokio::task::spawn_blocking(move || {
             let _permit = permit.ok();
-            search_pack(&pack, &query, limit, rule, multi_pack)
+            search_pack_report(&pack, &query, limit, rule, multi_pack)
         }));
     }
 
@@ -625,13 +610,13 @@ impl PublicRulesServer {
         let institution = params.institution.clone();
         let limit = top_k.unwrap_or(5);
         let selected_packs = self.selected_packs(institution.as_deref());
-        let rankings = if selected_packs.len() <= 1 {
+        let reports = if selected_packs.len() <= 1 {
             selected_packs
                 .into_iter()
-                .map(|pack| search_pack(pack, &query, limit, rule.clone(), self.multi_pack))
+                .map(|pack| search_pack_report(pack, &query, limit, rule.clone(), self.multi_pack))
                 .collect::<Vec<_>>()
         } else {
-            search_packs_blocking(
+            search_pack_reports_blocking(
                 selected_packs,
                 query.clone(),
                 limit,
@@ -640,11 +625,7 @@ impl PublicRulesServer {
             )
             .await
         };
-        let hits = if rankings.len() <= 1 {
-            rankings.into_iter().next().unwrap_or_default()
-        } else {
-            rules_core::rrf_fuse(rankings, limit)
-        };
+        let hits = rules_core::merge_search_route_reports(reports, limit).hits;
         let hit_meta = if self.multi_pack {
             self.hit_meta(&hits)
         } else {
