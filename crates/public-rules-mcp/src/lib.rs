@@ -10,7 +10,7 @@ use rmcp::{
 use rules_core::{
     default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
     LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions,
+    SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions, VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -219,6 +219,7 @@ pub struct StatusResult {
     pub institutions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<LoadedPackStatus>,
+    pub vectors: VectorStatus,
     pub meta: FreshnessMeta,
 }
 
@@ -582,7 +583,9 @@ fn load_pack(
             .unwrap_or_else(|| "bare-dir".to_string());
         let mut status = default_pack_status(institution, effective);
         status.source_commit = source_commit;
-        TantivyRulesIndex::from_articles_dir(path, status)?
+        let mut index = TantivyRulesIndex::from_articles_dir(path, status)?;
+        index.set_vector_enabled_requested(vector_options.enabled);
+        index
     };
     Ok(index)
 }
@@ -1077,12 +1080,31 @@ impl PublicRulesServer {
             stale: default_status.stale,
             institutions,
             packs,
+            vectors: self.vector_status(),
             meta: FreshnessMeta {
                 effective: default_status.effective_date.clone(),
                 amended: default_status.effective_date,
                 source_commit: default_status.source_commit,
                 extra: source_url_extra(default_status.source_url),
             },
+        }
+    }
+
+    fn vector_status(&self) -> VectorStatus {
+        let statuses = self
+            .packs
+            .iter()
+            .map(|pack| pack.index.vector_status())
+            .collect::<Vec<_>>();
+        let enabled = statuses.iter().any(|status| status.enabled);
+        let model_ready = enabled
+            && statuses
+                .iter()
+                .filter(|status| status.enabled)
+                .all(|status| status.model_ready);
+        VectorStatus {
+            enabled,
+            model_ready,
         }
     }
 }
@@ -1112,6 +1134,7 @@ impl From<PackStatus> for StatusResult {
             stale: status.stale,
             institutions: Vec::new(),
             packs: Vec::new(),
+            vectors: VectorStatus::default(),
             meta,
         }
     }
@@ -1935,6 +1958,31 @@ table_structured: true
         assert_eq!(result.institution, "cni");
         assert_eq!(result.effective_date, "2026-02-27");
         assert!(!result.stale);
+        assert_eq!(result.vectors, VectorStatus::default());
+    }
+
+    #[tokio::test]
+    async fn status_tool_reports_requested_vectors_even_when_model_is_unavailable() {
+        let root = make_r5_pack("cni");
+        let server = PublicRulesServer::from_config(ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(root.clone()),
+                ..PackConfig::default()
+            },
+            extra_packs: Vec::new(),
+            vectors: VectorConfig {
+                enabled: true,
+                cache_dir: Some(root.join("cache")),
+                ..VectorConfig::default()
+            },
+        })
+        .unwrap();
+
+        let Json(result) = server.status().await;
+
+        assert!(result.vectors.enabled);
+        assert!(!result.vectors.model_ready);
     }
 
     #[test]

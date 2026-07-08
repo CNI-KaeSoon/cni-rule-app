@@ -229,7 +229,7 @@ def test_parse_articles_extracts_amended_marker_split_by_pdf_line_break():
     text = """여비지급규칙
 제정 1995. 6. 9.
 개정 2026. 2. 27.
-제10조(여비지급기준) 식비는 정하는 금액을 지급한다. [전문
+제10조(지원지급기준) 지원금은 정하는 금액을 지급한다. [전문
 개정 2023. 8. 1.]
 """
 
@@ -376,8 +376,8 @@ def test_analyze_qlogs_groups_normalized_questions_and_miss_candidates(tmp_path)
 
     qlog = tmp_path / "qlog-install.jsonl"
     records = [
-        {"question": "국내 출장 일비는 얼마인가요?", "mode": "Interpret"},
-        {"question": "국내 출장 일비는 얼마인가요", "mode": "Interpret"},
+        {"question": "국내 출장 교통비는 얼마인가요?", "mode": "Interpret"},
+        {"question": "국내 출장 교통비는 얼마인가요", "mode": "Interpret"},
         {"question": "육아휴직 규정 비교", "mode": "Compare", "miss": True},
     ]
     qlog.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
@@ -385,7 +385,7 @@ def test_analyze_qlogs_groups_normalized_questions_and_miss_candidates(tmp_path)
     entries = module.read_qlogs(tmp_path)
     rendered = module.render_markdown(entries, diagnostics=[], limit=5, include_miss=True)
 
-    assert "| 1 | 2 | 국내 출장 일비는 얼마인가요? | `국내 출장 일비는 얼마인가요` |" in rendered
+    assert "| 1 | 2 | 국내 출장 교통비는 얼마인가요? | `국내 출장 교통비는 얼마인가요` |" in rendered
     assert "## 실검색 Miss 후보" in rendered
     assert "육아휴직 규정 비교" in rendered
     assert "faq.json을 자동 생성하지 않습니다" in rendered

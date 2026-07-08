@@ -23,6 +23,7 @@ pub const ARTICLE_ID_SEPARATOR: &str = "#";
 pub const DEFAULT_RRF_K: usize = 60;
 const VECTOR_CACHE_VERSION: u32 = 1;
 const VECTOR_MODEL_ID: &str = "multilingual-e5-small";
+const VECTOR_MODEL_REVISION: &str = "fastembed-5:EmbeddingModel::MultilingualE5Small";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum NodeKind {
@@ -264,6 +265,12 @@ pub struct VectorSearchOptions {
     pub vector_weight: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VectorStatus {
+    pub enabled: bool,
+    pub model_ready: bool,
+}
+
 impl Default for VectorSearchOptions {
     fn default() -> Self {
         Self {
@@ -422,6 +429,7 @@ pub struct TantivyRulesIndex {
     fields: SearchFields,
     vector_corpus: Option<VectorCorpus>,
     vector_provider: Option<StoredEmbeddingProvider>,
+    vector_enabled_requested: bool,
     rrf_k: usize,
     vector_weight: f32,
 }
@@ -450,6 +458,7 @@ impl TantivyRulesIndex {
             fields,
             vector_corpus: None,
             vector_provider: None,
+            vector_enabled_requested: false,
             rrf_k: DEFAULT_RRF_K,
             vector_weight: 1.0,
         })
@@ -470,6 +479,7 @@ impl TantivyRulesIndex {
     ) -> anyhow::Result<()> {
         self.rrf_k = rrf_k;
         self.vector_weight = vector_weight;
+        self.vector_enabled_requested = true;
         let provider = std::sync::Arc::new(provider);
         self.vector_corpus = Some(build_or_load_vector_corpus(
             self.articles.values(),
@@ -522,6 +532,7 @@ impl TantivyRulesIndex {
         index.node_indices = node_indices;
         index.rrf_k = vector_options.rrf_k;
         index.vector_weight = vector_options.vector_weight;
+        index.vector_enabled_requested = vector_options.enabled;
         if let Some((corpus, provider)) =
             index.try_build_vector_corpus_from_options(&cache_key, &vector_options)
         {
@@ -583,7 +594,6 @@ impl TantivyRulesIndex {
 
         let searcher = reader.searcher();
         let candidate_limit = k * 4;
-        let annex_likely = is_annex_query_likely(q, &query_terms);
         let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(candidate_limit)) else {
             return lexical_fallback(self.articles.values(), q, k, filter);
         };
@@ -596,7 +606,7 @@ impl TantivyRulesIndex {
             let Some(id) = first_text(&doc, self.fields.id) else {
                 continue;
             };
-            let Some(hit) = self.search_hit_for_id(id, score, q, filter, annex_likely) else {
+            let Some(hit) = self.search_hit_for_id(id, score, q, filter) else {
                 continue;
             };
             bm25_hits.push(hit);
@@ -619,8 +629,7 @@ impl TantivyRulesIndex {
                     let Some(id) = first_text(&doc, self.fields.id) else {
                         continue;
                     };
-                    let Some(hit) = self.search_hit_for_id(id, score, q, filter, annex_likely)
-                    else {
+                    let Some(hit) = self.search_hit_for_id(id, score, q, filter) else {
                         continue;
                     };
                     rule_hits.push(hit);
@@ -631,22 +640,16 @@ impl TantivyRulesIndex {
 
         let lexical_hits = lexical_rank(
             self.articles.values(),
-            annex_likely
-                .then_some(self.annexes.values())
-                .into_iter()
-                .flatten(),
+            self.annexes.values(),
             q,
             &query_terms,
             candidate_limit,
             filter,
         );
         let annex_ref_hits = self.annex_reference_rank(q, candidate_limit, filter);
-        let semantic_hits = self.semantic_rank(q, &query_terms, candidate_limit, filter);
         let vector_hits = self.vector_rank(q, candidate_limit, filter);
         let mut rankings = Vec::new();
         let mut weights = Vec::new();
-        rankings.push(semantic_hits);
-        weights.push(1.0);
         rankings.push(annex_ref_hits);
         weights.push(1.0);
         if !bm25_hits.is_empty() {
@@ -723,7 +726,6 @@ impl TantivyRulesIndex {
         score: f32,
         q: &str,
         filter: Option<&RuleFilter>,
-        allow_annex: bool,
     ) -> Option<SearchHit> {
         if let Some(article) = self.articles.get(id) {
             if !matches_filter(article, filter) {
@@ -739,9 +741,6 @@ impl TantivyRulesIndex {
                 effective: article.effective.clone(),
                 kind: "article".to_string(),
             });
-        }
-        if !allow_annex {
-            return None;
         }
         let annex = self.annexes.get(id)?;
         if !matches_annex_filter(annex, filter) {
@@ -767,6 +766,17 @@ impl TantivyRulesIndex {
 
     pub fn has_source_pages(&self) -> bool {
         self.pages.is_some()
+    }
+
+    pub fn vector_status(&self) -> VectorStatus {
+        VectorStatus {
+            enabled: self.vector_enabled_requested,
+            model_ready: self.vector_provider.is_some() && self.vector_corpus.is_some(),
+        }
+    }
+
+    pub fn set_vector_enabled_requested(&mut self, enabled: bool) {
+        self.vector_enabled_requested = enabled;
     }
 
     fn direct_article_hit(&self, q: &str, filter: Option<&RuleFilter>) -> Option<SearchHit> {
@@ -847,100 +857,6 @@ impl TantivyRulesIndex {
                 hit
             })
             .collect::<Vec<_>>();
-        sort_hits_by_score_and_id(&mut hits);
-        hits.truncate(k);
-        hits
-    }
-
-    fn semantic_rank(
-        &self,
-        q: &str,
-        terms: &[String],
-        k: usize,
-        filter: Option<&RuleFilter>,
-    ) -> Vec<SearchHit> {
-        let compact_query = normalize_compact(q);
-        let wants_promotion_minimum = compact_query.contains("승진최소연한");
-        let wants_travel_amount = compact_query.contains("출장")
-            && terms
-                .iter()
-                .any(|term| matches!(term.as_str(), "식비" | "일비" | "반나절"));
-        let wants_vehicle_exclusive_use = compact_query.contains("공용차량")
-            && (compact_query.contains("독점") || compact_query.contains("전용차"));
-        let rule_terms = rule_query_terms(terms);
-
-        if !wants_promotion_minimum
-            && !wants_travel_amount
-            && !wants_vehicle_exclusive_use
-            && rule_terms.is_empty()
-        {
-            return Vec::new();
-        }
-
-        let mut hits = Vec::new();
-        for annex in self.annexes.values() {
-            if !matches_annex_filter(annex, filter) {
-                continue;
-            }
-            let compact_annex = normalize_compact(&format!(
-                "{}\n{}\n{}",
-                annex_search_title(annex),
-                annex.rule,
-                annex.body
-            ));
-            let promotion_match = wants_promotion_minimum && compact_annex.contains("승진최소연한");
-            let travel_match = wants_travel_amount
-                && annex.rule.contains("여비")
-                && annex.annex == "별표1"
-                && (compact_annex.contains("식비") || compact_annex.contains("일비"));
-            if promotion_match || travel_match {
-                hits.push(search_hit_for_annex(annex, 120.0, q));
-            }
-        }
-        for article in self.articles.values() {
-            if !matches_filter(article, filter) {
-                continue;
-            }
-            let compact_article = normalize_compact(&format!(
-                "{}\n{}\n{}",
-                article.rule, article.title, article.body
-            ));
-            if rule_terms
-                .iter()
-                .any(|term| normalize_compact(&article.rule) == normalize_compact(term))
-            {
-                let term_hits = terms
-                    .iter()
-                    .filter(|term| compact_article.contains(normalize_compact(term).as_str()))
-                    .count() as f32;
-                hits.push(SearchHit {
-                    article_id: article.id.clone(),
-                    institution: article.institution.clone(),
-                    score: 70.0 + term_hits,
-                    snippet: snippet(&article.body, q),
-                    rule: article.rule.clone(),
-                    title: article.title.clone(),
-                    effective: article.effective.clone(),
-                    kind: "article".to_string(),
-                });
-            }
-            if wants_vehicle_exclusive_use
-                && compact_article.contains("공용차량")
-                && compact_article.contains("독점")
-                && compact_article.contains("전용차량")
-            {
-                hits.push(SearchHit {
-                    article_id: article.id.clone(),
-                    institution: article.institution.clone(),
-                    score: 120.0,
-                    snippet: snippet(&article.body, q),
-                    rule: article.rule.clone(),
-                    title: article.title.clone(),
-                    effective: article.effective.clone(),
-                    kind: "article".to_string(),
-                });
-            }
-        }
         sort_hits_by_score_and_id(&mut hits);
         hits.truncate(k);
         hits
@@ -1937,6 +1853,9 @@ fn sha256_text(text: &str) -> String {
 
 fn pack_vector_cache_key(manifest: &PackManifest) -> String {
     let value = serde_json::json!({
+        "cache_version": VECTOR_CACHE_VERSION,
+        "model_id": VECTOR_MODEL_ID,
+        "model_revision": VECTOR_MODEL_REVISION,
         "schema_version": manifest.schema_version,
         "institution": manifest.institution,
         "effective_date": manifest.effective_date,
@@ -2213,21 +2132,7 @@ fn query_terms(q: &str) -> Vec<String> {
             }
         }
     }
-    if terms.iter().any(|term| term.contains("밥값")) && !terms.iter().any(|term| term == "식비")
-    {
-        terms.push("식비".to_string());
-    }
     terms
-}
-
-fn is_annex_query_likely(q: &str, terms: &[String]) -> bool {
-    find_annex_ref(q).is_some()
-        || terms.iter().any(|term| {
-            matches!(
-                term.as_str(),
-                "승진최소연한" | "식비" | "일비" | "여비" | "국내출장여비" | "반나절"
-            )
-        })
 }
 
 fn rule_query_terms(terms: &[String]) -> Vec<String> {
@@ -2492,9 +2397,9 @@ refs: []
 "#,
             r#"---
 institution: cni
-rule: 여비규정
+rule: 출장규정
 article: 제12조
-title: 일비
+title: 교통비
 effective: 2026-02-27
 amended: 2026-02-27
 status: active
@@ -2504,11 +2409,11 @@ refs:
   - target: 복무규정#제18조
     type: 준용
 ---
-① 국내 출장자에게는 일비를 지급한다. 휴가 중 출장은 복무규정을 준용한다.
+① 국내 출장자에게는 교통비를 지급한다. 휴가 중 출장은 복무규정을 준용한다.
 "#,
             r#"---
 institution: cni
-rule: 여비규정
+rule: 출장규정
 article: 제13조
 title: 숙박비
 effective: 2026-02-27
@@ -2517,10 +2422,10 @@ status: active
 supersedes: null
 legal_basis: []
 refs:
-  - target: 여비규정#제12조
+  - target: 출장규정#제12조
     type: 인용
 ---
-① 숙박비는 출장지와 일비 지급 기준을 고려하여 지급한다.
+① 숙박비는 출장지와 교통비 지급 기준을 고려하여 지급한다.
 "#,
         ]
         .into_iter()
@@ -2573,7 +2478,7 @@ refs:
     #[test]
     fn parses_frontmatter_article_id_and_refs() {
         let article = fixture_articles().remove(1);
-        assert_eq!(article.id, "여비규정#제12조");
+        assert_eq!(article.id, "출장규정#제12조");
         assert_eq!(article.legal_basis.len(), 0);
         assert_eq!(article.refs[0].target, "복무규정#제18조");
     }
@@ -2586,9 +2491,9 @@ refs:
         )
         .unwrap();
 
-        let hits = index.search("일비 출장", 5, None);
+        let hits = index.search("교통비 출장", 5, None);
         assert!(!hits.is_empty());
-        assert_eq!(hits[0].article_id, "여비규정#제12조");
+        assert_eq!(hits[0].article_id, "출장규정#제12조");
 
         let filtered = index.search(
             "연차휴가",
@@ -2635,12 +2540,12 @@ refs:
             TantivyRulesIndex::from_articles(articles, default_pack_status("cni", "base")).unwrap();
 
         let left_ids = left
-            .search("일비 출장", 5, None)
+            .search("교통비 출장", 5, None)
             .into_iter()
             .map(|hit| hit.article_id)
             .collect::<Vec<_>>();
         let right_ids = right
-            .search("일비 출장", 5, None)
+            .search("교통비 출장", 5, None)
             .into_iter()
             .map(|hit| hit.article_id)
             .collect::<Vec<_>>();
@@ -2729,14 +2634,14 @@ refs:
         )
         .unwrap();
 
-        let by_rule = index.search("여비규정은 무엇을 정하는가", 5, None);
+        let by_rule = index.search("출장규정은 무엇을 정하는가", 5, None);
         assert!(by_rule
             .iter()
             .take(2)
-            .any(|hit| hit.article_id == "여비규정#제12조"));
+            .any(|hit| hit.article_id == "출장규정#제12조"));
 
         let by_title = index.search("숙박비 기준", 5, None);
-        assert_eq!(by_title[0].article_id, "여비규정#제13조");
+        assert_eq!(by_title[0].article_id, "출장규정#제13조");
     }
 
     #[test]
@@ -2747,8 +2652,8 @@ refs:
         )
         .unwrap();
 
-        let hits = index.search("여비규정 제13조는 현재 어떤 상태인가?", 5, None);
-        assert_eq!(hits[0].article_id, "여비규정#제13조");
+        let hits = index.search("출장규정 제13조는 현재 어떤 상태인가?", 5, None);
+        assert_eq!(hits[0].article_id, "출장규정#제13조");
     }
 
     #[test]
@@ -2759,17 +2664,17 @@ refs:
         )
         .unwrap();
 
-        let report = index.search_with_routes("여비규정 제13조 숙박비 기준", 5, None);
+        let report = index.search_with_routes("출장규정 제13조 숙박비 기준", 5, None);
 
         assert_eq!(
             report.pin_hit.as_ref().map(|hit| hit.article_id.as_str()),
-            Some("여비규정#제13조")
+            Some("출장규정#제13조")
         );
         assert!(report
             .retrieval_hits
             .iter()
-            .any(|hit| hit.article_id == "여비규정#제13조"));
-        assert_eq!(report.hits[0].article_id, "여비규정#제13조");
+            .any(|hit| hit.article_id == "출장규정#제13조"));
+        assert_eq!(report.hits[0].article_id, "출장규정#제13조");
     }
 
     #[test]
@@ -2866,19 +2771,19 @@ refs:
                 "cni",
                 "인사 규정",
                 "제20조",
-                "승진",
-                "승진 최소연한은 별표 1에 따른다.",
+                "자격",
+                "자격 기준은 별표 1에 따른다.",
             )],
             vec![annex_fixture(
                 "cni",
                 "인사 규정",
                 "별표1",
                 "",
-                "[별표 1]\n승진 최소연한\n| 구분 | 4급 |\n| --- | --- |\n| 연한 | 4년 |",
+                "[별표 1]\n자격 기준\n| 구분 | A등급 |\n| --- | --- |\n| 기간 | 4년 |",
             )],
         );
 
-        let report = index.search_with_routes("인사 규정 별표1에서 4급 승진최소연한", 5, None);
+        let report = index.search_with_routes("인사 규정 별표1에서 A등급 자격기준", 5, None);
 
         assert_eq!(
             report.pin_hit.as_ref().map(|hit| hit.article_id.as_str()),
@@ -2892,24 +2797,24 @@ refs:
         let index = index_with_annexes(
             vec![article_fixture(
                 "cni",
-                "여비지급규칙",
+                "지원규칙",
                 "제15조",
-                "여비",
-                "출장 여비는 별표 1에 따른다.",
+                "지원",
+                "출장 지원은 별표 1에 따른다.",
             )],
             vec![annex_fixture(
                 "cni",
-                "여비지급규칙",
+                "지원규칙",
                 "별표1",
-                "국내여비 지급표",
-                "식비 일비 반나절 출장 지급 기준\n| 항목 | 금액 |\n| --- | --- |\n| 식비 | 25000 |",
+                "국내지원 지급표",
+                "지원금 교통보조 단기 출장 지급 기준\n| 항목 | 금액 |\n| --- | --- |\n| 지원금 | 25000 |",
             )],
         );
 
-        let report = index.search_with_routes("별표1 식비 일비 기준", 5, None);
+        let report = index.search_with_routes("별표1 지원금 교통보조 기준", 5, None);
 
         assert!(report.pin_hit.is_none());
-        assert_eq!(report.hits[0].article_id, "여비지급규칙#별표1");
+        assert_eq!(report.hits[0].article_id, "지원규칙#별표1");
         assert_eq!(report.hits[0].kind, "annex");
     }
 
@@ -2918,32 +2823,32 @@ refs:
         let index = index_with_annexes(
             vec![article_fixture(
                 "cni",
-                "여비지급규칙",
+                "지원규칙",
                 "제15조",
-                "여비",
-                "출장 여비는 별표 1에 따른다.",
+                "지원",
+                "출장 지원은 별표 1에 따른다.",
             )],
             vec![annex_fixture(
                 "cni",
-                "여비지급규칙",
+                "지원규칙",
                 "별표1",
-                "국내여비 지급표",
-                "식비 일비 반나절 출장 지급 기준",
+                "국내지원 지급표",
+                "지원금 교통보조 단기 출장 지급 기준",
             )],
         );
 
         let report = index.search_with_routes(
-            "별표 1 식비 기준",
+            "별표 1 지원금 기준",
             5,
             Some(RuleFilter {
-                rule: Some("여비지급규칙".to_string()),
+                rule: Some("지원규칙".to_string()),
                 ..RuleFilter::default()
             }),
         );
 
         assert_eq!(
             report.pin_hit.as_ref().map(|hit| hit.article_id.as_str()),
-            Some("여비지급규칙#별표1")
+            Some("지원규칙#별표1")
         );
     }
 
@@ -2955,8 +2860,8 @@ refs:
         )
         .unwrap();
 
-        let article = index.get_article("여비규정#제12조").unwrap();
-        assert_eq!(article.next_id.as_deref(), Some("여비규정#제13조"));
+        let article = index.get_article("출장규정#제12조").unwrap();
+        assert_eq!(article.next_id.as_deref(), Some("출장규정#제13조"));
         assert_eq!(index.related_laws("복무규정#제18조")[0].law, "근로기준법");
         assert_eq!(index.list_rules().len(), 2);
     }
@@ -2970,10 +2875,10 @@ refs:
         .unwrap();
 
         let impact = index.impact("복무규정#제18조");
-        assert_eq!(impact.reverse_citations, vec!["여비규정#제12조"]);
+        assert_eq!(impact.reverse_citations, vec!["출장규정#제12조"]);
 
-        let travel_impact = index.impact("여비규정#제12조");
-        assert_eq!(travel_impact.reverse_citations, vec!["여비규정#제13조"]);
+        let travel_impact = index.impact("출장규정#제12조");
+        assert_eq!(travel_impact.reverse_citations, vec!["출장규정#제13조"]);
         assert_eq!(travel_impact.delegation_chain, vec!["복무규정#제18조"]);
     }
 
@@ -3060,7 +2965,7 @@ refs:
 
     #[test]
     fn rejects_article_markdown_with_unterminated_frontmatter() {
-        let err = parse_article_markdown_str("---\nrule: 여비규정\n\n본문").unwrap_err();
+        let err = parse_article_markdown_str("---\nrule: 출장규정\n\n본문").unwrap_err();
         assert!(matches!(err, RulesCoreError::InvalidArticle(_)));
     }
 
