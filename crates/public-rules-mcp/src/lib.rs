@@ -522,7 +522,8 @@ fn search_pack(
     rule: Option<String>,
     multi_pack: bool,
 ) -> Vec<SearchHit> {
-    pack.index
+    let mut hits = pack
+        .index
         .search(
             query,
             limit,
@@ -540,7 +541,9 @@ fn search_pack(
             }
             hit
         })
-        .collect()
+        .collect::<Vec<_>>();
+    rules_core::sort_hits_by_score_and_id(&mut hits);
+    hits
 }
 
 async fn search_packs_blocking(

@@ -444,10 +444,17 @@ impl TantivyRulesIndex {
     }
 
     fn search_retrieval(&self, q: &str, k: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        let query_terms = query_terms(q);
+        let normalized_query = query_terms.join(" ");
+        let parser_query = if normalized_query.is_empty() {
+            q
+        } else {
+            normalized_query.as_str()
+        };
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
         parser.set_field_boost(self.fields.title, 2.0);
-        let (query, _errors) = parser.parse_query_lenient(q);
+        let (query, _errors) = parser.parse_query_lenient(parser_query);
         let Ok(reader) = self.index.reader() else {
             return lexical_fallback(self.articles.values(), q, k, filter);
         };
@@ -470,9 +477,10 @@ impl TantivyRulesIndex {
             };
             bm25_hits.push(hit);
         }
+        sort_hits_by_score_and_id(&mut bm25_hits);
 
         let mut rule_hits = Vec::new();
-        let rule_terms = rule_query_terms(q);
+        let rule_terms = rule_query_terms(&query_terms);
         if !rule_terms.is_empty() {
             let mut rule_parser = QueryParser::for_index(&self.index, vec![self.fields.rule]);
             rule_parser.set_field_boost(self.fields.rule, 3.0);
@@ -490,10 +498,11 @@ impl TantivyRulesIndex {
                     };
                     rule_hits.push(hit);
                 }
+                sort_hits_by_score_and_id(&mut rule_hits);
             }
         }
 
-        let lexical_hits = lexical_rank(self.articles.values(), q, k * 4, filter);
+        let lexical_hits = lexical_rank(self.articles.values(), q, &query_terms, k * 4, filter);
         let rankings = if bm25_hits.is_empty() {
             vec![rule_hits, lexical_hits]
         } else {
@@ -929,7 +938,9 @@ pub fn rrf_fuse(rankings: Vec<Vec<SearchHit>>, k: usize) -> Vec<SearchHit> {
                 .entry(hit.article_id.clone())
                 .and_modify(|(existing, total)| {
                     *total += score;
-                    if hit.score > existing.score {
+                    if hit.score > existing.score
+                        || (hit.score == existing.score && hit.article_id < existing.article_id)
+                    {
                         *existing = hit.clone();
                     }
                 })
@@ -944,11 +955,7 @@ pub fn rrf_fuse(rankings: Vec<Vec<SearchHit>>, k: usize) -> Vec<SearchHit> {
             hit
         })
         .collect();
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.article_id.cmp(&b.article_id))
-    });
+    sort_hits_by_score_and_id(&mut hits);
     hits.truncate(k);
     hits
 }
@@ -959,14 +966,24 @@ fn merge_pinned_hits(
     k: usize,
 ) -> Vec<SearchHit> {
     let Some(pinned) = pinned else {
+        sort_hits_by_score_and_id(&mut ranked);
         ranked.truncate(k);
         return ranked;
     };
     ranked.retain(|hit| hit.article_id != pinned.article_id);
+    sort_hits_by_score_and_id(&mut ranked);
     let mut out = Vec::with_capacity(k.min(ranked.len() + 1));
     out.push(pinned);
     out.extend(ranked.into_iter().take(k.saturating_sub(1)));
     out
+}
+
+pub fn sort_hits_by_score_and_id(hits: &mut [SearchHit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.article_id.cmp(&b.article_id))
+    });
 }
 
 fn direct_article_ref(q: &str, fallback_rule: Option<&str>) -> Option<(String, String)> {
@@ -1099,7 +1116,7 @@ fn build_search_index<'a>(
         title,
         body,
     };
-    let mut writer = index.writer(50_000_000)?;
+    let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
     for entry in articles
         .map(SearchEntry::from_article)
         .chain(annexes.map(SearchEntry::from_annex))
@@ -1335,16 +1352,17 @@ fn lexical_fallback<'a>(
     k: usize,
     filter: Option<&RuleFilter>,
 ) -> Vec<SearchHit> {
-    lexical_rank(articles, q, k, filter)
+    let terms = query_terms(q);
+    lexical_rank(articles, q, &terms, k, filter)
 }
 
 fn lexical_rank<'a>(
     articles: impl Iterator<Item = &'a Article>,
     q: &str,
+    terms: &[String],
     k: usize,
     filter: Option<&RuleFilter>,
 ) -> Vec<SearchHit> {
-    let terms = lexical_query_terms(q);
     let mut hits = Vec::new();
     for article in articles {
         if !matches_filter(article, filter) {
@@ -1386,16 +1404,12 @@ fn lexical_rank<'a>(
             });
         }
     }
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.article_id.cmp(&b.article_id))
-    });
+    sort_hits_by_score_and_id(&mut hits);
     hits.truncate(k);
     hits
 }
 
-fn lexical_query_terms(q: &str) -> Vec<String> {
+fn query_terms(q: &str) -> Vec<String> {
     let mut terms = Vec::new();
     for raw in q.split_whitespace() {
         let stripped = strip_korean_suffixes(raw);
@@ -1411,9 +1425,10 @@ fn lexical_query_terms(q: &str) -> Vec<String> {
     terms
 }
 
-fn rule_query_terms(q: &str) -> Vec<String> {
-    lexical_query_terms(q)
-        .into_iter()
+fn rule_query_terms(terms: &[String]) -> Vec<String> {
+    terms
+        .iter()
+        .cloned()
         .filter(|term| looks_like_rule_name(term))
         .collect()
 }
@@ -1587,25 +1602,60 @@ fn first_text(doc: &TantivyDocument, field: Field) -> Option<&str> {
 }
 
 fn snippet(body: &str, q: &str) -> String {
-    let needle = q.split_whitespace().next().unwrap_or_default();
-    if needle.is_empty() {
+    const SNIPPET_CHARS: usize = 120;
+    const CONTEXT_BEFORE_CHARS: usize = 40;
+
+    let terms = query_terms(q);
+    if terms.is_empty() {
         return body.chars().take(120).collect();
     }
-    let Some(pos) = body.find(needle) else {
+
+    let mut best: Option<(usize, usize, usize)> = None;
+    for term in &terms {
+        let mut search_from = 0;
+        while let Some(relative_pos) = body[search_from..].find(term) {
+            let pos = search_from + relative_pos;
+            let start = byte_index_before(body, pos, CONTEXT_BEFORE_CHARS);
+            let end = byte_index_after(body, start, SNIPPET_CHARS);
+            let window = &body[start..end];
+            let score = terms
+                .iter()
+                .filter(|candidate| {
+                    let candidate: &String = candidate;
+                    window.contains(candidate.as_str())
+                })
+                .count();
+            let candidate = (score, start, end);
+            if best.is_none_or(|current| {
+                candidate.0 > current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+            }) {
+                best = Some(candidate);
+            }
+            search_from = pos + term.len();
+        }
+    }
+
+    let Some((_, start, end)) = best else {
         return body.chars().take(120).collect();
     };
-    let start = body[..pos]
+    body[start..end].to_string()
+}
+
+fn byte_index_before(s: &str, pos: usize, char_count: usize) -> usize {
+    s[..pos]
         .char_indices()
         .rev()
-        .nth(40)
+        .nth(char_count)
         .map(|(idx, _)| idx)
-        .unwrap_or(0);
-    let end = body[pos..]
+        .unwrap_or(0)
+}
+
+fn byte_index_after(s: &str, pos: usize, char_count: usize) -> usize {
+    s[pos..]
         .char_indices()
-        .nth(80)
+        .nth(char_count)
         .map(|(idx, _)| pos + idx)
-        .unwrap_or(body.len());
-    body[start..end].to_string()
+        .unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -1986,5 +2036,93 @@ refs:
         let hits = index.search("항공운임", 5, None);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].article_id, "여비지급규칙#제12조");
+    }
+
+    #[test]
+    fn query_terms_keep_raw_and_particle_stripped_forms() {
+        assert_eq!(
+            query_terms("여비지급규칙은 어떤 목적으로 제정되었는가?"),
+            vec![
+                "여비지급규칙은".to_string(),
+                "여비지급규칙".to_string(),
+                "어떤".to_string(),
+                "목적으로".to_string(),
+                "목적".to_string(),
+                "제정되었는가".to_string(),
+                "제정되었".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn snippet_chooses_window_with_most_query_terms() {
+        let body = "목적이라는 말만 먼저 나온다. 이 규칙은 충남연구원 여비 지급에 관한 사항을 정함을 목적으로 한다.";
+        let result = snippet(
+            body,
+            "충남연구원 여비지급규칙은 어떤 목적으로 제정되었는가?",
+        );
+
+        assert!(result.contains("충남연구원"));
+        assert!(result.contains("목적"));
+    }
+
+    #[test]
+    fn rebuilding_same_rules_dir_produces_identical_search_orders() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crates/rules-core has a repository ancestor")
+            .to_path_buf();
+        let golden_path = repo.join("01_docs/eval/golden.jsonl");
+        let rules_dir = repo.join("04_data/90_index-build/pack-cni-2026-02-27/articles");
+        assert!(
+            golden_path.exists(),
+            "golden set missing at {}",
+            golden_path.display()
+        );
+        assert!(
+            rules_dir.exists(),
+            "rules dir missing at {}",
+            rules_dir.display()
+        );
+
+        let queries = fs::read_to_string(&golden_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap()
+                    .get("q")
+                    .and_then(|q| q.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let left = TantivyRulesIndex::from_articles_dir(
+            &rules_dir,
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let right = TantivyRulesIndex::from_articles_dir(
+            &rules_dir,
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+
+        for query in queries {
+            let left_ids = left
+                .search(&query, 5, None)
+                .into_iter()
+                .map(|hit| hit.article_id)
+                .collect::<Vec<_>>();
+            let right_ids = right
+                .search(&query, 5, None)
+                .into_iter()
+                .map(|hit| hit.article_id)
+                .collect::<Vec<_>>();
+            assert_eq!(left_ids, right_ids, "query: {query}");
+        }
     }
 }

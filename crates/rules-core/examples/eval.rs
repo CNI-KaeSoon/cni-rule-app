@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}",
             if hit { "hit" } else { "miss" },
             if pin_hit { "pin-hit" } else { "pin-miss" },
             if retrieval_hit {
@@ -74,7 +74,6 @@ fn main() -> anyhow::Result<()> {
             } else {
                 "retrieval-miss"
             },
-            elapsed,
             report
                 .hits
                 .iter()
@@ -82,6 +81,7 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        eprintln!("case_latency_us={elapsed}");
     }
 
     latencies.sort_unstable();
@@ -92,13 +92,13 @@ fn main() -> anyhow::Result<()> {
         hit_count as f64 * 100.0 / cases.len() as f64
     };
     println!(
-        "summary cases={} hit@5={}/{} ({:.1}%) p95_us={}",
+        "summary cases={} hit@5={}/{} ({:.1}%)",
         cases.len(),
         hit_count,
         cases.len(),
-        hit_rate,
-        p95
+        hit_rate
     );
+    eprintln!("p95_us={p95}");
     println!(
         "routes pin_hit@5={}/{} retrieval_hit@5={}/{}",
         pin_hit_count,
