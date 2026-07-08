@@ -8,9 +8,9 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, LegalBasis,
-    PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit, SearchRouteReport, SourcePage,
-    TantivyRulesIndex,
+    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
+    LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
+    SearchRouteReport, SourcePage, TantivyRulesIndex,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -223,6 +223,7 @@ pub struct PublicRulesServer {
 #[derive(Debug, Clone)]
 struct LoadedPack {
     institution: String,
+    aliases: Vec<String>,
     index: Arc<TantivyRulesIndex>,
 }
 
@@ -232,6 +233,7 @@ impl PublicRulesServer {
         Self {
             packs: Arc::new(vec![LoadedPack {
                 institution: institution.clone(),
+                aliases: institution_aliases(&institution, None, &index),
                 index: Arc::new(index),
             }]),
             default_institution: institution,
@@ -250,9 +252,16 @@ impl PublicRulesServer {
         let default_institution = config.institution.clone();
         let mut seen = BTreeMap::new();
         seen.insert(default_institution.clone(), ());
+        let default_pack_path = config.pack.path.clone();
+        let default_index = load_pack(default_institution.clone(), config.pack)?;
         let mut packs = vec![LoadedPack {
             institution: default_institution.clone(),
-            index: Arc::new(load_pack(default_institution.clone(), config.pack)?),
+            aliases: institution_aliases(
+                &default_institution,
+                default_pack_path.as_deref(),
+                &default_index,
+            ),
+            index: Arc::new(default_index),
         }];
         for extra in config.extra_packs {
             if seen.insert(extra.institution.clone(), ()).is_some() {
@@ -261,9 +270,16 @@ impl PublicRulesServer {
                     extra.institution
                 ));
             }
+            let extra_pack_path = extra.pack.path.clone();
+            let extra_index = load_pack(extra.institution.clone(), extra.pack)?;
             packs.push(LoadedPack {
                 institution: extra.institution.clone(),
-                index: Arc::new(load_pack(extra.institution, extra.pack)?),
+                aliases: institution_aliases(
+                    &extra.institution,
+                    extra_pack_path.as_deref(),
+                    &extra_index,
+                ),
+                index: Arc::new(extra_index),
             });
         }
         let multi_pack = packs.len() > 1;
@@ -328,6 +344,29 @@ impl PublicRulesServer {
                 .into_iter()
                 .collect::<Vec<_>>(),
             None => self.packs.iter().collect(),
+        }
+    }
+
+    fn selected_packs_for_query(&self, institution: Option<&str>, query: &str) -> Vec<&LoadedPack> {
+        let selected = self.selected_packs(institution);
+        if institution.is_some() || selected.len() <= 1 {
+            return selected;
+        }
+        let normalized_query = normalize_alias(query);
+        let routed = selected
+            .iter()
+            .copied()
+            .filter(|pack| {
+                pack.aliases.iter().any(|alias| {
+                    let alias = normalize_alias(alias);
+                    alias.chars().count() >= 2 && normalized_query.contains(alias.as_str())
+                })
+            })
+            .collect::<Vec<_>>();
+        if routed.is_empty() {
+            selected
+        } else {
+            routed
         }
     }
 
@@ -504,6 +543,76 @@ fn load_pack(institution: String, pack: PackConfig) -> anyhow::Result<TantivyRul
     Ok(index)
 }
 
+fn institution_aliases(
+    institution: &str,
+    pack_path: Option<&Path>,
+    index: &TantivyRulesIndex,
+) -> Vec<String> {
+    let mut aliases = Vec::<String>::new();
+    push_alias(&mut aliases, institution);
+    push_alias(&mut aliases, &index.status().institution);
+    if let Some(label) =
+        pack_path.and_then(|path| institution_label_from_pack_path(path, institution))
+    {
+        push_alias(&mut aliases, &label);
+        for derived in derived_institution_aliases(&label) {
+            push_alias(&mut aliases, &derived);
+        }
+    }
+    aliases
+}
+
+fn institution_label_from_pack_path(path: &Path, institution: &str) -> Option<String> {
+    let root = pack_root_for_metadata(path);
+    let nodes_path = root.join("graph/nodes.jsonl");
+    let text = fs::read_to_string(nodes_path).ok()?;
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<GraphNode>(line).ok())
+        .find(|node| {
+            node.kind == NodeKind::Institution
+                && (node.id == institution
+                    || node
+                        .meta
+                        .get("institution")
+                        .and_then(|value| value.as_str())
+                        == Some(institution))
+        })
+        .map(|node| node.label)
+}
+
+fn pack_root_for_metadata(path: &Path) -> PathBuf {
+    if path.file_name().and_then(|name| name.to_str()) == Some("articles") {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn derived_institution_aliases(label: &str) -> Vec<String> {
+    let compact = normalize_alias(label);
+    ["충청남도", "충남", "한국", "재단법인", "(재)", "재단"]
+        .iter()
+        .filter_map(|prefix| compact.strip_prefix(&normalize_alias(prefix)))
+        .filter(|alias| alias.chars().count() >= 3)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn push_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim();
+    if !alias.is_empty() && !aliases.iter().any(|existing| existing == alias) {
+        aliases.push(alias.to_string());
+    }
+}
+
+fn normalize_alias(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_' && *ch != '·')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn source_url_extra(source_url: Option<String>) -> BTreeMap<String, String> {
     let mut extra = BTreeMap::new();
     if let Some(source_url) = source_url {
@@ -609,7 +718,7 @@ impl PublicRulesServer {
         let rule = params.rule.clone();
         let institution = params.institution.clone();
         let limit = top_k.unwrap_or(5);
-        let selected_packs = self.selected_packs(institution.as_deref());
+        let selected_packs = self.selected_packs_for_query(institution.as_deref(), &query);
         let reports = if selected_packs.len() <= 1 {
             selected_packs
                 .into_iter()
@@ -1346,10 +1455,16 @@ refs: []
             packs: Arc::new(vec![
                 LoadedPack {
                     institution: "cni".to_string(),
+                    aliases: vec!["cni".to_string(), "충남연구원".to_string()],
                     index: Arc::new(cni),
                 },
                 LoadedPack {
                     institution: "ctp".to_string(),
+                    aliases: vec![
+                        "ctp".to_string(),
+                        "충남테크노파크".to_string(),
+                        "테크노파크".to_string(),
+                    ],
                     index: Arc::new(ctp),
                 },
             ]),
@@ -1536,6 +1651,33 @@ table_structured: true
         assert_eq!(filtered.hits.len(), 1);
         assert_eq!(filtered.hits[0].institution, "ctp");
         assert_eq!(filtered.hits[0].article_id, "ctp/인사규정#제10조");
+    }
+
+    #[tokio::test]
+    async fn multi_pack_query_institution_name_routes_to_matching_pack() {
+        let server = multi_pack_fixture_server();
+
+        let Json(ctp_result) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "테크노파크 육아휴직".to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: None,
+            }))
+            .await;
+        assert!(!ctp_result.hits.is_empty());
+        assert!(ctp_result.hits.iter().all(|hit| hit.institution == "ctp"));
+
+        let Json(cni_result) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: "충남연구원 육아휴직".to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: None,
+            }))
+            .await;
+        assert!(!cni_result.hits.is_empty());
+        assert!(cni_result.hits.iter().all(|hit| hit.institution == "cni"));
     }
 
     #[tokio::test]

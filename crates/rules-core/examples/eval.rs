@@ -1,6 +1,6 @@
 use rules_core::{
-    default_pack_status, merge_search_route_reports, namespace_search_route_report, RuleFilter,
-    SearchHit, SearchRouteReport, TantivyRulesIndex,
+    default_pack_status, merge_search_route_reports, namespace_search_route_report, GraphNode,
+    NodeKind, RuleFilter, RulesIndex, SearchHit, SearchRouteReport, TantivyRulesIndex,
 };
 use serde::Deserialize;
 use std::fs::File;
@@ -196,7 +196,7 @@ fn print_usage() {
     eprintln!("legacy positional usage is still supported: eval <golden.jsonl> <rules-dir>");
 }
 
-fn load_indexes(args: &EvalArgs) -> anyhow::Result<Vec<(String, TantivyRulesIndex)>> {
+fn load_indexes(args: &EvalArgs) -> anyhow::Result<Vec<(String, Vec<String>, TantivyRulesIndex)>> {
     let packs = if args.packs.is_empty() {
         vec![PackArg {
             institution: args.institution.clone(),
@@ -215,24 +215,40 @@ fn load_indexes(args: &EvalArgs) -> anyhow::Result<Vec<(String, TantivyRulesInde
     packs
         .into_iter()
         .map(|pack| {
-            let index = TantivyRulesIndex::from_articles_dir(
-                &pack.rules_dir,
-                default_pack_status(&pack.institution, "eval"),
-            )?;
-            Ok((pack.institution, index))
+            let index = load_index_for_eval(&pack.institution, &pack.rules_dir)?;
+            let aliases = institution_aliases(&pack.institution, &pack.rules_dir, &index);
+            Ok((pack.institution, aliases, index))
         })
         .collect()
 }
 
+fn load_index_for_eval(institution: &str, path: &PathBuf) -> anyhow::Result<TantivyRulesIndex> {
+    if path.join("manifest.json").is_file() {
+        return Ok(TantivyRulesIndex::from_pack_dir(path)?);
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some("articles") {
+        if let Some(parent) = path.parent() {
+            if parent.join("manifest.json").is_file() {
+                return Ok(TantivyRulesIndex::from_pack_dir(parent)?);
+            }
+        }
+    }
+    Ok(TantivyRulesIndex::from_articles_dir(
+        path,
+        default_pack_status(institution, "eval"),
+    )?)
+}
+
 fn search_indexes(
-    indexes: &[(String, TantivyRulesIndex)],
+    indexes: &[(String, Vec<String>, TantivyRulesIndex)],
     query: &str,
     k: usize,
     multi_pack: bool,
 ) -> SearchRouteReport {
-    let reports = indexes
+    let selected = selected_indexes_for_query(indexes, query, multi_pack);
+    let reports = selected
         .iter()
-        .map(|(institution, index)| {
+        .map(|(institution, _, index)| {
             let report = index.search_with_routes(
                 query,
                 k,
@@ -245,6 +261,95 @@ fn search_indexes(
         })
         .collect();
     merge_search_route_reports(reports, k)
+}
+
+fn selected_indexes_for_query<'a>(
+    indexes: &'a [(String, Vec<String>, TantivyRulesIndex)],
+    query: &str,
+    multi_pack: bool,
+) -> Vec<&'a (String, Vec<String>, TantivyRulesIndex)> {
+    let all = indexes.iter().collect::<Vec<_>>();
+    if !multi_pack {
+        return all;
+    }
+    let normalized_query = normalize_alias(query);
+    let routed = indexes
+        .iter()
+        .filter(|(_, aliases, _)| {
+            aliases.iter().any(|alias| {
+                let alias = normalize_alias(alias);
+                alias.chars().count() >= 2 && normalized_query.contains(alias.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    if routed.is_empty() {
+        all
+    } else {
+        routed
+    }
+}
+
+fn institution_aliases(
+    institution: &str,
+    path: &PathBuf,
+    index: &TantivyRulesIndex,
+) -> Vec<String> {
+    let mut aliases = Vec::<String>::new();
+    push_alias(&mut aliases, institution);
+    push_alias(&mut aliases, &index.status().institution);
+    if let Some(label) = institution_label_from_pack_path(path, institution) {
+        push_alias(&mut aliases, &label);
+        for alias in derived_institution_aliases(&label) {
+            push_alias(&mut aliases, &alias);
+        }
+    }
+    aliases
+}
+
+fn institution_label_from_pack_path(path: &PathBuf, institution: &str) -> Option<String> {
+    let root = if path.file_name().and_then(|name| name.to_str()) == Some("articles") {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.clone()
+    };
+    let text = std::fs::read_to_string(root.join("graph/nodes.jsonl")).ok()?;
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<GraphNode>(line).ok())
+        .find(|node| {
+            node.kind == NodeKind::Institution
+                && (node.id == institution
+                    || node
+                        .meta
+                        .get("institution")
+                        .and_then(|value| value.as_str())
+                        == Some(institution))
+        })
+        .map(|node| node.label)
+}
+
+fn derived_institution_aliases(label: &str) -> Vec<String> {
+    let compact = normalize_alias(label);
+    ["충청남도", "충남", "한국", "재단법인", "(재)", "재단"]
+        .iter()
+        .filter_map(|prefix| compact.strip_prefix(&normalize_alias(prefix)))
+        .filter(|alias| alias.chars().count() >= 3)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn push_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim();
+    if !alias.is_empty() && !aliases.iter().any(|existing| existing == alias) {
+        aliases.push(alias.to_string());
+    }
+}
+
+fn normalize_alias(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_' && *ch != '·')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn any_expected_hit(expected: &[String], hits: &[SearchHit]) -> bool {
