@@ -3093,16 +3093,18 @@ refs:
             .to_path_buf();
         let golden_path = repo.join("01_docs/eval/golden.jsonl");
         let rules_dir = repo.join("04_data/90_index-build/pack-cni-2026-02-27/articles");
-        assert!(
-            golden_path.exists(),
-            "golden set missing at {}",
-            golden_path.display()
-        );
-        assert!(
-            rules_dir.exists(),
-            "rules dir missing at {}",
-            rules_dir.display()
-        );
+        // 결정성 회귀 검증은 빌드 중간물(04_data/90_index-build/.../articles)에 의존한다.
+        // 이 디렉터리는 파이프라인 산출물이며 git 미추적 — 배포 머신 등에는 없을 수 있다.
+        // 픽스처가 없으면 패닉 대신 건너뛴다(이식성 확보). 픽스처가 있는 환경에서는 그대로 검증한다.
+        if !golden_path.exists() || !rules_dir.exists() {
+            eprintln!(
+                "SKIP rebuilding_same_rules_dir_produces_identical_search_orders: fixture absent \
+                 (golden={}, rules_dir={})",
+                golden_path.display(),
+                rules_dir.display()
+            );
+            return;
+        }
 
         let queries = fs::read_to_string(&golden_path)
             .unwrap()

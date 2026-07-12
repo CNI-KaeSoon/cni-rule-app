@@ -1964,6 +1964,12 @@ table_structured: true
     #[tokio::test]
     async fn status_tool_reports_requested_vectors_even_when_model_is_unavailable() {
         let root = make_r5_pack("cni");
+        // "모델 미가용" 조건을 결정적·오프라인으로 강제한다. model_dir 을 (디렉터리가 아닌)
+        // 일반 파일로 지정하면 FastEmbed 초기화가 반드시 실패해 벡터가 graceful-disable 된다.
+        // 이렇게 하지 않으면 네트워크가 있는 머신(예: 배포 서버)에서 모델이 다운로드돼
+        // model_ready 가 true 가 되어 이 테스트가 환경 의존적으로 흔들린다.
+        // 팩 매니페스트 검증에 걸리지 않도록 팩에 이미 존재하는 일반 파일을 재사용한다.
+        let bogus_model = root.join("manifest.json");
         let server = PublicRulesServer::from_config(ServerConfig {
             institution: "cni".to_string(),
             pack: PackConfig {
@@ -1974,6 +1980,7 @@ table_structured: true
             vectors: VectorConfig {
                 enabled: true,
                 cache_dir: Some(root.join("cache")),
+                model_dir: Some(bogus_model),
                 ..VectorConfig::default()
             },
         })
