@@ -1,4 +1,5 @@
 target/
+.cargo-home/
 node_modules/
 .venv/
 .pytest_cache/

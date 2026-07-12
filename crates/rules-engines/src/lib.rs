@@ -697,12 +697,12 @@ mod tests {
             mode,
             messages: vec![Msg {
                 role: "user".to_string(),
-                content: "출장 일비 기준은?".to_string(),
+                content: "출장 교통비 기준은?".to_string(),
             }],
             context: vec![ContextBlock {
-                id: "여비규정#제12조".to_string(),
-                title: "일비".to_string(),
-                body: "① 국내 출장자에게는 일비를 지급한다.".to_string(),
+                id: "출장규정#제12조".to_string(),
+                title: "교통비".to_string(),
+                body: "① 국내 출장자에게는 교통비를 지급한다.".to_string(),
                 source: "cni-rules@abc123".to_string(),
             }],
         }
@@ -712,9 +712,9 @@ mod tests {
     fn prompt_builder_injects_context_and_citation_rule() {
         let prompt = PromptBuilder::build(&request(Mode::Interpret));
 
-        assert!(prompt.contains("[여비규정#제12조] 일비"));
+        assert!(prompt.contains("[출장규정#제12조] 교통비"));
         assert!(prompt.contains("Cite every legal or regulation claim"));
-        assert!(prompt.contains("출장 일비 기준은?"));
+        assert!(prompt.contains("출장 교통비 기준은?"));
     }
 
     #[test]
