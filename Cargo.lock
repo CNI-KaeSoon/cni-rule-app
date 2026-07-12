@@ -4228,6 +4228,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.8.2",
+ "unicode-normalization",
 ]
 
 [[package]]

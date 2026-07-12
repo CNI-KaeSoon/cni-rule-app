@@ -1,10 +1,11 @@
 use public_rules_mcp::{
-    FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig, ServerTransport, TransportArgs, VectorConfig,
-    GET_ANNEX_TOOL, GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LIST_RULES_TOOL,
-    SEARCH_RULES_TOOL, STATUS_TOOL,
+    CompareRulesResult, FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig,
+    ServerTransport, TransportArgs, VectorConfig, COMPARE_RULES_TOOL, GET_ANNEX_TOOL,
+    GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LABOR_COMPARE_PROMPT,
+    LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
 };
 use rmcp::{
-    model::{CallToolRequestParams, ClientInfo, ContentBlock},
+    model::{CallToolRequestParams, ClientInfo, ContentBlock, GetPromptRequestParams},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
@@ -38,6 +39,12 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     let url = format!("http://{addr}/mcp");
 
     let client = connect_with_retry(&url).await?;
+    let peer_info = client
+        .peer_info()
+        .ok_or_else(|| anyhow::anyhow!("server handshake info missing"))?;
+    assert!(peer_info.capabilities.tools.is_some());
+    assert!(peer_info.capabilities.prompts.is_some());
+
     let tool_names = client
         .list_all_tools()
         .await?
@@ -47,6 +54,7 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     assert_eq!(
         tool_names,
         BTreeSet::from([
+            COMPARE_RULES_TOOL.to_string(),
             SEARCH_RULES_TOOL.to_string(),
             GET_ARTICLE_TOOL.to_string(),
             LIST_RULES_TOOL.to_string(),
@@ -56,6 +64,47 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
             GET_SOURCE_PAGE_TOOL.to_string(),
         ])
     );
+
+    let prompts = client.list_all_prompts().await?;
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name.as_str(), LABOR_COMPARE_PROMPT);
+
+    let prompt_arguments = serde_json::json!({
+        "topic": "육아휴직",
+        "target_institution": "cni",
+        "institutions": "cni,ctp",
+        "query_variants": "육아 휴직,부모 휴직"
+    })
+    .as_object()
+    .expect("prompt arguments must be an object")
+    .clone();
+    let prompt_result = client
+        .get_prompt(
+            GetPromptRequestParams::new(LABOR_COMPARE_PROMPT).with_arguments(prompt_arguments),
+        )
+        .await?;
+    let prompt_text = prompt_result
+        .messages
+        .iter()
+        .find_map(|message| match &message.content {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("labor_compare prompt did not include text content"))?;
+    assert!(prompt_text.contains("주제: 육아휴직"));
+    assert!(prompt_text.contains("우리 기관(target_institution): cni"));
+    assert!(prompt_text.contains("대조 기관(institutions, 쉼표 구분): cni,ctp"));
+    assert!(prompt_text.contains("검색 변형(query_variants, 쉼표 구분): 육아 휴직,부모 휴직"));
+    let missing_required = serde_json::json!({ "topic": "육아휴직" })
+        .as_object()
+        .expect("prompt arguments must be an object")
+        .clone();
+    assert!(client
+        .get_prompt(
+            GetPromptRequestParams::new(LABOR_COMPARE_PROMPT).with_arguments(missing_required),
+        )
+        .await
+        .is_err());
 
     let arguments = serde_json::from_value(serde_json::json!({
         "query": "항공운임",
@@ -71,6 +120,25 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     assert!(!search_result.hits.is_empty());
     assert_eq!(search_result.hits[0].article_id, "여비지급규칙#제12조");
     assert_freshness_meta(search_result.meta);
+
+    let arguments = serde_json::from_value(serde_json::json!({
+        "topic": "항공운임",
+        "institutions": ["cni"]
+    }))?;
+    let result = client
+        .call_tool(CallToolRequestParams::new(COMPARE_RULES_TOOL).with_arguments(arguments))
+        .await?;
+    assert_ne!(result.is_error, Some(true));
+
+    let payload = tool_result_json(result)?;
+    let compare_result: CompareRulesResult = serde_json::from_value(payload)?;
+    assert_eq!(compare_result.topic, "항공운임");
+    assert_eq!(compare_result.institutions.len(), 1);
+    assert_eq!(compare_result.institutions[0].institution, "cni");
+    assert!(compare_result.institutions[0]
+        .provisions
+        .iter()
+        .any(|provision| provision.id == "여비지급규칙#제12조"));
 
     let result = client
         .call_tool(CallToolRequestParams::new(STATUS_TOOL))
@@ -88,7 +156,7 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
     let log_text = fs::read_to_string(query_log_path)?;
     let events = log_text
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line))
+        .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()?;
     let search_event = events
         .iter()

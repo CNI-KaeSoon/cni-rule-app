@@ -2138,8 +2138,8 @@ fn query_terms(q: &str) -> Vec<String> {
 fn rule_query_terms(terms: &[String]) -> Vec<String> {
     terms
         .iter()
-        .cloned()
         .filter(|term| looks_like_rule_name(term))
+        .cloned()
         .collect()
 }
 

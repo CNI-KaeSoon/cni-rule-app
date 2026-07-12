@@ -6,7 +6,7 @@ use rules_core::{
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
@@ -341,11 +341,7 @@ fn selected_indexes_for_query<'a>(
     }
 }
 
-fn institution_aliases(
-    institution: &str,
-    path: &PathBuf,
-    index: &TantivyRulesIndex,
-) -> Vec<String> {
+fn institution_aliases(institution: &str, path: &Path, index: &TantivyRulesIndex) -> Vec<String> {
     let mut aliases = Vec::<String>::new();
     push_alias(&mut aliases, institution);
     push_alias(&mut aliases, &index.status().institution);
@@ -358,11 +354,11 @@ fn institution_aliases(
     aliases
 }
 
-fn institution_label_from_pack_path(path: &PathBuf, institution: &str) -> Option<String> {
+fn institution_label_from_pack_path(path: &Path, institution: &str) -> Option<String> {
     let root = if path.file_name().and_then(|name| name.to_str()) == Some("articles") {
         path.parent().unwrap_or(path).to_path_buf()
     } else {
-        path.clone()
+        path.to_path_buf()
     };
     let text = std::fs::read_to_string(root.join("graph/nodes.jsonl")).ok()?;
     text.lines()
