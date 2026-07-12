@@ -389,3 +389,33 @@ def test_analyze_qlogs_groups_normalized_questions_and_miss_candidates(tmp_path)
     assert "## 실검색 Miss 후보" in rendered
     assert "육아휴직 규정 비교" in rendered
     assert "faq.json을 자동 생성하지 않습니다" in rendered
+
+
+def test_header_scan_toc_segments_code_indexed_rulebook():
+    # code-indexed TOC (no dotted leaders) on page 1; running headers on body pages.
+    from cni_rule_pipeline.pipeline import header_scan_toc
+
+    pages = {
+        1: "目 次\n1000. 정관\n1000\n2000. 인사규정\n2000\n2100. 보수규정\n2100\n",
+        2: "정관\n제1조(목적) 이 정관은 ...\n제2조(사무소) ...\n",
+        3: "인사규정\n제1조(목적) ...\n제2조(적용범위) ...\n",
+        4: "인사규정\n제3조(임용) ...\n",
+        5: "보수규정\n제1조(목적) ...\n",
+    }
+
+    result = header_scan_toc(pages)
+
+    assert result.profile == "header-scan"
+    assert [e.rule for e in result.entries] == ["정관", "인사규정", "보수규정"]
+    entries = {e.rule: e for e in result.entries}
+    assert entries["인사규정"].start_page == 3
+    assert entries["인사규정"].end_page == 4
+    assert entries["보수규정"].start_page == 5
+    assert entries["보수규정"].end_page == 5
+
+
+def test_canonical_name_strips_trailing_code_and_middots():
+    from cni_rule_pipeline.pipeline import canonical_name
+
+    assert canonical_name("공익신고처리및신고자보호등에관한시행내규3020") == "공익신고처리및신고자보호등에관한시행내규"
+    assert canonical_name("재산심의위원회구성‧운영에관한내규") == "재산심의위원회구성운영에관한내규"

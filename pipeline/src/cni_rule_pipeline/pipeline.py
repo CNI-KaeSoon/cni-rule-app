@@ -985,17 +985,87 @@ def render_annex_markdown(annex: Annex, config: BuildConfig = BuildConfig()) -> 
     return "\n".join(lines)
 
 
+RULE_NAME_SUFFIX_RE = re.compile(r"(규정|규칙|정관|조례|강령|지침|내규|기준|요령|준칙)$")
+HEADER_TOC_LINE_RE = re.compile(r"^\s*(?:○\s*)?\d{3,4}\.\s*(?P<title>\S.*?)\s*$")
+
+
+def canonical_name(value: str) -> str:
+    value = normalize_spaces(value)
+    value = re.sub(r"\d{2,4}\s*$", "", value)
+    return re.sub(r"[\s·ㆍ․‧･∙・()（）]+", "", value).strip()
+
+
+def collect_header_scan_names(pages: dict[int, str], scan_pages: int = 10) -> dict[str, str]:
+    """Ordered map of canonical->display rule names harvested from a code-indexed TOC."""
+    names: dict[str, str] = {}
+    for page_no in range(1, min(max(pages), scan_pages) + 1):
+        for line in pages.get(page_no, "").splitlines():
+            match = HEADER_TOC_LINE_RE.match(normalize_spaces(line))
+            if not match:
+                continue
+            title = re.sub(r"\d{2,4}\s*$", "", match.group("title")).strip()
+            if not RULE_NAME_SUFFIX_RE.search(canonical_name(title)):
+                continue
+            key = canonical_name(title)
+            if key and key not in names:
+                names[key] = title
+    return names
+
+
+def page_header(text: str) -> str:
+    for line in text.splitlines():
+        line = normalize_spaces(line).strip()
+        if line:
+            return line
+    return ""
+
+
+def header_scan_toc(pages: dict[int, str]) -> TocParseResult:
+    valid = collect_header_scan_names(pages)
+    max_page = max(pages)
+    entries: list[TocEntry] = []
+    current: str | None = None
+    start_page = 0
+    order = 0
+    for page_no in range(1, max_page + 1):
+        key = canonical_name(page_header(pages.get(page_no, "")))
+        if key in valid and key != current:
+            if current is not None:
+                order += 1
+                entries.append(
+                    TocEntry(code=f"header-{order:03d}", rule=valid[current], start_page=start_page, end_page=page_no - 1)
+                )
+            current = key
+            start_page = page_no
+    if current is not None:
+        order += 1
+        entries.append(
+            TocEntry(code=f"header-{order:03d}", rule=valid[current], start_page=start_page, end_page=max_page)
+        )
+    return TocParseResult(entries=entries, profile="header-scan", match_count=len(valid), toc_pages=())
+
+
 def build(
     pdf_path: Path,
     output_dir: Path,
     config: BuildConfig = BuildConfig(),
     toc_pages: Iterable[int] | None = (3, 4, 5),
+    header_scan: bool = False,
+    single_rule: str | None = None,
 ) -> BuildResult:
     doc = fitz.open(pdf_path)
     pages = read_pages(doc)
     prepare_output_tree(output_dir)
     write_page_sidecars(pages, output_dir)
-    toc_result = parse_toc_with_profile(pages, toc_pages=toc_pages)
+    if single_rule:
+        toc_result = TocParseResult(
+            entries=[TocEntry(code="single-001", rule=single_rule, start_page=1, end_page=max(pages))],
+            profile="single-rule", match_count=1, toc_pages=(),
+        )
+    elif header_scan:
+        toc_result = header_scan_toc(pages)
+    else:
+        toc_result = parse_toc_with_profile(pages, toc_pages=toc_pages)
     rules = toc_result.entries
     if not rules:
         raise ValueError(
@@ -1380,15 +1450,21 @@ def render_qa_json(result: BuildResult, pdf_path: Path) -> dict[str, object]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     root = project_root()
     parser = argparse.ArgumentParser(description="Build CNI rule Markdown files from the PDF rule book.")
-    parser.add_argument("--pdf", type=Path, default=default_pdf_path(root))
+    parser.add_argument("--pdf", type=Path, default=None)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--institution", default=INSTITUTION)
     parser.add_argument("--institution-name", default=INSTITUTION_NAME)
     parser.add_argument("--effective-date", type=parse_effective_date, default=SOURCE_EFFECTIVE_DATE)
     parser.add_argument("--footer", action="append", default=[])
     parser.add_argument("--toc-pages", type=parse_page_range)
+    parser.add_argument("--header-scan", action="store_true",
+                        help="segment rules by per-page running headers (code-indexed TOCs without dotted leaders)")
+    parser.add_argument("--single-rule", metavar="RULE_NAME",
+                        help="treat the whole PDF as one regulation (e.g. a standalone 정관)")
     parser.add_argument("--source-url")
     args = parser.parse_args(argv)
+    if args.pdf is None:
+        args.pdf = default_pdf_path(root)
     if args.output is None:
         base_output = root / "04_data" / "90_index-build"
         args.output = base_output if args.institution == INSTITUTION else base_output / args.institution
@@ -1409,7 +1485,7 @@ def main(argv: list[str] | None = None) -> int:
         source_url=args.source_url,
     )
     try:
-        result = build(args.pdf.resolve(), args.output.resolve(), config=config, toc_pages=args.toc_pages)
+        result = build(args.pdf.resolve(), args.output.resolve(), config=config, toc_pages=args.toc_pages, header_scan=args.header_scan, single_rule=args.single_rule)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
