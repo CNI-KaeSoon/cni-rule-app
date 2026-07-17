@@ -19,6 +19,7 @@ use rules_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -55,6 +56,37 @@ pub enum ServerTransport {
     Http,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthToken(Arc<str>);
+
+impl AuthToken {
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("authentication token must not be empty"));
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        }) {
+            return Err(anyhow::anyhow!(
+                "authentication token contains invalid bearer-token characters"
+            ));
+        }
+        Ok(Self(value.into()))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthToken([REDACTED])")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CliArgs {
     pub config_path: PathBuf,
@@ -62,6 +94,7 @@ pub struct CliArgs {
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub query_log_path: Option<PathBuf>,
+    pub auth_token: Option<AuthToken>,
     pub extra_packs: Vec<ExtraPackConfig>,
 }
 
@@ -71,6 +104,7 @@ pub struct TransportArgs {
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub query_log_path: Option<PathBuf>,
+    pub auth_token: Option<AuthToken>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1811,6 +1845,18 @@ pub async fn run_http_server_with_options(
     extra_allowed_hosts: Vec<String>,
     query_log_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    run_http_server_with_auth_options(config, bind_addr, extra_allowed_hosts, query_log_path, None)
+        .await
+}
+
+pub async fn run_http_server_with_auth_options(
+    config: ServerConfig,
+    bind_addr: SocketAddr,
+    extra_allowed_hosts: Vec<String>,
+    query_log_path: Option<PathBuf>,
+    auth_token: Option<AuthToken>,
+) -> anyhow::Result<()> {
+    validate_http_auth_configuration(bind_addr, auth_token.as_ref())?;
     let server = PublicRulesServer::from_config(config)?;
     let server = if let Some(logger) = optional_query_logger(query_log_path) {
         server.with_query_logger(logger)
@@ -1821,14 +1867,25 @@ pub async fn run_http_server_with_options(
     let mut http_config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
         .with_cancellation_token(cancellation_token.child_token());
+    let mut allowed_hosts = http_config.allowed_hosts.clone();
     if !extra_allowed_hosts.is_empty() {
-        let mut allowed_hosts = default_allowed_hosts();
         allowed_hosts.extend(extra_allowed_hosts);
-        http_config = http_config.with_allowed_hosts(allowed_hosts);
+        http_config = http_config.with_allowed_hosts(allowed_hosts.clone());
     }
     let service: StreamableHttpService<PublicRulesServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(server.clone()), Default::default(), http_config);
     let router = axum::Router::new().nest_service("/mcp", service);
+    let router = if let Some(auth_token) = auth_token {
+        router.layer(axum::middleware::from_fn_with_state(
+            BearerAuthState {
+                auth_token,
+                allowed_hosts,
+            },
+            require_bearer_auth,
+        ))
+    } else {
+        router
+    };
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     axum::serve(listener, router)
@@ -1852,6 +1909,7 @@ pub async fn run_server(
             bind_addr,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            auth_token: None,
         },
     )
     .await
@@ -1866,15 +1924,136 @@ pub async fn run_server_with_transport_args(
             run_stdio_server_with_query_log(config, args.query_log_path).await
         }
         ServerTransport::Http => {
-            run_http_server_with_options(
+            run_http_server_with_auth_options(
                 config,
                 args.bind_addr,
                 args.allowed_hosts,
                 args.query_log_path,
+                args.auth_token,
             )
             .await
         }
     }
+}
+
+#[derive(Clone)]
+struct BearerAuthState {
+    auth_token: AuthToken,
+    allowed_hosts: Vec<String>,
+}
+
+async fn require_bearer_auth(
+    axum::extract::State(state): axum::extract::State<BearerAuthState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+
+    match request_host_is_allowed(request.uri(), request.headers(), &state.allowed_hosts) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    }
+
+    let authorization_values = request.headers().get_all(header::AUTHORIZATION);
+    let mut authorization_values = authorization_values.iter();
+    let supplied = authorization_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let has_single_value = authorization_values.next().is_none();
+
+    if has_single_value
+        && supplied.is_some_and(|value| {
+            constant_time_eq(value.as_bytes(), state.auth_token.expose().as_bytes())
+        })
+    {
+        return next.run(request).await;
+    }
+
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+#[derive(PartialEq, Eq)]
+struct NormalizedAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+fn normalize_authority(host: &str, port: Option<u16>) -> NormalizedAuthority {
+    NormalizedAuthority {
+        host: host
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_ascii_lowercase(),
+        port,
+    }
+}
+
+fn parse_allowed_authority(allowed: &str) -> Option<NormalizedAuthority> {
+    let allowed = allowed.trim();
+    if allowed.is_empty() {
+        return None;
+    }
+    if let Ok(authority) = axum::http::uri::Authority::try_from(allowed) {
+        return Some(normalize_authority(authority.host(), authority.port_u16()));
+    }
+    Some(normalize_authority(allowed, None))
+}
+
+fn request_host_is_allowed(
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+    allowed_hosts: &[String],
+) -> Result<bool, ()> {
+    if allowed_hosts.is_empty() {
+        return Ok(true);
+    }
+    let authority = if let Some(host) = headers.get(axum::http::header::HOST) {
+        let host = host.to_str().map_err(|_| ())?;
+        axum::http::uri::Authority::try_from(host).map_err(|_| ())?
+    } else {
+        uri.authority().cloned().ok_or(())?
+    };
+    let requested = normalize_authority(authority.host(), authority.port_u16());
+    Ok(allowed_hosts
+        .iter()
+        .filter_map(|allowed| parse_allowed_authority(allowed))
+        .any(|allowed| {
+            allowed.host == requested.host
+                && match allowed.port {
+                    Some(port) => requested.port == Some(port),
+                    None => true,
+                }
+        }))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let width = left.len().max(right.len());
+    for index in 0..width {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+fn validate_http_auth_configuration(
+    bind_addr: SocketAddr,
+    auth_token: Option<&AuthToken>,
+) -> anyhow::Result<()> {
+    if !bind_addr.ip().is_loopback() && auth_token.is_none() {
+        return Err(anyhow::anyhow!(
+            "HTTP authentication is required for a non-loopback --bind address"
+        ));
+    }
+    Ok(())
 }
 
 pub async fn run_stdio_server_from_toml(toml_text: &str) -> anyhow::Result<()> {
@@ -1920,6 +2099,7 @@ where
         bind_addr: transport_args.bind_addr,
         allowed_hosts: transport_args.allowed_hosts,
         query_log_path: transport_args.query_log_path,
+        auth_token: transport_args.auth_token,
         extra_packs,
     })
 }
@@ -1975,6 +2155,21 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--query-log requires <path>"))?,
             );
         }
+        "--auth-token" => {
+            reject_duplicate_auth_configuration(transport_args)?;
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--auth-token requires <value>"))?;
+            transport_args.auth_token = Some(AuthToken::new(value)?);
+        }
+        "--auth-token-file" => {
+            reject_duplicate_auth_configuration(transport_args)?;
+            let path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("--auth-token-file requires <path>"))?;
+            transport_args.auth_token = Some(read_auth_token_file(&path)?);
+        }
         _ => return Err(anyhow::anyhow!("unknown argument: {arg}")),
     }
     Ok(())
@@ -1989,8 +2184,49 @@ impl Default for TransportArgs {
                 .expect("default HTTP bind address must be valid"),
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            auth_token: None,
         }
     }
+}
+
+fn reject_duplicate_auth_configuration(transport_args: &TransportArgs) -> anyhow::Result<()> {
+    if transport_args.auth_token.is_some() {
+        return Err(anyhow::anyhow!(
+            "authentication token may be configured only once"
+        ));
+    }
+    Ok(())
+}
+
+fn read_auth_token_file(path: &Path) -> anyhow::Result<AuthToken> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect --auth-token-file {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(anyhow::anyhow!(
+            "--auth-token-file must be a regular, non-symlink file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(anyhow::anyhow!(
+                "--auth-token-file must have mode 0600: {}",
+                path.display()
+            ));
+        }
+    }
+    let value = fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!("cannot read --auth-token-file {}: {error}", path.display())
+    })?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    AuthToken::new(value.to_string())
 }
 
 fn parse_transport(value: String) -> anyhow::Result<ServerTransport> {
@@ -2033,10 +2269,6 @@ fn parse_extra_pack_arg(value: &str) -> anyhow::Result<ExtraPackConfig> {
             ..PackConfig::default()
         },
     })
-}
-
-fn default_allowed_hosts() -> Vec<String> {
-    StreamableHttpServerConfig::default().allowed_hosts
 }
 
 #[cfg(unix)]
@@ -2681,6 +2913,92 @@ table_structured: true
             args.query_log_path.as_deref(),
             Some(Path::new("/tmp/public-rules-query.jsonl"))
         );
+    }
+
+    #[test]
+    fn auth_token_debug_output_is_redacted() {
+        let secret = format!("sensitive-{}-fixture", std::process::id());
+        let token = AuthToken::new(secret.clone()).expect("fixture token must be valid");
+        let args = TransportArgs {
+            auth_token: Some(token.clone()),
+            ..TransportArgs::default()
+        };
+
+        assert!(!format!("{token:?}").contains(&secret));
+        assert!(!format!("{args:?}").contains(&secret));
+        assert!(format!("{token:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn parse_transport_args_accepts_direct_auth_token_without_exposing_it() {
+        let secret = format!("direct-{}-fixture", std::process::id());
+        let args = parse_transport_args(["--auth-token", secret.as_str()])
+            .expect("direct auth token must parse");
+
+        assert!(args.auth_token.is_some());
+        assert!(!format!("{args:?}").contains(&secret));
+    }
+
+    #[test]
+    fn parse_transport_args_does_not_echo_invalid_auth_token() {
+        let invalid_secret = format!("invalid:{}:fixture", std::process::id());
+        let error = parse_transport_args(["--auth-token", invalid_secret.as_str()])
+            .expect_err("invalid auth token must fail")
+            .to_string();
+
+        assert!(!error.contains(&invalid_secret));
+    }
+
+    #[test]
+    fn parse_transport_args_rejects_missing_auth_token_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "public-rules-mcp-missing-token-{}",
+            unix_epoch_ms()
+        ));
+        let error = parse_transport_args(["--auth-token-file", missing.to_string_lossy().as_ref()])
+            .expect_err("missing auth token file must fail")
+            .to_string();
+
+        assert!(error.contains("cannot inspect --auth-token-file"));
+    }
+
+    #[test]
+    fn parse_transport_args_rejects_empty_auth_token_file() {
+        let path = write_auth_token_fixture("empty", "\n", 0o600);
+        let error = parse_transport_args(["--auth-token-file", path.to_string_lossy().as_ref()])
+            .expect_err("empty auth token file must fail")
+            .to_string();
+
+        assert!(error.contains("authentication token must not be empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_transport_args_rejects_insecure_auth_token_file_permissions() {
+        let path = write_auth_token_fixture("insecure", "not-a-real-secret\n", 0o644);
+        let error = parse_transport_args(["--auth-token-file", path.to_string_lossy().as_ref()])
+            .expect_err("insecure auth token file permissions must fail")
+            .to_string();
+
+        assert!(error.contains("must have mode 0600"));
+    }
+
+    fn write_auth_token_fixture(label: &str, content: &str, mode: u32) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "public-rules-mcp-{label}-token-{}-{}",
+            std::process::id(),
+            unix_epoch_ms()
+        ));
+        fs::write(&path, content).expect("fixture token file must be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("fixture token permissions must be set");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
     }
 
     #[test]

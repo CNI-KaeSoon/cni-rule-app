@@ -11,6 +11,7 @@ async fn main() -> anyhow::Result<()> {
             bind_addr: args.bind_addr,
             allowed_hosts: args.allowed_hosts,
             query_log_path: args.query_log_path,
+            auth_token: args.auth_token,
         },
     )
     .await

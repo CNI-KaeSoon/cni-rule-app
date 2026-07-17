@@ -1,5 +1,5 @@
 use public_rules_mcp::{
-    CompareRulesResult, FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig,
+    AuthToken, CompareRulesResult, FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig,
     ServerTransport, TransportArgs, VectorConfig, COMPARE_RULES_TOOL, GET_ANNEX_TOOL,
     GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LABOR_COMPARE_PROMPT,
     LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
@@ -34,6 +34,7 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: Some(query_log_path.clone()),
+            auth_token: None,
         },
     ));
     let url = format!("http://{addr}/mcp");
@@ -207,6 +208,7 @@ async fn streamable_http_searches_multiple_packs_with_institution_labels() -> an
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            auth_token: None,
         },
     ));
     let url = format!("http://{addr}/mcp");
@@ -272,16 +274,107 @@ async fn streamable_http_allows_configured_host_header() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn streamable_http_enforces_bearer_auth_and_preserves_host_validation() -> anyhow::Result<()>
+{
+    let fixture_root = make_fixture_pack()?;
+    let query_log_path = fixture_root.join("auth-query-log.jsonl");
+    let addr = unused_loopback_addr().await?;
+    let token = format!(
+        "fixture-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let server_handle = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        fixture_config(fixture_root),
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: Vec::new(),
+            query_log_path: Some(query_log_path.clone()),
+            auth_token: Some(AuthToken::new(token.clone())?),
+        },
+    ));
+
+    assert_eq!(
+        raw_mcp_initialize_status(addr, "127.0.0.1", None).await?,
+        401
+    );
+    assert_eq!(
+        raw_mcp_initialize_status(addr, "127.0.0.1", Some("wrong-token")).await?,
+        401
+    );
+    assert_eq!(
+        raw_mcp_initialize_status(addr, "127.0.0.1", Some(&token)).await?,
+        200
+    );
+    assert_eq!(
+        raw_mcp_initialize_status(addr, "evil.example.com", Some(&token)).await?,
+        403
+    );
+    assert_eq!(
+        raw_mcp_initialize_status(addr, "evil.example.com", None).await?,
+        403
+    );
+
+    let url = format!("http://{addr}/mcp");
+    let client = connect_with_retry_auth(&url, Some(&token)).await?;
+    let result = client
+        .call_tool(CallToolRequestParams::new(STATUS_TOOL))
+        .await?;
+    assert_ne!(result.is_error, Some(true));
+    client.cancel().await?;
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    let query_log = fs::read_to_string(query_log_path)?;
+    assert!(!query_log.contains(&token));
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamable_http_rejects_non_loopback_bind_without_auth() -> anyhow::Result<()> {
+    let fixture_root = make_fixture_pack()?;
+    let error = public_rules_mcp::run_server_with_transport_args(
+        fixture_config(fixture_root),
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: "0.0.0.0:0".parse()?,
+            allowed_hosts: Vec::new(),
+            query_log_path: None,
+            auth_token: None,
+        },
+    )
+    .await
+    .expect_err("non-loopback HTTP must fail closed without authentication");
+
+    assert!(error
+        .to_string()
+        .contains("authentication is required for a non-loopback"));
+    Ok(())
+}
+
 async fn connect_with_retry(
     url: &str,
 ) -> anyhow::Result<
     rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
 > {
+    connect_with_retry_auth(url, None).await
+}
+
+async fn connect_with_retry_auth(
+    url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
+> {
     let mut last_error = None;
     for _ in 0..20 {
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(url.to_string()),
-        );
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        if let Some(token) = bearer_token {
+            config = config.auth_header(token.to_string());
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
         match ClientInfo::default().serve(transport).await {
             Ok(client) => return Ok(client),
             Err(error) => {
@@ -325,13 +418,38 @@ async fn unused_loopback_addr() -> anyhow::Result<SocketAddr> {
 }
 
 async fn raw_mcp_post_status(addr: SocketAddr, host: &str) -> anyhow::Result<u16> {
+    raw_http_post_status(addr, host, "{}", None).await
+}
+
+async fn raw_mcp_initialize_status(
+    addr: SocketAddr,
+    host: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<u16> {
+    raw_http_post_status(
+        addr,
+        host,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"auth-test","version":"1"}}}"#,
+        bearer_token,
+    )
+    .await
+}
+
+async fn raw_http_post_status(
+    addr: SocketAddr,
+    host: &str,
+    body: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<u16> {
     let mut last_error = None;
     for _ in 0..20 {
         match tokio::net::TcpStream::connect(addr).await {
             Ok(mut stream) => {
-                let body = "{}";
+                let authorization = bearer_token
+                    .map(|token| format!("Authorization: Bearer {token}\r\n"))
+                    .unwrap_or_default();
                 let request = format!(
-                    "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{authorization}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(request.as_bytes()).await?;
