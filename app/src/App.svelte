@@ -685,7 +685,7 @@
             <span class="banner-arrow">→</span>
           </button>
           <div class="suggestion-grid">
-            {#each ["연차휴가 이월 기준은?", "국내 출장 일비는 얼마인가요?", "육아휴직 중 보수는?", "겸직 허가 절차는?"] as suggestion}
+            {#each ["연차휴가 이월 기준은?", "국내 출장 교통비는 얼마인가요?", "육아휴직 중 보수는?", "겸직 허가 절차는?"] as suggestion}
               <button class="suggestion-card" on:click={() => (prompt = suggestion)}><span class="s-icon">✦</span><span class="s-text">{suggestion}</span></button>
             {/each}
           </div>

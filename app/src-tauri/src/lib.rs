@@ -1838,13 +1838,13 @@ mod tests {
         let graph_dir = root.join("graph");
         fs::create_dir_all(&articles_dir).expect("articles dir");
         fs::create_dir_all(&graph_dir).expect("graph dir");
-        let article = "---\ninstitution: cni\nrule: 여비지급규칙\narticle: 제12조\ntitle: 항공운임\neffective: 2026-02-27\namended: 2026-02-27\nstatus: active\nsupersedes: null\nlegal_basis: []\nrefs: []\n---\n① 항공운임과 출장 일비를 지급한다.\n";
+        let article = "---\ninstitution: cni\nrule: 출장지급규칙\narticle: 제12조\ntitle: 항공운임\neffective: 2026-02-27\namended: 2026-02-27\nstatus: active\nsupersedes: null\nlegal_basis: []\nrefs: []\n---\n① 항공운임과 출장 교통비를 지급한다.\n";
         fs::write(articles_dir.join("제12조.md"), article).expect("article");
         fs::write(graph_dir.join("nodes.jsonl"), "").expect("nodes");
         fs::write(graph_dir.join("edges.jsonl"), "").expect("edges");
         fs::write(
             root.join("manifest.json"),
-            r#"{"schema_version":1,"institution":"cni","effective_date":"2026-02-27","source_commit":"fixture123","created_at":"2026-07-02T00:00:00Z","files":{"articles/제12조.md":"0acc659ccebcd54042d6544e503a23080a7e2c752618629b50d7ef5377181044","graph/nodes.jsonl":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","graph/edges.jsonl":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}"#,
+            r#"{"schema_version":1,"institution":"cni","effective_date":"2026-02-27","source_commit":"fixture123","created_at":"2026-07-02T00:00:00Z","files":{"articles/제12조.md":"73e95310650ceacd0f1d38b1afcc5ad06abbf5762a3f2cb023bef1adabcf8afa","graph/nodes.jsonl":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","graph/edges.jsonl":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}"#,
         )
         .expect("manifest");
     }
@@ -1869,7 +1869,8 @@ mod tests {
         let state = test_state_with_rules_dir(data_dir.path(), None);
 
         let status = install_index_from_pack_dir(&state, pack_dir.path()).expect("install pack");
-        let hits = with_index(&state, |index| index.search("출장 일비", 5, None)).expect("search");
+        let hits =
+            with_index(&state, |index| index.search("출장 교통비", 5, None)).expect("search");
 
         assert!(status.installed);
         assert_eq!(status.source_commit, "fixture123");
@@ -1878,7 +1879,7 @@ mod tests {
             pack_dir.path().join("articles")
         );
         assert!(!hits.is_empty());
-        assert_eq!(hits[0].article_id, "여비지급규칙#제12조");
+        assert_eq!(hits[0].article_id, "출장지급규칙#제12조");
     }
 
     #[test]
@@ -2026,12 +2027,12 @@ mod tests {
             mode: Mode::Interpret,
             messages: vec![Msg {
                 role: "user".to_string(),
-                content: "출장 일비".to_string(),
+                content: "출장 교통비".to_string(),
             }],
             context: vec![ContextBlock {
                 id: "여비규정#제12조".to_string(),
-                title: "제12조 일비".to_string(),
-                body: "일비를 지급한다.".to_string(),
+                title: "제12조 교통비".to_string(),
+                body: "교통비를 지급한다.".to_string(),
                 source: "fixture".to_string(),
             }],
         };
@@ -2053,8 +2054,8 @@ mod tests {
     fn citations_are_extracted_from_streamed_content() {
         let context = vec![ContextBlock {
             id: "여비규정#제12조".to_string(),
-            title: "제12조 일비".to_string(),
-            body: "일비를 지급한다.".to_string(),
+            title: "제12조 교통비".to_string(),
+            body: "교통비를 지급한다.".to_string(),
             source: "fixture".to_string(),
         }];
 
@@ -2070,7 +2071,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("data dir");
         set_question_telemetry_settings(&db, false, None).expect("settings");
 
-        record_question_if_allowed(&db, data_dir.path(), &Mode::Interpret, "출장 일비는?")
+        record_question_if_allowed(&db, data_dir.path(), &Mode::Interpret, "출장 교통비는?")
             .expect("record");
 
         assert!(!local_question_log_path(data_dir.path()).exists());
@@ -2128,7 +2129,7 @@ mod tests {
         )
         .expect("settings");
 
-        record_question_if_allowed(&db, data_dir.path(), &Mode::Interpret, "출장 일비는?")
+        record_question_if_allowed(&db, data_dir.path(), &Mode::Interpret, "출장 교통비는?")
             .expect("record");
 
         let synced = shared_dir
@@ -2151,7 +2152,7 @@ mod tests {
         NewAnswerTrace {
             message_id,
             conversation_id,
-            search_query: "출장 일비".to_string(),
+            search_query: "출장 교통비".to_string(),
             search_results: vec![SearchTraceHit {
                 article_id: "여비규정#제12조".to_string(),
                 score: 3.5,
@@ -2211,7 +2212,7 @@ mod tests {
         set_question_telemetry_settings(&db, true, Some(shared_dir.path().display().to_string()))
             .expect("settings");
         let conversation = seeded_conversation(&db);
-        db.add_message(&conversation.id, "user", "출장 일비는?")
+        db.add_message(&conversation.id, "user", "출장 교통비는?")
             .expect("question");
         let answer = db
             .add_message(
@@ -2236,7 +2237,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(export.local_path).expect("json"))
                 .expect("parse");
         assert_eq!(saved["reason"], "답변이 틀림");
-        assert_eq!(saved["question"], "출장 일비는?");
+        assert_eq!(saved["question"], "출장 교통비는?");
     }
 
     #[test]
