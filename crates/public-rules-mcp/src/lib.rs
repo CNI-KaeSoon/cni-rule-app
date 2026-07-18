@@ -1892,6 +1892,7 @@ pub async fn run_http_server_with_auth_options(
     let cancellation_token = CancellationToken::new();
     let mut http_config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
+        .with_json_response(true)
         .with_cancellation_token(cancellation_token.child_token());
     let mut allowed_hosts = http_config.allowed_hosts.clone();
     if !extra_allowed_hosts.is_empty() {
@@ -1905,13 +1906,17 @@ pub async fn run_http_server_with_auth_options(
         router.layer(axum::middleware::from_fn_with_state(
             BearerAuthState {
                 auth_token,
-                allowed_hosts,
+                allowed_hosts: allowed_hosts.clone(),
             },
             require_bearer_auth,
         ))
     } else {
         router
     };
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        McpCompatibilityState { allowed_hosts },
+        provide_mcp_get_info,
+    ));
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     axum::serve(listener, router)
@@ -1966,6 +1971,37 @@ pub async fn run_server_with_transport_args(
 struct BearerAuthState {
     auth_token: AuthToken,
     allowed_hosts: Vec<String>,
+}
+
+#[derive(Clone)]
+struct McpCompatibilityState {
+    allowed_hosts: Vec<String>,
+}
+
+async fn provide_mcp_get_info(
+    axum::extract::State(state): axum::extract::State<McpCompatibilityState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+
+    if request.method() != Method::GET || request.uri().path() != "/mcp" {
+        return next.run(request).await;
+    }
+    match request_host_is_allowed(request.uri(), request.headers(), &state.allowed_hosts) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+    }
+    axum::Json(serde_json::json!({
+        "name": "public-rules-mcp",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": ProtocolVersion::V_2025_03_26.as_str(),
+        "endpoint": "/mcp",
+        "tools": 8,
+    }))
+    .into_response()
 }
 
 async fn require_bearer_auth(

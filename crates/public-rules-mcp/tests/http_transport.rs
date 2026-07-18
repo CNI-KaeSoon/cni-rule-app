@@ -283,6 +283,17 @@ async fn streamable_http_negotiates_known_version_across_full_handshake() -> any
         addr,
     ));
 
+    let info = raw_http_get_response(addr, "127.0.0.1").await?;
+    assert_eq!(http_status(&info)?, 200);
+    assert_eq!(
+        header_value(&info, "content-type"),
+        Some("application/json")
+    );
+    assert_eq!(
+        response_json(&info)?.get("protocol"),
+        Some(&serde_json::Value::String("2025-03-26".to_string()))
+    );
+
     let initialize = raw_http_post_response(
         addr,
         "127.0.0.1",
@@ -292,7 +303,11 @@ async fn streamable_http_negotiates_known_version_across_full_handshake() -> any
     )
     .await?;
     assert_eq!(http_status(&initialize)?, 200);
-    let initialize_json = first_sse_json(&initialize)?;
+    assert_eq!(
+        header_value(&initialize, "content-type"),
+        Some("application/json")
+    );
+    let initialize_json = response_json(&initialize)?;
     assert_eq!(
         initialize_json.pointer("/result/protocolVersion"),
         Some(&serde_json::Value::String("2025-06-18".to_string()))
@@ -317,7 +332,11 @@ async fn streamable_http_negotiates_known_version_across_full_handshake() -> any
     )
     .await?;
     assert_eq!(http_status(&tools)?, 200);
-    let tools_json = first_sse_json(&tools)?;
+    assert_eq!(
+        header_value(&tools, "content-type"),
+        Some("application/json")
+    );
+    let tools_json = response_json(&tools)?;
     let tool_names = tools_json
         .pointer("/result/tools")
         .and_then(serde_json::Value::as_array)
@@ -355,6 +374,14 @@ async fn streamable_http_enforces_bearer_auth_and_preserves_host_validation() ->
         },
     ));
 
+    assert_eq!(
+        http_status(&raw_http_get_response(addr, "127.0.0.1").await?)?,
+        200
+    );
+    assert_eq!(
+        http_status(&raw_http_get_response(addr, "evil.example.com").await?)?,
+        403
+    );
     assert_eq!(
         raw_mcp_initialize_status(addr, "127.0.0.1", None).await?,
         401
@@ -542,6 +569,30 @@ async fn raw_http_post_response(
         .unwrap_or_else(|| anyhow::anyhow!("HTTP MCP server did not start")))
 }
 
+async fn raw_http_get_response(addr: SocketAddr, host: &str) -> anyhow::Result<String> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(mut stream) => {
+                let request = format!(
+                    "GET /mcp HTTP/1.1\r\nHost: {host}\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(request.as_bytes()).await?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await?;
+                return Ok(String::from_utf8(response)?);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("HTTP MCP server did not start")))
+}
+
 fn http_status(response: &str) -> anyhow::Result<u16> {
     response
         .lines()
@@ -552,16 +603,22 @@ fn http_status(response: &str) -> anyhow::Result<u16> {
         .map_err(anyhow::Error::from)
 }
 
-fn first_sse_json(response: &str) -> anyhow::Result<serde_json::Value> {
+fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn response_json(response: &str) -> anyhow::Result<serde_json::Value> {
     let body = response
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .ok_or_else(|| anyhow::anyhow!("HTTP response body missing"))?;
-    let data = body
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .ok_or_else(|| anyhow::anyhow!("SSE data event missing"))?;
-    Ok(serde_json::from_str(data)?)
+    if let Some(data) = body.lines().find_map(|line| line.strip_prefix("data: ")) {
+        return Ok(serde_json::from_str(data)?);
+    }
+    Ok(serde_json::from_str(body.trim())?)
 }
 
 fn fixture_config(fixture_root: std::path::PathBuf) -> ServerConfig {
