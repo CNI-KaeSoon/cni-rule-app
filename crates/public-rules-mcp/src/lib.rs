@@ -4,8 +4,13 @@ use rmcp::{
         wrapper::Json,
         wrapper::Parameters,
     },
-    model::{Implementation, PromptMessage, Role, ServerCapabilities, ServerInfo},
-    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+    model::{
+        Implementation, InitializeRequestParams, InitializeResult, PromptMessage, ProtocolVersion,
+        Role, ServerCapabilities, ServerInfo,
+    },
+    prompt, prompt_handler, prompt_router,
+    service::{RequestContext, RoleServer},
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
@@ -1760,6 +1765,27 @@ impl PublicRulesServer {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for PublicRulesServer {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        let requested_version = request.protocol_version.clone();
+        context.peer.set_peer_info(request);
+
+        let mut info = self.get_info();
+        let selected_version = if ProtocolVersion::KNOWN_VERSIONS.contains(&requested_version) {
+            requested_version.clone()
+        } else {
+            info.protocol_version.clone()
+        };
+        println!(
+            "mcp_initialize requested_protocol_version={requested_version} selected_protocol_version={selected_version}"
+        );
+        info.protocol_version = selected_version;
+        Ok(info)
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()

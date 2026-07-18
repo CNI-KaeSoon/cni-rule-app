@@ -275,6 +275,65 @@ async fn streamable_http_allows_configured_host_header() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn streamable_http_negotiates_known_version_across_full_handshake() -> anyhow::Result<()> {
+    let fixture_root = make_fixture_pack()?;
+    let addr = unused_loopback_addr().await?;
+    let server_handle = tokio::spawn(public_rules_mcp::run_http_server(
+        fixture_config(fixture_root),
+        addr,
+    ));
+
+    let initialize = raw_http_post_response(
+        addr,
+        "127.0.0.1",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"claude-compatible-test","version":"1"}}}"#,
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(http_status(&initialize)?, 200);
+    let initialize_json = first_sse_json(&initialize)?;
+    assert_eq!(
+        initialize_json.pointer("/result/protocolVersion"),
+        Some(&serde_json::Value::String("2025-06-18".to_string()))
+    );
+
+    let initialized = raw_http_post_response(
+        addr,
+        "127.0.0.1",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        Some("2025-06-18"),
+        None,
+    )
+    .await?;
+    assert_eq!(http_status(&initialized)?, 202);
+
+    let tools = raw_http_post_response(
+        addr,
+        "127.0.0.1",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        Some("2025-06-18"),
+        None,
+    )
+    .await?;
+    assert_eq!(http_status(&tools)?, 200);
+    let tools_json = first_sse_json(&tools)?;
+    let tool_names = tools_json
+        .pointer("/result/tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("tools/list response did not contain a tools array"))?
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    assert!(tool_names.contains(STATUS_TOOL));
+    assert!(tool_names.contains(COMPARE_RULES_TOOL));
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn streamable_http_enforces_bearer_auth_and_preserves_host_validation() -> anyhow::Result<()>
 {
     let fixture_root = make_fixture_pack()?;
@@ -441,6 +500,17 @@ async fn raw_http_post_status(
     body: &str,
     bearer_token: Option<&str>,
 ) -> anyhow::Result<u16> {
+    let response = raw_http_post_response(addr, host, body, None, bearer_token).await?;
+    http_status(&response)
+}
+
+async fn raw_http_post_response(
+    addr: SocketAddr,
+    host: &str,
+    body: &str,
+    protocol_version: Option<&str>,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<String> {
     let mut last_error = None;
     for _ in 0..20 {
         match tokio::net::TcpStream::connect(addr).await {
@@ -448,21 +518,18 @@ async fn raw_http_post_status(
                 let authorization = bearer_token
                     .map(|token| format!("Authorization: Bearer {token}\r\n"))
                     .unwrap_or_default();
+                let protocol_version = protocol_version
+                    .map(|version| format!("MCP-Protocol-Version: {version}\r\n"))
+                    .unwrap_or_default();
                 let request = format!(
-                    "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{authorization}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "POST /mcp HTTP/1.1\r\nHost: {host}\r\n{authorization}{protocol_version}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(request.as_bytes()).await?;
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).await?;
                 let response = String::from_utf8(response)?;
-                let status = response
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .ok_or_else(|| anyhow::anyhow!("HTTP response status line missing"))?
-                    .parse::<u16>()?;
-                return Ok(status);
+                return Ok(response);
             }
             Err(error) => {
                 last_error = Some(error);
@@ -473,6 +540,28 @@ async fn raw_http_post_status(
     Err(last_error
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow::anyhow!("HTTP MCP server did not start")))
+}
+
+fn http_status(response: &str) -> anyhow::Result<u16> {
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| anyhow::anyhow!("HTTP response status line missing"))?
+        .parse::<u16>()
+        .map_err(anyhow::Error::from)
+}
+
+fn first_sse_json(response: &str) -> anyhow::Result<serde_json::Value> {
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .ok_or_else(|| anyhow::anyhow!("HTTP response body missing"))?;
+    let data = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .ok_or_else(|| anyhow::anyhow!("SSE data event missing"))?;
+    Ok(serde_json::from_str(data)?)
 }
 
 fn fixture_config(fixture_root: std::path::PathBuf) -> ServerConfig {
