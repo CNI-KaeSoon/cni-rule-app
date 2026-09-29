@@ -273,6 +273,8 @@ pub struct VectorSearchOptions {
 pub struct SearchOptions {
     /// Apply the e5 model-card `passage:` / `query:` prefixes to both sides.
     pub e5_prefix: bool,
+    /// Part-of-speech filter / normalisation of the BM25 `ko` analyzer.
+    pub ko_pos_filter: KoPosFilter,
 }
 
 impl SearchOptions {
@@ -283,6 +285,64 @@ impl SearchOptions {
             PassageFormat::Legacy
         }
     }
+}
+
+/// BM25 analyzer variants (PRD PH-06). `None` is the legacy token stream.
+/// `V1` = NFKC + lowercase + particle/symbol stop tags; `V2` = `V1` plus
+/// verbal endings. Matching is exact on the first ko-dic feature, so compound
+/// tags such as `VV+EC` are intentionally kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KoPosFilter {
+    #[default]
+    None,
+    V1,
+    V2,
+}
+
+/// Stop tags of `V1`: case/particle markers and punctuation-like symbols.
+const KO_STOP_TAGS_V1: [&str; 15] = [
+    "JKS", "JKC", "JKG", "JKO", "JKB", "JKV", "JKQ", "JX", "JC", "SF", "SE", "SSO", "SSC", "SC",
+    "SY",
+];
+/// Additional stop tags of `V2`: pre-final, final, connective and
+/// nominalising/adnominal endings.
+const KO_STOP_TAGS_V2_EXTRA: [&str; 5] = ["EP", "EF", "EC", "ETN", "ETM"];
+
+impl KoPosFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KoPosFilter::None => "none",
+            KoPosFilter::V1 => "v1",
+            KoPosFilter::V2 => "v2",
+        }
+    }
+
+    /// Exact tag set removed by this variant (empty for `None`).
+    pub fn stop_tags(self) -> Vec<&'static str> {
+        match self {
+            KoPosFilter::None => Vec::new(),
+            KoPosFilter::V1 => KO_STOP_TAGS_V1.to_vec(),
+            KoPosFilter::V2 => KO_STOP_TAGS_V1
+                .iter()
+                .chain(KO_STOP_TAGS_V2_EXTRA.iter())
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+/// Which analyzer the BM25 index really uses; a dictionary load failure is
+/// reported here instead of silently changing behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TokenizerStatus {
+    /// `lindera-ko-dic` or `simple-fallback`.
+    pub kind: String,
+    /// Filter variant actually applied (`none` when the fallback is active).
+    pub filter: String,
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// How passage text is rendered before embedding. `Legacy` keeps the original
@@ -509,10 +569,22 @@ pub struct TantivyRulesIndex {
     rrf_k: usize,
     vector_weight: f32,
     search_options: SearchOptions,
+    tokenizer_status: TokenizerStatus,
 }
 
 impl TantivyRulesIndex {
     pub fn from_articles<I>(articles: I, status: PackStatus) -> Result<Self>
+    where
+        I: IntoIterator<Item = Article>,
+    {
+        Self::from_articles_with_options(articles, status, SearchOptions::default())
+    }
+
+    pub fn from_articles_with_options<I>(
+        articles: I,
+        status: PackStatus,
+        search_options: SearchOptions,
+    ) -> Result<Self>
     where
         I: IntoIterator<Item = Article>,
     {
@@ -525,8 +597,20 @@ impl TantivyRulesIndex {
             &[],
             status,
             &VectorSearchOptions::default(),
+            search_options,
             false,
         )
+    }
+
+    /// Analyzer actually used by the BM25 index.
+    pub fn tokenizer_status(&self) -> &TokenizerStatus {
+        &self.tokenizer_status
+    }
+
+    /// Test hook (like `enable_vectors_for_test`): pretend the analyzer degraded.
+    #[doc(hidden)]
+    pub fn set_tokenizer_status_for_test(&mut self, status: TokenizerStatus) {
+        self.tokenizer_status = status;
     }
 
     /// Builds the search index, summaries and graph exactly once.
@@ -539,10 +623,15 @@ impl TantivyRulesIndex {
         edges: &[GraphEdge],
         status: PackStatus,
         opts: &VectorSearchOptions,
+        search_options: SearchOptions,
         with_page_owners: bool,
     ) -> Result<Self> {
         link_neighbors(&mut articles);
-        let (index, fields) = build_search_index(articles.values(), annexes.values())?;
+        let (index, fields, tokenizer_status) = build_search_index(
+            articles.values(),
+            annexes.values(),
+            search_options.ko_pos_filter,
+        )?;
         let reader = SearchReader(
             index
                 .reader_builder()
@@ -574,7 +663,8 @@ impl TantivyRulesIndex {
             vector_enabled_requested: opts.enabled,
             rrf_k: opts.rrf_k,
             vector_weight: opts.vector_weight,
-            search_options: SearchOptions::default(),
+            search_options,
+            tokenizer_status,
         })
     }
 
@@ -652,9 +742,9 @@ impl TantivyRulesIndex {
             &edges,
             status,
             &vector_options,
+            search_options,
             true,
         )?;
-        index.search_options = search_options;
         if let Some((corpus, provider)) =
             index.try_build_vector_corpus_from_options(&cache_key, &vector_options)
         {
@@ -1689,7 +1779,8 @@ thread_local! {
 fn build_search_index<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
-) -> Result<(Index, SearchFields)> {
+    ko_pos_filter: KoPosFilter,
+) -> Result<(Index, SearchFields, TokenizerStatus)> {
     #[cfg(test)]
     SEARCH_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
     let mut schema_builder = Schema::builder();
@@ -1707,7 +1798,7 @@ fn build_search_index<'a>(
     let body = schema_builder.add_text_field("body", ko_text);
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
-    register_ko_tokenizer(&index);
+    let tokenizer_status = register_ko_tokenizer(&index, ko_pos_filter);
 
     let fields = SearchFields {
         id,
@@ -1729,7 +1820,7 @@ fn build_search_index<'a>(
         ))?;
     }
     writer.commit()?;
-    Ok((index, fields))
+    Ok((index, fields, tokenizer_status))
 }
 
 struct SearchEntry {
@@ -1799,23 +1890,79 @@ fn normalize_compact(text: &str) -> String {
 }
 
 #[cfg(feature = "korean-tokenizer")]
-fn register_ko_tokenizer(index: &Index) {
-    use lindera::dictionary::load_dictionary;
-    use lindera::mode::Mode;
-    use lindera::segmenter::Segmenter;
-
-    let tokenizer = load_dictionary("embedded://ko-dic")
-        .map(|dictionary| Segmenter::new(Mode::Normal, dictionary, None))
-        .map(lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter);
-    match tokenizer {
-        Ok(tokenizer) => index.tokenizers().register("ko", tokenizer),
-        Err(_) => register_simple_ko_tokenizer(index),
-    }
+fn register_ko_tokenizer(index: &Index, filter: KoPosFilter) -> TokenizerStatus {
+    register_ko_tokenizer_with(index, filter, || {
+        lindera::dictionary::load_dictionary("embedded://ko-dic")
+    })
 }
 
 #[cfg(not(feature = "korean-tokenizer"))]
-fn register_ko_tokenizer(index: &Index) {
+fn register_ko_tokenizer(index: &Index, _filter: KoPosFilter) -> TokenizerStatus {
     register_simple_ko_tokenizer(index);
+    TokenizerStatus {
+        kind: "simple-fallback".to_string(),
+        filter: KoPosFilter::None.as_str().to_string(),
+        degraded: true,
+        reason: Some("korean-tokenizer feature disabled".to_string()),
+    }
+}
+
+/// Registers the `ko` analyzer. `loader` supplies the dictionary so that a
+/// load failure can be exercised; on failure the simple tokenizer is used, an
+/// `ERROR tokenizer` line is written to stderr and the status says so.
+#[cfg(feature = "korean-tokenizer")]
+fn register_ko_tokenizer_with<F>(index: &Index, filter: KoPosFilter, loader: F) -> TokenizerStatus
+where
+    F: FnOnce() -> lindera::LinderaResult<lindera::dictionary::Dictionary>,
+{
+    use lindera::character_filter::unicode_normalize::{
+        UnicodeNormalizeCharacterFilter, UnicodeNormalizeKind,
+    };
+    use lindera::character_filter::BoxCharacterFilter;
+    use lindera::mode::Mode;
+    use lindera::segmenter::Segmenter;
+    use lindera::token_filter::korean_stop_tags::KoreanStopTagsTokenFilter;
+    use lindera::token_filter::lowercase::LowercaseTokenFilter;
+    use lindera::token_filter::BoxTokenFilter;
+
+    match loader() {
+        Ok(dictionary) => {
+            let mut tokenizer = lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter(
+                Segmenter::new(Mode::Normal, dictionary, None),
+            );
+            if filter != KoPosFilter::None {
+                let tags = filter.stop_tags().into_iter().map(String::from).collect();
+                tokenizer.append_character_filter(BoxCharacterFilter::from(
+                    UnicodeNormalizeCharacterFilter::new(UnicodeNormalizeKind::NFKC),
+                ));
+                tokenizer.append_token_filter(BoxTokenFilter::from(LowercaseTokenFilter::new()));
+                tokenizer.append_token_filter(BoxTokenFilter::from(
+                    KoreanStopTagsTokenFilter::new(tags),
+                ));
+            }
+            index.tokenizers().register("ko", tokenizer);
+            TokenizerStatus {
+                kind: "lindera-ko-dic".to_string(),
+                filter: filter.as_str().to_string(),
+                degraded: false,
+                reason: None,
+            }
+        }
+        Err(error) => {
+            let reason = format!("ko-dic load failed: {error}");
+            eprintln!(
+                "ERROR tokenizer {reason}; using simple fallback (pos filter {} not applied)",
+                filter.as_str()
+            );
+            register_simple_ko_tokenizer(index);
+            TokenizerStatus {
+                kind: "simple-fallback".to_string(),
+                filter: KoPosFilter::None.as_str().to_string(),
+                degraded: true,
+                reason: Some(reason),
+            }
+        }
+    }
 }
 
 fn register_simple_ko_tokenizer(index: &Index) {
@@ -2669,7 +2816,10 @@ refs:
             default_pack_status("cni", "2026-03-01"),
         )
         .unwrap();
-        index.search_options = SearchOptions { e5_prefix };
+        index.search_options = SearchOptions {
+            e5_prefix,
+            ..SearchOptions::default()
+        };
         index
             .enable_vectors_for_test(provider, "test-key", None, 60, 1.0)
             .unwrap();
@@ -3076,8 +3226,12 @@ refs:
             .into_iter()
             .map(|annex| (annex.id.clone(), annex))
             .collect();
-        (index.index, index.fields) =
-            build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        (index.index, index.fields, index.tokenizer_status) = build_search_index(
+            index.articles.values(),
+            index.annexes.values(),
+            index.search_options.ko_pos_filter,
+        )
+        .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
         index
     }
@@ -3543,8 +3697,12 @@ refs:
         index.annexes = annexes.into_iter().map(|a| (a.id.clone(), a)).collect();
         index.page_owners = build_page_owners(index.articles.values(), index.annexes.values());
         index.pages = pages;
-        (index.index, index.fields) =
-            build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        (index.index, index.fields, index.tokenizer_status) = build_search_index(
+            index.articles.values(),
+            index.annexes.values(),
+            index.search_options.ko_pos_filter,
+        )
+        .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
         let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
         index.graph = graph;
@@ -3650,6 +3808,213 @@ refs:
                     .collect::<Vec<_>>()
             };
             assert_eq!(key(&a), key(&b), "query: {q}");
+        }
+    }
+
+    fn pos_index(filter: KoPosFilter, bodies: &[&str]) -> TantivyRulesIndex {
+        let articles = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                article_fixture("cni", "시험규칙", &format!("제{}조", i + 1), "목적", body)
+            })
+            .collect::<Vec<_>>();
+        TantivyRulesIndex::from_articles_with_options(
+            articles,
+            default_pack_status("cni", "2026-03-01"),
+            SearchOptions {
+                ko_pos_filter: filter,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn ko_tokens(filter: KoPosFilter, text: &str) -> Vec<String> {
+        use tantivy::tokenizer::TokenStream;
+        let index = pos_index(filter, &["본문"]);
+        let mut analyzer = index.index.tokenizers().get("ko").unwrap();
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    fn without(tokens: &[String], removed: &[&str]) -> Vec<String> {
+        tokens
+            .iter()
+            .filter(|t| !removed.iter().any(|r| **t == **r))
+            .cloned()
+            .collect()
+    }
+
+    const POS_SAMPLE: &str = "시험규칙에 따라 제3조 (적용 범위) 를 정하고 하는 시험을 끝나며 했다.";
+
+    #[test]
+    fn ko_pos_filter_tag_sets_are_exact() {
+        assert!(KoPosFilter::None.stop_tags().is_empty());
+        let mut v1 = KoPosFilter::V1.stop_tags();
+        v1.sort_unstable();
+        let mut expected_v1 = vec![
+            "JKS", "JKC", "JKG", "JKO", "JKB", "JKV", "JKQ", "JX", "JC", "SF", "SE", "SSO", "SSC",
+            "SC", "SY",
+        ];
+        expected_v1.sort_unstable();
+        assert_eq!(v1, expected_v1);
+        let mut v2 = KoPosFilter::V2.stop_tags();
+        v2.sort_unstable();
+        let mut expected_v2 = expected_v1.clone();
+        expected_v2.extend(["EP", "EF", "EC", "ETN", "ETM"]);
+        expected_v2.sort_unstable();
+        assert_eq!(v2, expected_v2);
+        for kept in [
+            "SN", "SL", "SH", "NNG", "NNP", "VV", "VA", "MM", "MAG", "XR",
+        ] {
+            assert!(!expected_v2.contains(&kept), "{kept} must be preserved");
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_v1_drops_particles_and_symbols_only() {
+        let none = ko_tokens(KoPosFilter::None, POS_SAMPLE);
+        let v1 = ko_tokens(KoPosFilter::V1, POS_SAMPLE);
+        // particles (JKB/JKO), brackets and the sentence-final period are gone
+        assert_eq!(v1, without(&none, &["에", "(", ")", "를", "을", "."]));
+        // the number (SN) and the endings (EC/ETM/EF) survive v1
+        for kept in ["3", "고", "는", "며", "다"] {
+            assert!(v1.iter().any(|t| t == kept), "{kept} missing: {v1:?}");
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_v2_also_drops_endings() {
+        let v1 = ko_tokens(KoPosFilter::V1, POS_SAMPLE);
+        let v2 = ko_tokens(KoPosFilter::V2, POS_SAMPLE);
+        assert_eq!(v2, without(&v1, &["고", "는", "며", "다"]));
+        assert!(v2.iter().any(|t| t == "3"));
+        // compound tags such as VV+EC are not exact matches and stay (PH-00 probe)
+        assert!(v2.iter().any(|t| t == "정하"));
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_never_drops_numbers_latin_hanja() {
+        let text = "제12조 ABC test 法 version2 100";
+        for filter in [KoPosFilter::V1, KoPosFilter::V2] {
+            let tokens = ko_tokens(filter, text);
+            for kept in ["12", "abc", "test", "法", "version", "2", "100"] {
+                assert!(
+                    tokens.iter().any(|t| t == kept),
+                    "{filter:?}: {kept} missing in {tokens:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn nfkc_and_lowercase_normalize_fullwidth_and_case() {
+        let text = "ＡＢＣ Test １２";
+        for filter in [KoPosFilter::V1, KoPosFilter::V2] {
+            let tokens = ko_tokens(filter, text);
+            for wanted in ["abc", "test", "12"] {
+                assert!(
+                    tokens.iter().any(|t| t == wanted),
+                    "{filter:?}: {wanted} missing in {tokens:?}"
+                );
+            }
+        }
+        let legacy = ko_tokens(KoPosFilter::None, text);
+        assert!(
+            !legacy.iter().any(|t| t == "abc" || t == "12"),
+            "{legacy:?}"
+        );
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn query_and_document_share_analyzer() {
+        use tantivy::collector::Count;
+        // documents hold ASCII upper case / full-width; queries the other form.
+        let bodies = ["ABC 시험 본문", "ＸＹＺ 시험 본문"];
+        for (filter, expected) in [(KoPosFilter::V1, 1usize), (KoPosFilter::None, 0)] {
+            let index = pos_index(filter, &bodies);
+            let parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
+            let searcher = index.reader.0.searcher();
+            for query in ["ＡＢＣ", "xyz"] {
+                let parsed = parser.parse_query(query).unwrap();
+                let hits = searcher.search(&parsed, &Count).unwrap();
+                assert_eq!(hits, expected, "{filter:?} query {query}");
+            }
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn tokenizer_load_failure_is_reported_not_silent() {
+        use tantivy::tokenizer::TokenStream;
+        let index = Index::create_in_ram(Schema::builder().build());
+        let status = register_ko_tokenizer_with(&index, KoPosFilter::V2, || {
+            Err(lindera::error::LinderaErrorKind::NotFound.with_error(io::Error::other("no dict")))
+        });
+        assert_eq!(status.kind, "simple-fallback");
+        assert!(status.degraded);
+        assert_eq!(status.filter, "none");
+        assert!(status.reason.as_deref().unwrap().contains("no dict"));
+        // the fallback analyzer is registered so indexing keeps working
+        let mut analyzer = index.tokenizers().get("ko").unwrap();
+        let mut stream = analyzer.token_stream("가 나");
+        assert!(stream.advance());
+
+        let healthy = register_ko_tokenizer_with(&index, KoPosFilter::V1, || {
+            lindera::dictionary::load_dictionary("embedded://ko-dic")
+        });
+        assert_eq!(healthy.kind, "lindera-ko-dic");
+        assert!(!healthy.degraded);
+        assert_eq!(healthy.filter, "v1");
+        assert_eq!(healthy.reason, None);
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn default_filter_none_keeps_legacy_token_stream() {
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+        use tantivy::tokenizer::{TextAnalyzer, TokenStream};
+        let legacy = lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter(Segmenter::new(
+            Mode::Normal,
+            lindera::dictionary::load_dictionary("embedded://ko-dic").unwrap(),
+            None,
+        ));
+        let mut legacy = TextAnalyzer::builder(legacy).build();
+        let index = TantivyRulesIndex::from_articles(
+            vec![article_fixture("cni", "시험규칙", "제1조", "목적", "본문")],
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        assert_eq!(SearchOptions::default().ko_pos_filter, KoPosFilter::None);
+        assert_eq!(index.tokenizer_status().filter, "none");
+        assert!(!index.tokenizer_status().degraded);
+        let mut current = index.index.tokenizers().get("ko").unwrap();
+        for text in [
+            POS_SAMPLE,
+            "ＡＢＣ Test １２ 시험을 하고",
+            "가상법 제12조에 따른 위임",
+        ] {
+            let collect = |analyzer: &mut TextAnalyzer| {
+                let mut stream = analyzer.token_stream(text);
+                let mut out = Vec::new();
+                while stream.advance() {
+                    let t = stream.token();
+                    out.push((t.text.clone(), t.offset_from, t.offset_to, t.position));
+                }
+                out
+            };
+            assert_eq!(collect(&mut legacy), collect(&mut current), "{text}");
         }
     }
 }

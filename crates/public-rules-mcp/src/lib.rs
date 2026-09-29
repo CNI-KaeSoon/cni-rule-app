@@ -18,9 +18,9 @@ use rmcp::{
 };
 use rules_core::{
     default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
-    LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchOptions, SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions,
-    VectorStatus,
+    KoPosFilter, LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
+    SearchOptions, SearchRouteReport, SourcePage, TantivyRulesIndex, TokenizerStatus,
+    VectorSearchOptions, VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -132,12 +132,16 @@ pub struct ServerConfig {
 pub struct SearchConfig {
     #[serde(default)]
     pub e5_prefix: bool,
+    /// `"none"` (default) | `"v1"` | `"v2"`; other values fail config loading.
+    #[serde(default)]
+    pub ko_pos_filter: KoPosFilter,
 }
 
 impl SearchConfig {
     fn to_search_options(&self) -> SearchOptions {
         SearchOptions {
             e5_prefix: self.e5_prefix,
+            ko_pos_filter: self.ko_pos_filter,
         }
     }
 }
@@ -378,6 +382,8 @@ pub struct StatusResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<LoadedPackStatus>,
     pub vectors: VectorStatus,
+    /// True when any loaded pack fell back to the simple tokenizer.
+    pub tokenizer_degraded: bool,
     pub meta: FreshnessMeta,
 }
 
@@ -388,6 +394,8 @@ pub struct LoadedPackStatus {
     pub source_commit: String,
     pub index_built_at: String,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<TokenizerStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1735,7 +1743,10 @@ impl PublicRulesServer {
         let packs = if self.multi_pack {
             self.packs
                 .iter()
-                .map(|pack| LoadedPackStatus::from(pack.index.status()))
+                .map(|pack| LoadedPackStatus {
+                    tokenizer: Some(pack.index.tokenizer_status().clone()),
+                    ..LoadedPackStatus::from(pack.index.status())
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1748,6 +1759,10 @@ impl PublicRulesServer {
         } else {
             Vec::new()
         };
+        let tokenizer_degraded = self
+            .packs
+            .iter()
+            .any(|pack| pack.index.tokenizer_status().degraded);
         StatusResult {
             institution: default_status.institution.clone(),
             effective_date: default_status.effective_date.clone(),
@@ -1757,6 +1772,7 @@ impl PublicRulesServer {
             institutions,
             packs,
             vectors: self.vector_status(),
+            tokenizer_degraded,
             meta: FreshnessMeta {
                 effective: default_status.effective_date.clone(),
                 amended: default_status.effective_date,
@@ -1840,6 +1856,7 @@ impl From<PackStatus> for StatusResult {
             institutions: Vec::new(),
             packs: Vec::new(),
             vectors: VectorStatus::default(),
+            tokenizer_degraded: false,
             meta,
         }
     }
@@ -1853,6 +1870,7 @@ impl From<PackStatus> for LoadedPackStatus {
             source_commit: status.source_commit,
             index_built_at: status.index_built_at,
             stale: status.stale,
+            tokenizer: None,
         }
     }
 }
@@ -2944,6 +2962,95 @@ table_structured: true
 
         assert!(result.vectors.enabled);
         assert!(!result.vectors.model_ready);
+    }
+
+    fn tokenizer_status_fixture_server(degrade_ctp: bool) -> PublicRulesServer {
+        let build = |institution: &str| {
+            TantivyRulesIndex::from_articles(
+                vec![fixture_article(
+                    institution,
+                    "시험규칙",
+                    "제1조",
+                    "목적",
+                    "2026-03-01",
+                    "① 시험 본문이다.",
+                )],
+                default_pack_status(institution, "2026-03-01"),
+            )
+            .unwrap()
+        };
+        let cni = build("cni");
+        let mut ctp = build("ctp");
+        if degrade_ctp {
+            ctp.set_tokenizer_status_for_test(TokenizerStatus {
+                kind: "simple-fallback".to_string(),
+                filter: "none".to_string(),
+                degraded: true,
+                reason: Some("ko-dic load failed: test".to_string()),
+            });
+        }
+        let pack = |institution: &str, index: TantivyRulesIndex| LoadedPack {
+            institution: institution.to_string(),
+            aliases: vec![institution.to_string()],
+            index: Arc::new(index),
+        };
+        PublicRulesServer {
+            packs: Arc::new(vec![pack("cni", cni), pack("ctp", ctp)]),
+            default_institution: "cni".to_string(),
+            multi_pack: true,
+            tool_router: PublicRulesServer::tool_router(),
+            prompt_router: PublicRulesServer::prompt_router(),
+            search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            query_logger: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_tool_reports_tokenizer_degradation() {
+        let Json(healthy) = tokenizer_status_fixture_server(false).status().await;
+        assert!(!healthy.tokenizer_degraded);
+        assert!(healthy
+            .packs
+            .iter()
+            .all(|p| p.tokenizer.as_ref().is_some_and(|t| !t.degraded)));
+
+        let Json(degraded) = tokenizer_status_fixture_server(true).status().await;
+        assert!(degraded.tokenizer_degraded);
+        let ctp = degraded
+            .packs
+            .iter()
+            .find(|p| p.institution == "ctp")
+            .unwrap();
+        let status = ctp.tokenizer.as_ref().unwrap();
+        assert!(status.degraded);
+        assert_eq!(status.kind, "simple-fallback");
+        assert!(status.reason.as_deref().unwrap().contains("ko-dic"));
+        let cni = degraded
+            .packs
+            .iter()
+            .find(|p| p.institution == "cni")
+            .unwrap();
+        assert!(!cni.tokenizer.as_ref().unwrap().degraded);
+        // the flag is always serialised, even when false
+        let json = serde_json::to_value(&healthy).unwrap();
+        assert_eq!(json["tokenizer_degraded"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn search_ko_pos_filter_parses_and_rejects_unknown_values() {
+        let config: ServerConfig =
+            toml::from_str("institution = \"cni\"\n\n[search]\nko_pos_filter = \"v2\"\n").unwrap();
+        assert_eq!(config.search.ko_pos_filter, KoPosFilter::V2);
+        assert_eq!(
+            config.search.to_search_options().ko_pos_filter,
+            KoPosFilter::V2
+        );
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\nko_pos_filter = \"v3\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("none") && error.contains("v1") && error.contains("v2"));
     }
 
     #[test]
