@@ -700,6 +700,9 @@ impl PublicRulesServer {
         let mut links: Vec<LegalLink> = Vec::new();
         let mut seen: std::collections::BTreeSet<(String, String)> = Default::default();
         for basis in &article.legal_basis {
+            if !is_law_name(&basis.law) {
+                continue;
+            }
             let key = (rules_core::slugify_rule(&basis.law), basis.article.clone());
             if !seen.insert(key) {
                 continue;
@@ -3386,6 +3389,36 @@ table_structured: true
         // 다른 팩에는 시험법이 없으므로 그 팩 기준으로 미확인이다.
         let ctp_result = legal_links_of(&server, "ctp/시험규칙#제1조").await;
         assert_eq!(ctp_result.links[0].resolution, "external_unverified");
+    }
+
+    #[tokio::test]
+    async fn legal_basis_non_law_entries_are_excluded_from_links() {
+        let index = TantivyRulesIndex::from_articles(
+            vec![
+                link_article("cni", "시험법", "제3조", &[], &[]),
+                link_article(
+                    "cni",
+                    "시험세칙",
+                    "제1조",
+                    &[
+                        ("시험법", "제3조"),
+                        ("시험기관 정관", "제5조"),
+                        ("시험규칙", "제2조"),
+                    ],
+                    &[],
+                ),
+            ],
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let server = PublicRulesServer::new(index);
+        let result = legal_links_of(&server, "시험세칙#제1조").await;
+        assert_eq!(result.links.len(), 1);
+        assert_eq!(result.links[0].law, "시험법");
+        assert_eq!(result.links[0].source, "legal_basis");
+        assert_eq!(result.links[0].resolution, "local_bundled");
+        // 기존 basis 필드는 필터하지 않는다.
+        assert_eq!(result.basis.len(), 3);
     }
 
     #[tokio::test]
