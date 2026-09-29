@@ -131,8 +131,9 @@ pub struct ServerConfig {
     pub search: SearchConfig,
 }
 
-/// `[search]` section of the server config (PRD 2.3). Absent keys mean the
-/// legacy behaviour.
+/// `[search]` section of the server config (PRD 2.3). Absent keys take the
+/// adopted server defaults (PH-08 `bigram_weight`, PH-09 `multipack_fusion`);
+/// the rules-core `SearchOptions::default()` library defaults are unchanged.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct SearchConfig {
     #[serde(default)]
@@ -143,13 +144,18 @@ pub struct SearchConfig {
     /// `"none"` (default) | `"vector"` | `"both"`; other values fail config loading.
     #[serde(default)]
     pub context_prefix: ContextPrefix,
-    /// RRF weight of the character-bigram list, `0.0..=2.0` (default 0.0 =
-    /// off); values outside the range fail config loading.
-    #[serde(default, deserialize_with = "deserialize_bigram_weight")]
+    /// RRF weight of the character-bigram list, `0.0..=2.0` (server default
+    /// 1.0, adopted in PH-08; 0.0 = off); values outside the range fail config
+    /// loading.
+    #[serde(
+        default = "default_bigram_weight",
+        deserialize_with = "deserialize_bigram_weight"
+    )]
     pub bigram_weight: f32,
-    /// Multi-pack merge of `search_rules`: `"rrf"` (default) | `"score"` |
-    /// `"global"`; other values fail config loading.
-    #[serde(default)]
+    /// Multi-pack merge of `search_rules`: `"rrf"` | `"score"` | `"global"`
+    /// (server default `"global"`, adopted in PH-09); other values fail config
+    /// loading.
+    #[serde(default = "default_multipack_fusion")]
     pub multipack_fusion: MultipackFusion,
     /// Most `query_variants` one `search_rules` call may carry, `0..=3`
     /// (default 3); larger values fail config loading.
@@ -166,11 +172,24 @@ impl Default for SearchConfig {
             e5_prefix: false,
             ko_pos_filter: KoPosFilter::default(),
             context_prefix: ContextPrefix::default(),
-            bigram_weight: 0.0,
-            multipack_fusion: MultipackFusion::default(),
+            bigram_weight: ADOPTED_BIGRAM_WEIGHT,
+            multipack_fusion: ADOPTED_MULTIPACK_FUSION,
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
         }
     }
+}
+
+/// PH-08 adopted `search.bigram_weight` (server default).
+const ADOPTED_BIGRAM_WEIGHT: f32 = 1.0;
+/// PH-09 adopted `search.multipack_fusion` (server default).
+const ADOPTED_MULTIPACK_FUSION: MultipackFusion = MultipackFusion::Global;
+
+fn default_bigram_weight() -> f32 {
+    ADOPTED_BIGRAM_WEIGHT
+}
+
+fn default_multipack_fusion() -> MultipackFusion {
+    ADOPTED_MULTIPACK_FUSION
 }
 
 fn default_query_variants_max() -> usize {
@@ -3983,7 +4002,26 @@ table_structured: true
             assert!(error.contains("0.0..=2.0"), "{raw}: {error}");
         }
         let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
-        assert_eq!(default.search.bigram_weight, 0.0);
+        assert_eq!(default.search.bigram_weight, 1.0);
+    }
+
+    #[test]
+    fn server_config_without_search_section_applies_adopted_defaults() {
+        let config: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(config.search.bigram_weight, 1.0);
+        assert_eq!(config.search.multipack_fusion, MultipackFusion::Global);
+        assert!(!config.search.e5_prefix);
+        assert_eq!(config.search.ko_pos_filter, KoPosFilter::None);
+        assert_eq!(config.search.context_prefix, ContextPrefix::None);
+        assert_eq!(config.search, SearchConfig::default());
+        // Partial `[search]` sections keep the other adopted defaults.
+        let partial: ServerConfig =
+            toml::from_str("institution = \"cni\"\n\n[search]\ne5_prefix = true\n").unwrap();
+        assert_eq!(partial.search.bigram_weight, 1.0);
+        assert_eq!(partial.search.multipack_fusion, MultipackFusion::Global);
+        // rules-core library defaults are untouched.
+        assert_eq!(SearchOptions::default().bigram_weight, 0.0);
+        assert_eq!(MultipackFusion::default(), MultipackFusion::Rrf);
     }
 
     #[test]
@@ -3994,7 +4032,13 @@ table_structured: true
         .unwrap();
         assert_eq!(config.search, SearchConfig::default());
         assert!(!config.search.e5_prefix);
-        assert_eq!(config.search.to_search_options(), SearchOptions::default());
+        assert_eq!(
+            config.search.to_search_options(),
+            SearchOptions {
+                bigram_weight: 1.0,
+                ..SearchOptions::default()
+            }
+        );
 
         let with_flag: ServerConfig =
             toml::from_str("institution = \"cni\"\n\n[search]\ne5_prefix = true\n").unwrap();
@@ -4979,7 +5023,7 @@ refs: []
     #[test]
     fn multipack_fusion_config_parses_and_rejects_unknown() {
         let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
-        assert_eq!(default.search.multipack_fusion, MultipackFusion::Rrf);
+        assert_eq!(default.search.multipack_fusion, MultipackFusion::Global);
         for (raw, expected) in [
             ("rrf", MultipackFusion::Rrf),
             ("score", MultipackFusion::Score),
