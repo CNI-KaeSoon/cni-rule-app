@@ -138,6 +138,18 @@ pub struct SearchConfig {
     /// `"none"` (default) | `"vector"` | `"both"`; other values fail config loading.
     #[serde(default)]
     pub context_prefix: ContextPrefix,
+    /// RRF weight of the character-bigram list, `0.0..=2.0` (default 0.0 =
+    /// off); values outside the range fail config loading.
+    #[serde(default, deserialize_with = "deserialize_bigram_weight")]
+    pub bigram_weight: f32,
+}
+
+fn deserialize_bigram_weight<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let weight = f32::deserialize(deserializer)?;
+    rules_core::validate_bigram_weight(weight).map_err(serde::de::Error::custom)
 }
 
 impl SearchConfig {
@@ -146,6 +158,7 @@ impl SearchConfig {
             e5_prefix: self.e5_prefix,
             ko_pos_filter: self.ko_pos_filter,
             context_prefix: self.context_prefix,
+            bigram_weight: self.bigram_weight,
         }
     }
 }
@@ -3077,6 +3090,31 @@ table_structured: true
         .unwrap_err()
         .to_string();
         assert!(error.contains("none") && error.contains("vector") && error.contains("both"));
+    }
+
+    #[test]
+    fn bigram_weight_out_of_range_rejected_by_config() {
+        for raw in ["0.0", "0.3", "1.0", "2.0"] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\nbigram_weight = {raw}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.bigram_weight, raw.parse::<f32>().unwrap());
+            assert_eq!(
+                config.search.to_search_options().bigram_weight,
+                config.search.bigram_weight
+            );
+        }
+        for raw in ["-0.1", "2.1", "100.0", "nan"] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "institution = \"cni\"\n\n[search]\nbigram_weight = {raw}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("0.0..=2.0"), "{raw}: {error}");
+        }
+        let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(default.search.bigram_weight, 0.0);
     }
 
     #[test]

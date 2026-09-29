@@ -9,12 +9,12 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value,
     STORED, STRING,
 };
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError, Term};
 use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -269,7 +269,7 @@ pub struct VectorSearchOptions {
 
 /// Search-time behaviour flags shared by all packs (PRD 2.3). Every field
 /// defaults to the legacy behaviour.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SearchOptions {
     /// Apply the e5 model-card `passage:` / `query:` prefixes to both sides.
     pub e5_prefix: bool,
@@ -277,9 +277,31 @@ pub struct SearchOptions {
     pub ko_pos_filter: KoPosFilter,
     /// Deterministic metadata context prepended to passages (PH-07).
     pub context_prefix: ContextPrefix,
+    /// RRF weight of the character-bigram list (PH-08). `0.0` (default) means
+    /// the `body_ng` field is not indexed and the list is not computed.
+    pub bigram_weight: f32,
+}
+
+/// Allowed range of `search.bigram_weight`.
+pub const BIGRAM_WEIGHT_MAX: f32 = 2.0;
+
+/// Validates a `bigram_weight` value (`0.0..=2.0`, finite).
+pub fn validate_bigram_weight(weight: f32) -> std::result::Result<f32, String> {
+    if weight.is_finite() && (0.0..=BIGRAM_WEIGHT_MAX).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(format!(
+            "bigram_weight must be within 0.0..=2.0, got {weight}"
+        ))
+    }
 }
 
 impl SearchOptions {
+    /// Whether the bigram field is indexed and the list is computed.
+    pub fn bigram_enabled(&self) -> bool {
+        self.bigram_weight > 0.0
+    }
+
     pub fn passage_format(&self) -> PassageFormat {
         match (self.e5_prefix, self.context_prefix != ContextPrefix::None) {
             (false, false) => PassageFormat::Legacy,
@@ -537,6 +559,8 @@ struct SearchFields {
     rule: Field,
     title: Field,
     body: Field,
+    /// Character-bigram field (PH-08); present only when `bigram_weight > 0`.
+    body_ng: Option<Field>,
 }
 
 #[derive(Clone)]
@@ -684,6 +708,7 @@ impl TantivyRulesIndex {
             annexes.values(),
             search_options.ko_pos_filter,
             bm25_contexts,
+            search_options.bigram_enabled(),
         )?;
         let reader = SearchReader(
             index
@@ -918,6 +943,7 @@ impl TantivyRulesIndex {
         );
         let annex_ref_hits = self.annex_reference_rank(q, candidate_limit, filter);
         let vector_hits = self.vector_rank(q, candidate_limit, filter);
+        let bigram_hits = self.bigram_rank(q, candidate_limit, filter);
         let mut rankings = Vec::new();
         let mut weights = Vec::new();
         rankings.push(annex_ref_hits);
@@ -934,7 +960,68 @@ impl TantivyRulesIndex {
         weights.push(1.0);
         rankings.push(lexical_hits);
         weights.push(1.0);
+        if !bigram_hits.is_empty() {
+            rankings.push(bigram_hits);
+            weights.push(self.search_options.bigram_weight);
+        }
         rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
+    }
+
+    /// BM25 ranking over the character-bigram field (PH-08). Empty unless the
+    /// field was indexed (`bigram_weight > 0`). The query is compacted the same
+    /// way as the indexed text and turned into a bag of bigram terms; a
+    /// `QueryParser` would build a phrase query out of them (bigram tokens all
+    /// share position 0), which cannot match.
+    fn bigram_rank(&self, q: &str, limit: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        let Some(field) = self.fields.body_ng else {
+            return Vec::new();
+        };
+        if !self.search_options.bigram_enabled() {
+            return Vec::new();
+        }
+        let compact = normalize_compact(q);
+        if compact.is_empty() {
+            return Vec::new();
+        }
+        let Some(mut analyzer) = self.index.tokenizers().get(BIGRAM_TOKENIZER) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let mut stream = analyzer.token_stream(&compact);
+        stream.process(&mut |token| {
+            if seen.insert(token.text.clone()) {
+                clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, &token.text),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                ));
+            }
+        });
+        if clauses.is_empty() {
+            return Vec::new();
+        }
+        let query = BooleanQuery::new(clauses);
+        let searcher = self.reader.0.searcher();
+        let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(limit)) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (score, addr) in top_docs {
+            let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                continue;
+            };
+            let Some(id) = first_text(&doc, self.fields.id) else {
+                continue;
+            };
+            if let Some(hit) = self.search_hit_for_id(id, score, q, filter) {
+                hits.push(hit);
+            }
+        }
+        sort_hits_by_score_and_id(&mut hits);
+        hits
     }
 }
 
@@ -1827,6 +1914,7 @@ fn build_search_index<'a>(
     annexes: impl Iterator<Item = &'a Annex>,
     ko_pos_filter: KoPosFilter,
     body_contexts: Option<&BTreeMap<String, String>>,
+    with_bigram: bool,
 ) -> Result<(Index, SearchFields, TokenizerStatus)> {
     #[cfg(test)]
     SEARCH_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
@@ -1843,32 +1931,56 @@ fn build_search_index<'a>(
     let title = schema_builder.add_text_field("title", ko_text.clone());
     let effective = schema_builder.add_text_field("effective", STRING | STORED);
     let body = schema_builder.add_text_field("body", ko_text);
+    let body_ng = with_bigram.then(|| {
+        schema_builder.add_text_field(
+            "body_ng",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(BIGRAM_TOKENIZER)
+                    .set_index_option(IndexRecordOption::WithFreqs),
+            ),
+        )
+    });
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
     let tokenizer_status = register_ko_tokenizer(&index, ko_pos_filter);
+    if with_bigram {
+        register_bigram_tokenizer(&index)?;
+    }
 
     let fields = SearchFields {
         id,
         rule,
         title,
         body,
+        body_ng,
     };
     let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
     for entry in articles
         .map(SearchEntry::from_article)
         .chain(annexes.map(SearchEntry::from_annex))
     {
+        // Bigram source: compacted title + body without any context prefix.
+        let bigram_source = if with_bigram {
+            normalize_compact(&format!("{}\n{}", entry.title, entry.body))
+        } else {
+            String::new()
+        };
         let entry_body = match body_contexts.and_then(|contexts| contexts.get(&entry.id)) {
             Some(context) => format!("{context}\n{}", entry.body),
             None => entry.body,
         };
-        writer.add_document(doc!(
+        let mut document = doc!(
             id => entry.id,
             rule => entry.rule,
             title => entry.title,
             effective => entry.effective,
             body => entry_body,
-        ))?;
+        );
+        if let Some(field) = body_ng {
+            document.add_text(field, bigram_source);
+        }
+        writer.add_document(document)?;
     }
     writer.commit()?;
     Ok((index, fields, tokenizer_status))
@@ -1932,6 +2044,20 @@ fn searchable_text_with_compact(text: &str) -> String {
     } else {
         format!("{text}\n{compact}")
     }
+}
+
+const BIGRAM_TOKENIZER: &str = "ko_ng";
+
+/// `ko_ng` analyzer: lower-cased character 2-grams (no whitespace handling,
+/// the source text is already compacted).
+fn register_bigram_tokenizer(index: &Index) -> Result<()> {
+    use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
+    let tokenizer = NgramTokenizer::new(2, 2, false)?;
+    index.tokenizers().register(
+        BIGRAM_TOKENIZER,
+        TextAnalyzer::builder(tokenizer).filter(LowerCaser).build(),
+    );
+    Ok(())
 }
 
 fn normalize_compact(text: &str) -> String {
@@ -3430,6 +3556,7 @@ refs:
             index.annexes.values(),
             index.search_options.ko_pos_filter,
             None,
+            false,
         )
         .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
@@ -3902,6 +4029,7 @@ refs:
             index.annexes.values(),
             index.search_options.ko_pos_filter,
             None,
+            false,
         )
         .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
@@ -4266,6 +4394,123 @@ refs:
             false,
         )
         .unwrap()
+    }
+
+    fn bigram_options(weight: f32) -> SearchOptions {
+        SearchOptions {
+            bigram_weight: weight,
+            ..SearchOptions::default()
+        }
+    }
+
+    fn bigram_corpus() -> Vec<Article> {
+        vec![
+            article_fixture(
+                "cni",
+                "테스트규정",
+                "제1조",
+                "총칙",
+                "쿼틱스람다파이 절차를 따른다.",
+            ),
+            article_fixture(
+                "cni",
+                "테스트규정",
+                "제2조",
+                "잡담",
+                "무관한 내용의 조문이다.",
+            ),
+            article_fixture("cni", "시험규칙", "제1조", "보충", "다른 문장만 있다."),
+        ]
+    }
+
+    fn bigram_index(weight: f32) -> TantivyRulesIndex {
+        TantivyRulesIndex::from_articles_with_options(
+            bigram_corpus(),
+            default_pack_status("cni", "2026-03-01"),
+            bigram_options(weight),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bigram_list_recovers_spacing_variants() {
+        let index = bigram_index(1.0);
+        let target = "테스트규정#제1조";
+        // The document has no space inside the compound; the query splits it
+        // differently. The bigram list must still surface the document.
+        let hits = index.bigram_rank("쿼틱 스람다 파이", 10, None);
+        assert_eq!(hits.first().map(|h| h.article_id.as_str()), Some(target));
+        assert!(hits.iter().all(|h| h.article_id != "테스트규정#제2조"));
+
+        // A query in another spacing that shares no whole token with the body.
+        let hits = index.bigram_rank("쿼틱스 람다파이", 10, None);
+        assert_eq!(hits.first().map(|h| h.article_id.as_str()), Some(target));
+
+        // Fused search: the document is returned with the bigram list on.
+        let fused = index.search("쿼틱 스람다 파이", 5, None);
+        assert!(fused.iter().any(|h| h.article_id == target));
+
+        // Empty / whitespace-only queries produce no bigram list.
+        assert!(index.bigram_rank("   ", 10, None).is_empty());
+        // Disabled index computes nothing.
+        assert!(bigram_index(0.0)
+            .bigram_rank("쿼틱스 람다파이", 10, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn bigram_weight_zero_is_bit_identical_to_baseline() {
+        let baseline = TantivyRulesIndex::from_articles(
+            bigram_corpus(),
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        let zero = bigram_index(0.0);
+        for q in [
+            "쿼틱스 람다파이",
+            "절차",
+            "무관한 내용",
+            "시험규칙 제1조",
+            "없는말",
+        ] {
+            let a = baseline.search_with_routes(q, 10, None);
+            let b = zero.search_with_routes(q, 10, None);
+            let key = |r: &SearchRouteReport| {
+                r.hits
+                    .iter()
+                    .map(|h| (h.article_id.clone(), h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(key(&a), key(&b), "query {q}");
+            let retrieval = |r: &SearchRouteReport| {
+                r.retrieval_hits
+                    .iter()
+                    .map(|h| (h.article_id.clone(), h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(retrieval(&a), retrieval(&b), "query {q}");
+        }
+        assert_eq!(SearchOptions::default().bigram_weight, 0.0);
+    }
+
+    #[test]
+    fn bigram_field_not_indexed_when_disabled() {
+        let off = bigram_index(0.0);
+        assert!(off.fields.body_ng.is_none());
+        assert!(off.index.schema().get_field("body_ng").is_err());
+        assert!(off.index.tokenizers().get(BIGRAM_TOKENIZER).is_none());
+        assert_eq!(off.index.schema().fields().count(), 5);
+
+        let on = bigram_index(0.5);
+        assert!(on.fields.body_ng.is_some());
+        assert!(on.index.schema().get_field("body_ng").is_ok());
+        assert_eq!(on.index.schema().fields().count(), 6);
+        // Weight validation used by the config layer.
+        assert!(validate_bigram_weight(0.0).is_ok());
+        assert!(validate_bigram_weight(2.0).is_ok());
+        assert!(validate_bigram_weight(-0.01).is_err());
+        assert!(validate_bigram_weight(2.01).is_err());
+        assert!(validate_bigram_weight(f32::NAN).is_err());
     }
 
     #[test]
