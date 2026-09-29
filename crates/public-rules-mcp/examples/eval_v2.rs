@@ -261,7 +261,10 @@ async fn search_once(server: &PublicRulesServer, item: &Item, k: usize) -> PassI
         institution: institution_for(item),
     };
     let started = Instant::now();
-    let Json(result) = server.search_rules(Parameters(params)).await;
+    let Json(result) = server
+        .search_rules(Parameters(params))
+        .await
+        .expect("search_rules must not fail for eval queries");
     let latency_us = started.elapsed().as_micros();
     let hits = result
         .hits

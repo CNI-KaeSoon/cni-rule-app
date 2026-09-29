@@ -440,6 +440,184 @@ async fn streamable_http_rejects_non_loopback_bind_without_auth() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn every_tool_has_title_and_readonly_annotations() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let tools = client.list_all_tools().await?;
+    assert_eq!(tools.len(), 8);
+    for tool in &tools {
+        let title = tool.title.as_deref().unwrap_or_default();
+        assert!(!title.trim().is_empty(), "{} has no title", tool.name);
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+        assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+        assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+        assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name);
+        assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+    }
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+fn call_arguments_for(tool: &str) -> serde_json::Value {
+    match tool {
+        "compare_rules" => serde_json::json!({"topic": "항공운임", "institutions": ["cni"]}),
+        "search_rules" => serde_json::json!({"query": "항공운임", "top_k": 3}),
+        "get_annex" => serde_json::json!({"id": "여비지급규칙#별표1"}),
+        "get_source_page" => serde_json::json!({"page": 1}),
+        "get_article" => serde_json::json!({"id": "여비지급규칙#제12조"}),
+        "get_legal_basis" => serde_json::json!({"id": "여비지급규칙#제12조"}),
+        _ => serde_json::json!({}),
+    }
+}
+
+#[tokio::test]
+async fn every_json_tool_advertises_output_schema() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    for tool in client.list_all_tools().await? {
+        assert!(
+            tool.output_schema.is_some(),
+            "{} has no outputSchema",
+            tool.name
+        );
+        let arguments = call_arguments_for(&tool.name)
+            .as_object()
+            .expect("arguments object")
+            .clone();
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool.name.to_string()).with_arguments(arguments))
+            .await?;
+        assert_ne!(result.is_error, Some(true), "{}", tool.name);
+        assert!(
+            result.structured_content.is_some(),
+            "{} returned no structuredContent",
+            tool.name
+        );
+    }
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_content_matches_output_schema() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    for tool in client.list_all_tools().await? {
+        let schema = serde_json::to_value(tool.output_schema.as_ref().expect("outputSchema"))?;
+        let arguments = call_arguments_for(&tool.name)
+            .as_object()
+            .expect("arguments object")
+            .clone();
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool.name.to_string()).with_arguments(arguments))
+            .await?;
+        let content = result.structured_content.expect("structuredContent");
+        let object = content.as_object().expect("structuredContent is an object");
+        let properties = schema["properties"].as_object().expect("schema properties");
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let key = required.as_str().expect("required key");
+            assert!(object.contains_key(key), "{}: missing {key}", tool.name);
+        }
+        for key in object.keys() {
+            assert!(
+                properties.contains_key(key),
+                "{}: {key} not in outputSchema",
+                tool.name
+            );
+        }
+    }
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_tool_surface_mentions_siheng_il() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let surface = serde_json::to_string(&client.list_all_tools().await?)?;
+    assert!(!surface.contains("시행일"), "tool surface mentions 시행일");
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_query_returns_is_error_result() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    for query in ["", "   "] {
+        let arguments = serde_json::from_value(serde_json::json!({ "query": query }))?;
+        let result = client
+            .call_tool(CallToolRequestParams::new(SEARCH_RULES_TOOL).with_arguments(arguments))
+            .await?;
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .iter()
+            .find_map(|content| match content {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .expect("error text");
+        assert!(text.contains("query"));
+    }
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn compare_rules_invalid_input_is_tool_error_with_same_message() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let cases = [
+        (
+            serde_json::json!({"topic": "   "}),
+            "topic은 trim 후 비어 있을 수 없습니다",
+        ),
+        (
+            serde_json::json!({
+                "topic": "항공운임",
+                "institutions": (0..13).map(|n| format!("i{n}")).collect::<Vec<_>>()
+            }),
+            "institutions는 최대 12개입니다. 여러 번으로 분할 호출해 주세요",
+        ),
+        (
+            serde_json::json!({
+                "topic": "항공운임",
+                "query_variants": ["a", "b", "c", "d", "e", "f"]
+            }),
+            "query_variants는 최대 5개까지 지정할 수 있습니다",
+        ),
+    ];
+    for (arguments, message) in cases {
+        let arguments = arguments.as_object().expect("arguments").clone();
+        let result = client
+            .call_tool(CallToolRequestParams::new(COMPARE_RULES_TOOL).with_arguments(arguments))
+            .await?;
+        assert_eq!(result.is_error, Some(true), "{message}");
+        let text = result
+            .content
+            .iter()
+            .find_map(|content| match content {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .expect("error text");
+        assert_eq!(text, message);
+    }
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
 fn sort_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(

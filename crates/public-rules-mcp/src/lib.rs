@@ -181,7 +181,31 @@ pub struct SearchRulesResult {
     pub meta: FreshnessMeta,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hit_meta: BTreeMap<String, FreshnessMeta>,
+    /// article_id별 인용 정보. 답변에서 출처를 밝힐 때 그대로 쓴다.
+    #[serde(default)]
+    pub citations: BTreeMap<String, Citation>,
 }
+
+/// 검색 결과 하나의 인용 묶음. 값은 모두 팩에서 읽은 것이다.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct Citation {
+    pub institution: String,
+    pub rule: String,
+    /// 조 또는 별표 번호(예: 제12조, 별표1)
+    pub article: String,
+    pub title: String,
+    /// 원문 페이지. 단일 `3`, 범위 `3-4`, 정보 없으면 빈 문자열
+    pub pages: String,
+    /// 조문 개정 표기(팩에 기록된 값)
+    pub amended: String,
+    /// 이 결과가 속한 팩의 기준일
+    pub pack_effective: String,
+    pub source_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+const EMPTY_QUERY_MESSAGE: &str = "query가 비어 있습니다. 검색어를 한 글자 이상 입력해 주세요";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct CompareRulesParams {
@@ -747,6 +771,63 @@ impl PublicRulesServer {
             }
         }
         Some((self.default_pack(), id))
+    }
+
+    fn citations(&self, hits: &[SearchHit]) -> BTreeMap<String, Citation> {
+        hits.iter()
+            .filter_map(|hit| {
+                let pack = self.pack_for_institution(&hit.institution)?;
+                let status = pack.index.status();
+                let local_id = hit
+                    .article_id
+                    .strip_prefix(&format!("{}/", pack.institution))
+                    .filter(|_| self.multi_pack)
+                    .unwrap_or(&hit.article_id);
+                let (rule, article, title, amended, pages) =
+                    if let Some(found) = pack.index.get_article(local_id) {
+                        (
+                            found.rule,
+                            found.article,
+                            found.title,
+                            found.amended,
+                            found.meta.get("pages").cloned().unwrap_or_default(),
+                        )
+                    } else if let Some(found) = pack.index.get_annex(local_id) {
+                        (
+                            found.rule,
+                            found.annex,
+                            found.title,
+                            found.effective,
+                            found.meta.get("pages").cloned().unwrap_or_default(),
+                        )
+                    } else {
+                        (
+                            hit.rule.clone(),
+                            local_id
+                                .split_once(rules_core::ARTICLE_ID_SEPARATOR)
+                                .map(|(_, item)| item.to_string())
+                                .unwrap_or_default(),
+                            hit.title.clone(),
+                            hit.effective.clone(),
+                            String::new(),
+                        )
+                    };
+                Some((
+                    hit.article_id.clone(),
+                    Citation {
+                        institution: pack.institution.clone(),
+                        rule,
+                        article,
+                        title,
+                        pages,
+                        amended,
+                        pack_effective: status.effective_date,
+                        source_commit: status.source_commit,
+                        source_url: status.source_url,
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn hit_meta(&self, hits: &[SearchHit]) -> BTreeMap<String, FreshnessMeta> {
@@ -1365,16 +1446,25 @@ fn collect_effective_counts(
 impl PublicRulesServer {
     #[tool(
         name = "compare_rules",
+        title = "기관 간 규정 대조",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "주제어로 여러 기관 규정을 나란히 대조한다. no_match_found는 '이 질의로 대응 조문을 확인하지 못함'이며 조문 부재의 단정이 아니다. query_variants로 동의어를 바꿔 재시도한 뒤에도 없으면 개선 검토 후보로 다뤄라. semantic_candidate는 검증 필요 후보이다. rank_score는 기관 내 정렬 전용으로 기관 간 비교할 수 없다. body가 truncated/omitted면 get_article·get_annex로 전문을 확인하라."
     )]
     pub async fn compare_rules(
         &self,
         Parameters(params): Parameters<CompareRulesParams>,
-    ) -> Result<Json<CompareRulesResult>, ErrorData> {
+    ) -> Result<Json<CompareRulesResult>, String> {
         let started_at = Instant::now();
         let topic = params.topic.trim().nfc().collect::<String>();
-        let variants = compare_variants(&topic, params.query_variants.clone())?;
-        let requested = requested_institutions(&self.packs, params.institutions.clone())?;
+        let variants = compare_variants(&topic, params.query_variants.clone())
+            .map_err(|error| error.message.to_string())?;
+        let requested = requested_institutions(&self.packs, params.institutions.clone())
+            .map_err(|error| error.message.to_string())?;
         let top_k = params
             .top_k_per_institution
             .unwrap_or(DEFAULT_COMPARE_TOP_K)
@@ -1504,13 +1594,23 @@ impl PublicRulesServer {
 
     #[tool(
         name = "search_rules",
-        description = "Search institutional rule articles."
+        title = "규정 조문 검색",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "로드된 기관 규정 팩에서 질의어와 관련된 조문·별표를 검색한다. 규정 질문의 첫 단계로 쓰고, 결과의 article_id로 get_article(조문) 또는 get_annex(별표)를 호출해 전문을 확인한 뒤 답하라. citations에 각 결과의 인용 정보(기관·규정·조·페이지·팩 기준일·소스 커밋)가 들어 있으니 답변에 그대로 인용하라. 검색 결과가 없다는 것은 규정이 없다는 뜻이 아니다. 질의어를 바꿔 다시 검색하고, 그래도 없으면 없다고 단정하지 말고 확인하지 못했다고 답하라. effective는 팩 기준일이며 조문의 개정·적용 시점이 아니다. 기관을 지정하려면 institution, 규정을 좁히려면 rule을 쓴다. 여러 기관을 나란히 비교할 때는 compare_rules를 쓴다."
     )]
     pub async fn search_rules(
         &self,
         Parameters(params): Parameters<SearchRulesParams>,
-    ) -> Json<SearchRulesResult> {
+    ) -> Result<Json<SearchRulesResult>, String> {
         let started_at = Instant::now();
+        if params.query.trim().is_empty() {
+            return Err(EMPTY_QUERY_MESSAGE.to_string());
+        }
         let query = params.query.clone();
         let top_k = params.top_k;
         let rule = params.rule.clone();
@@ -1562,16 +1662,25 @@ impl PublicRulesServer {
                 },
             }),
         );
-        Json(SearchRulesResult {
+        let citations = self.citations(&hits);
+        Ok(Json(SearchRulesResult {
             hits,
             meta: self.status_meta(None),
             hit_meta,
-        })
+            citations,
+        }))
     }
 
     #[tool(
         name = "get_annex",
-        description = "Get one annex/bylaw attachment with source metadata."
+        title = "별표·별지 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "별표·별지 하나를 원문 텍스트와 표(table_markdown)로 가져온다. search_rules 결과나 조문의 annex_refs에 나온 별표 id를 넣는다. 다중 기관 모드에서는 `기관/규정#별표N` 형식이다. table_structured가 false이면 표 구조가 보장되지 않으니 warning대로 get_source_page로 원문 페이지를 확인하라. 없는 id는 오류가 아니라 빈 결과로 돌아온다. meta.effective는 팩 기준일이다."
     )]
     pub async fn get_annex(
         &self,
@@ -1628,7 +1737,14 @@ impl PublicRulesServer {
 
     #[tool(
         name = "get_source_page",
-        description = "Get raw source text for one page."
+        title = "원문 페이지 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "규정 원문의 한 페이지 텍스트를 가져온다. 조문·별표의 pages 값이나 인용 정보의 페이지를 근거로, 표나 서식이 깨졌는지 원문으로 확인할 때 쓴다. 다중 기관 모드에서는 institution을 반드시 지정해야 한다. 원문 페이지를 싣지 않은 팩이면 error에 그 사유가 담긴다. meta.effective는 팩 기준일이다."
     )]
     pub async fn get_source_page(
         &self,
@@ -1697,7 +1813,14 @@ impl PublicRulesServer {
 
     #[tool(
         name = "get_article",
-        description = "Get one rule article with freshness metadata."
+        title = "조문 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "조문 하나의 전문과 근거 법령(legal_basis), 참조(refs), 이전·다음 조문 id를 가져온다. search_rules로 찾은 article_id를 넣어 본문을 확인한 뒤 인용하라. 다중 기관 모드에서는 `기관/규정#제N조` 형식이다. 없는 id는 오류가 아니라 article이 비어 있는 결과로 돌아오며, 이는 규정이 없다는 뜻이 아니다. 답에는 조문 본문에 있는 내용만 쓰고, meta.effective는 팩 기준일로 표기하라."
     )]
     pub async fn get_article(
         &self,
@@ -1733,7 +1856,17 @@ impl PublicRulesServer {
         })
     }
 
-    #[tool(name = "list_rules", description = "List rules in the loaded pack.")]
+    #[tool(
+        name = "list_rules",
+        title = "규정 목록 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "로드된 팩에 수록된 규정 목록을 돌려준다. 어떤 규정이 수록되어 있는지 파악하거나 search_rules의 rule 인자를 정할 때 쓴다. 목록에 없는 규정은 이 팩에 수록되지 않은 것이며, 실제 규정의 존재 여부와는 다를 수 있다. meta.effective는 팩 기준일이다."
+    )]
     pub async fn list_rules(&self) -> Json<ListRulesResult> {
         let started_at = Instant::now();
         let rules = self
@@ -1759,7 +1892,14 @@ impl PublicRulesServer {
 
     #[tool(
         name = "get_legal_basis",
-        description = "Get legal basis for an article."
+        title = "근거 법령 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "조문이 근거로 든 상위 법령과 그 조문 인용 목록을 돌려준다. 조문 id를 넣는다. links의 resolution이 local_bundled이면 같은 팩에 수록된 조문이고 external_unverified이면 팩에 없어 이 서비스에서 확인하지 못한 인용이다. 확인되지 않은 인용은 법령 원문에서 직접 확인해야 한다고 안내하라. link_status로 조문 없음(article_not_found)과 인용 없음(none_in_pack)을 구분한다. meta.effective는 팩 기준일이다."
     )]
     pub async fn get_legal_basis(
         &self,
@@ -1808,7 +1948,17 @@ impl PublicRulesServer {
         })
     }
 
-    #[tool(name = "status", description = "Return loaded pack freshness status.")]
+    #[tool(
+        name = "status",
+        title = "팩 상태 조회",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "로드된 규정 팩의 기관, 기준일(effective_date), 소스 커밋, 인덱스 생성 시각, 벡터 검색 상태를 돌려준다. 답변이 기준으로 삼는 규정 시점을 밝히거나 여러 팩의 최신성을 점검할 때 쓴다. 기준일은 팩의 기준일이며 개별 조문의 개정·적용 시점이 아니다."
+    )]
     pub async fn status(&self) -> Json<StatusResult> {
         let started_at = Instant::now();
         let status = self.status_result();
@@ -2756,7 +2906,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
 
         assert!(!result.hits.is_empty());
         assert_eq!(result.hits[0].article_id, "여비지급규칙#제12조");
@@ -2774,7 +2925,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
 
         let ids = result
             .hits
@@ -2798,7 +2950,8 @@ table_structured: true
                 rule: None,
                 institution: Some("ctp".to_string()),
             }))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(filtered.hits.len(), 1);
         assert_eq!(filtered.hits[0].institution, "ctp");
         assert_eq!(filtered.hits[0].article_id, "ctp/인사규정#제10조");
@@ -2815,7 +2968,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(!ctp_result.hits.is_empty());
         assert!(ctp_result.hits.iter().all(|hit| hit.institution == "ctp"));
 
@@ -2826,7 +2980,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(!cni_result.hits.is_empty());
         assert!(cni_result.hits.iter().all(|hit| hit.institution == "cni"));
     }
@@ -2891,7 +3046,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(search
             .hits
             .iter()
@@ -2960,7 +3116,8 @@ table_structured: true
                 rule: None,
                 institution: None,
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(search
             .hits
             .iter()
@@ -3872,7 +4029,7 @@ refs: []
             Ok(_) => panic!("13 institutions must fail"),
             Err(error) => error,
         };
-        assert!(error.message.contains("분할 호출"));
+        assert!(error.contains("분할 호출"));
         for (requested_top_k, expected_max) in [(0, 1), (11, 10)] {
             let mut params = compare_params("육아휴직");
             params.top_k_per_institution = Some(requested_top_k);
@@ -4080,5 +4237,144 @@ refs: []
                 "missing golden provision {id}"
             );
         }
+    }
+
+    async fn search_ok(
+        server: &PublicRulesServer,
+        query: &str,
+        institution: Option<&str>,
+    ) -> SearchRulesResult {
+        let Json(result) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: query.to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: institution.map(ToString::to_string),
+            }))
+            .await
+            .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn search_rules_citations_cover_every_hit() {
+        let server = multi_pack_fixture_server();
+        let result = search_ok(&server, "육아휴직", None).await;
+        assert!(!result.hits.is_empty());
+        for hit in &result.hits {
+            let citation = result
+                .citations
+                .get(&hit.article_id)
+                .unwrap_or_else(|| panic!("missing citation for {}", hit.article_id));
+            assert_eq!(citation.institution, hit.institution);
+            assert_eq!(citation.rule, hit.rule);
+            assert_eq!(citation.title, hit.title);
+            assert!(!citation.article.is_empty());
+            assert!(!citation.source_commit.is_empty());
+        }
+        assert_eq!(result.citations.len(), result.hits.len());
+    }
+
+    #[tokio::test]
+    async fn citation_pack_effective_equals_pack_status_date() {
+        let server = multi_pack_fixture_server();
+        let result = search_ok(&server, "육아휴직", None).await;
+        for hit in &result.hits {
+            let citation = &result.citations[&hit.article_id];
+            let pack = server.pack_for_institution(&hit.institution).unwrap();
+            assert_eq!(citation.pack_effective, pack.index.status().effective_date);
+        }
+        let dates = result
+            .citations
+            .values()
+            .map(|citation| citation.pack_effective.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(dates, BTreeSet::from(["2026-02-27", "2026-03-01"]));
+    }
+
+    #[tokio::test]
+    async fn citations_carry_pages_for_articles_and_annexes() {
+        let root = make_r5_pack("cni");
+        let server = PublicRulesServer::from_config(ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(root),
+                ..PackConfig::default()
+            },
+            extra_packs: Vec::new(),
+            vectors: VectorConfig::default(),
+        })
+        .unwrap();
+        let result = search_ok(&server, "국내출장여비 항공", None).await;
+        let annex = &result.citations["여비지급규칙#별표1"];
+        assert!(
+            annex.pages.starts_with("350"),
+            "annex pages: {}",
+            annex.pages
+        );
+        assert_eq!(annex.article, "별표1");
+        assert_eq!(
+            annex.source_url.as_deref(),
+            Some("https://example.test/cni.pdf")
+        );
+        if let Some(article) = result.citations.get("여비지급규칙#제10조") {
+            assert!(article.pages.starts_with("345"), "pages: {}", article.pages);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rules_blank_query_is_an_error() {
+        let server = fixture_server();
+        for query in ["", "   ", "\t\n"] {
+            let outcome = server
+                .search_rules(Parameters(SearchRulesParams {
+                    query: query.to_string(),
+                    top_k: None,
+                    rule: None,
+                    institution: None,
+                }))
+                .await;
+            match outcome {
+                Ok(_) => panic!("blank query must be an error"),
+                Err(error) => assert_eq!(error, EMPTY_QUERY_MESSAGE),
+            }
+        }
+    }
+
+    #[test]
+    fn search_hit_shape_is_unchanged_by_citations() {
+        let hit = serde_json::to_value(SearchHit {
+            article_id: "a#제1조".into(),
+            institution: "x".into(),
+            score: 1.0,
+            snippet: "s".into(),
+            rule: "a".into(),
+            title: "t".into(),
+            effective: "2026-01-01".into(),
+            kind: "article".into(),
+        })
+        .unwrap();
+        let keys = hit
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "article_id",
+                "institution",
+                "score",
+                "snippet",
+                "rule",
+                "title",
+                "effective",
+                "kind"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>()
+        );
     }
 }
