@@ -1,0 +1,24 @@
+[
+  {
+    "arguments": [
+      {
+        "name": "institutions",
+        "required": false
+      },
+      {
+        "name": "query_variants",
+        "required": false
+      },
+      {
+        "name": "target_institution",
+        "required": true
+      },
+      {
+        "name": "topic",
+        "required": true
+      }
+    ],
+    "description": "여러 기관 노동·인사 규정을 비교하고 우리 기관의 개선 방향을 검토한다.",
+    "name": "labor_compare"
+  }
+]

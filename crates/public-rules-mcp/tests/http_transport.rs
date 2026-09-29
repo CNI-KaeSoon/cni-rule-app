@@ -440,6 +440,91 @@ async fn streamable_http_rejects_non_loopback_bind_without_auth() -> anyhow::Res
     Ok(())
 }
 
+fn sort_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(key, value)| (key, sort_json(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_json).collect())
+        }
+        other => other,
+    }
+}
+
+/// 스냅샷 비교. `UPDATE_SNAPSHOTS=1`일 때만 파일을 갱신한다.
+fn assert_snapshot(name: &str, value: serde_json::Value) -> anyhow::Result<()> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join(name);
+    let actual = format!("{}\n", serde_json::to_string_pretty(&sort_json(value))?);
+    if std::env::var("UPDATE_SNAPSHOTS").as_deref() == Ok("1") {
+        fs::create_dir_all(path.parent().expect("snapshot dir"))?;
+        fs::write(&path, &actual)?;
+        return Ok(());
+    }
+    let expected = fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "snapshot {} unreadable ({error}); run with UPDATE_SNAPSHOTS=1",
+            path.display()
+        )
+    })?;
+    assert_eq!(
+        actual, expected,
+        "snapshot {name} differs; rerun with UPDATE_SNAPSHOTS=1 and review the diff"
+    );
+    Ok(())
+}
+
+async fn snapshot_client() -> anyhow::Result<(
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
+    let fixture_root = make_fixture_pack()?;
+    let addr = unused_loopback_addr().await?;
+    let server_handle = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        fixture_config(fixture_root),
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: Vec::new(),
+            query_log_path: None,
+            auth_token: None,
+        },
+    ));
+    let client = connect_with_retry(&format!("http://{addr}/mcp")).await?;
+    Ok((client, server_handle))
+}
+
+#[tokio::test]
+async fn tools_list_matches_snapshot() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let mut tools = client.list_all_tools().await?;
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let outcome = assert_snapshot("tools_list.json", serde_json::to_value(&tools)?);
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    outcome
+}
+
+#[tokio::test]
+async fn prompts_list_matches_snapshot() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let mut prompts = client.list_all_prompts().await?;
+    prompts.sort_by(|left, right| left.name.cmp(&right.name));
+    let outcome = assert_snapshot("prompts_list.json", serde_json::to_value(&prompts)?);
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    outcome
+}
+
 async fn connect_with_retry(
     url: &str,
 ) -> anyhow::Result<
