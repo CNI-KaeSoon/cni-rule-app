@@ -196,7 +196,7 @@ pub struct Citation {
     pub title: String,
     /// 원문 페이지. 단일 `3`, 범위 `3-4`, 정보 없으면 빈 문자열
     pub pages: String,
-    /// 조문 개정 표기(팩에 기록된 값)
+    /// 조문 개정 표기(팩에 기록된 조문의 amended). 별표 등 개정 표기가 없으면 빈 문자열이며 팩 기준일로 대신하지 않는다
     pub amended: String,
     /// 이 결과가 속한 팩의 기준일
     pub pack_effective: String,
@@ -800,7 +800,7 @@ impl PublicRulesServer {
                             found.rule,
                             found.annex,
                             found.title,
-                            found.effective,
+                            String::new(),
                             found.meta.get("pages").cloned().unwrap_or_default(),
                         )
                     } else {
@@ -811,7 +811,7 @@ impl PublicRulesServer {
                                 .map(|(_, item)| item.to_string())
                                 .unwrap_or_default(),
                             hit.title.clone(),
-                            hit.effective.clone(),
+                            String::new(),
                             String::new(),
                         )
                     };
@@ -2780,10 +2780,12 @@ refs: []
     }
 
     fn unique_temp_root(name: &str) -> PathBuf {
+        static NEXT_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "public-rules-mcp-{name}-{}-{}",
+            "public-rules-mcp-{name}-{}-{}-{}",
             std::process::id(),
-            unix_epoch_ms()
+            unix_epoch_ms(),
+            NEXT_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ))
     }
 
@@ -4350,9 +4352,54 @@ refs: []
             annex.source_url.as_deref(),
             Some("https://example.test/cni.pdf")
         );
-        if let Some(article) = result.citations.get("여비지급규칙#제10조") {
-            assert!(article.pages.starts_with("345"), "pages: {}", article.pages);
-        }
+        let article = result
+            .citations
+            .get("여비지급규칙#제10조")
+            .expect("article citation must be present in the result");
+        assert!(article.pages.starts_with("345"), "pages: {}", article.pages);
+    }
+
+    #[tokio::test]
+    async fn citation_amended_is_not_filled_with_pack_date() {
+        let root = make_r5_pack("cni");
+        let server = PublicRulesServer::from_config(ServerConfig {
+            institution: "cni".to_string(),
+            pack: PackConfig {
+                path: Some(root),
+                ..PackConfig::default()
+            },
+            extra_packs: Vec::new(),
+            vectors: VectorConfig::default(),
+        })
+        .unwrap();
+        let result = search_ok(&server, "국내출장여비 항공", None).await;
+        let annex = result
+            .citations
+            .get("여비지급규칙#별표1")
+            .expect("annex citation must be present");
+        assert_eq!(annex.amended, "");
+        assert_eq!(annex.pack_effective, "2026-02-27");
+        let article = result
+            .citations
+            .get("여비지급규칙#제10조")
+            .expect("article citation must be present");
+        assert_eq!(article.amended, "2026-02-27");
+
+        // 조문 amended가 팩 기준일과 다르면 조문 값이 그대로 나온다.
+        let distinct = rules_core::parse_article_markdown_str(
+            "---\ninstitution: cni\nrule: 시험규칙\narticle: 제1조\ntitle: 시험\neffective: 2026-02-27\namended: 2025-01-01\nstatus: active\nsupersedes: null\nlegal_basis: []\nrefs: []\n---\n시험 본문\n",
+        )
+        .unwrap();
+        let index = TantivyRulesIndex::from_articles(
+            vec![distinct],
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let server = PublicRulesServer::new(index);
+        let result = search_ok(&server, "시험 본문", None).await;
+        let citation = result.citations.values().next().unwrap();
+        assert_eq!(citation.amended, "2025-01-01");
+        assert_eq!(citation.pack_effective, "2026-02-27");
     }
 
     #[tokio::test]

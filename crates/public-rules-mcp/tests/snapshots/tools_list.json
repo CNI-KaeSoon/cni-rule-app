@@ -1126,7 +1126,7 @@
           "description": "검색 결과 하나의 인용 묶음. 값은 모두 팩에서 읽은 것이다.",
           "properties": {
             "amended": {
-              "description": "조문 개정 표기(팩에 기록된 값)",
+              "description": "조문 개정 표기(팩에 기록된 조문의 amended). 별표 등 개정 표기가 없으면 빈 문자열이며 팩 기준일로 대신하지 않는다",
               "type": "string"
             },
             "article": {
