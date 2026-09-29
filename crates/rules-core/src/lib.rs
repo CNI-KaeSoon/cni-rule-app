@@ -9,12 +9,12 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value,
     STORED, STRING,
 };
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError, Term};
 use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -267,6 +267,256 @@ pub struct VectorSearchOptions {
     pub vector_weight: f32,
 }
 
+/// Search-time behaviour flags shared by all packs (PRD 2.3). Every field
+/// defaults to the legacy behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SearchOptions {
+    /// Apply the e5 model-card `passage:` / `query:` prefixes to both sides.
+    pub e5_prefix: bool,
+    /// Part-of-speech filter / normalisation of the BM25 `ko` analyzer.
+    pub ko_pos_filter: KoPosFilter,
+    /// Deterministic metadata context prepended to passages (PH-07).
+    pub context_prefix: ContextPrefix,
+    /// RRF weight of the character-bigram list (PH-08). `0.0` (default) means
+    /// the `body_ng` field is not indexed and the list is not computed.
+    pub bigram_weight: f32,
+}
+
+/// Allowed range of `search.bigram_weight`.
+pub const BIGRAM_WEIGHT_MAX: f32 = 2.0;
+
+/// Validates a `bigram_weight` value (`0.0..=2.0`, finite).
+pub fn validate_bigram_weight(weight: f32) -> std::result::Result<f32, String> {
+    if weight.is_finite() && (0.0..=BIGRAM_WEIGHT_MAX).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(format!(
+            "bigram_weight must be within 0.0..=2.0, got {weight}"
+        ))
+    }
+}
+
+impl SearchOptions {
+    /// Whether the bigram field is indexed and the list is computed.
+    pub fn bigram_enabled(&self) -> bool {
+        self.bigram_weight > 0.0
+    }
+
+    pub fn passage_format(&self) -> PassageFormat {
+        match (self.e5_prefix, self.context_prefix != ContextPrefix::None) {
+            (false, false) => PassageFormat::Legacy,
+            (true, false) => PassageFormat::E5Prefix,
+            (false, true) => PassageFormat::Ctx1,
+            (true, true) => PassageFormat::E5PrefixCtx1,
+        }
+    }
+}
+
+/// Where the deterministic article/annex context string is injected (PH-07).
+/// `Vector` = embedding passages only; `Both` = passages and the BM25 `body`
+/// field. `None` is the legacy behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextPrefix {
+    #[default]
+    None,
+    Vector,
+    Both,
+}
+
+impl ContextPrefix {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextPrefix::None => "none",
+            ContextPrefix::Vector => "vector",
+            ContextPrefix::Both => "both",
+        }
+    }
+}
+
+/// How per-pack search results are combined for a multi-pack query (PRD
+/// PH-09). `Rrf` (default) is the legacy rank-only fusion of the packs' final
+/// lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultipackFusion {
+    #[default]
+    Rrf,
+    /// Sort the union of the packs' in-pack fused scores (same `rrf_k` and
+    /// weights, hence one scale) globally.
+    Score,
+    /// Merge each ranker's list across packs by its raw score, then run one
+    /// weighted RRF. BM25 and lexical raw scores use per-pack IDF, so the
+    /// cross-pack ordering of those lists is an approximation.
+    Global,
+}
+
+impl MultipackFusion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MultipackFusion::Rrf => "rrf",
+            MultipackFusion::Score => "score",
+            MultipackFusion::Global => "global",
+        }
+    }
+}
+
+/// Individual rankers that feed the in-pack RRF, in fusion order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RankerKind {
+    AnnexRef,
+    Bm25,
+    Vector,
+    Rule,
+    Lexical,
+    Bigram,
+}
+
+impl RankerKind {
+    pub const ALL: [RankerKind; 6] = [
+        RankerKind::AnnexRef,
+        RankerKind::Bm25,
+        RankerKind::Vector,
+        RankerKind::Rule,
+        RankerKind::Lexical,
+        RankerKind::Bigram,
+    ];
+}
+
+/// [`SearchRouteReport`] plus the per-ranker lists it was fused from (PH-09).
+/// `report` is exactly what `search_with_routes` returns.
+#[derive(Debug, Clone, Default)]
+pub struct DetailedRouteReport {
+    pub report: SearchRouteReport,
+    /// Ranker lists with their raw scores, in fusion order.
+    pub per_ranker: Vec<(RankerKind, Vec<SearchHit>)>,
+    /// RRF weight of each ranker in this pack.
+    pub weights: Vec<(RankerKind, f32)>,
+    pub pinned: Option<SearchHit>,
+    pub rrf_k: usize,
+}
+
+impl DetailedRouteReport {
+    /// Wraps a plain report without ranker detail (`rrf`/`score` need none).
+    pub fn from_report(report: SearchRouteReport) -> Self {
+        let pinned = report.pin_hit.clone();
+        Self {
+            report,
+            per_ranker: Vec::new(),
+            weights: Vec::new(),
+            pinned,
+            rrf_k: DEFAULT_RRF_K,
+        }
+    }
+}
+
+/// BM25 analyzer variants (PRD PH-06). `None` is the legacy token stream.
+/// `V1` = NFKC + lowercase + particle/symbol stop tags; `V2` = `V1` plus
+/// verbal endings. Matching is exact on the first ko-dic feature, so compound
+/// tags such as `VV+EC` are intentionally kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KoPosFilter {
+    #[default]
+    None,
+    V1,
+    V2,
+}
+
+/// Stop tags of `V1`: case/particle markers and punctuation-like symbols.
+const KO_STOP_TAGS_V1: [&str; 15] = [
+    "JKS", "JKC", "JKG", "JKO", "JKB", "JKV", "JKQ", "JX", "JC", "SF", "SE", "SSO", "SSC", "SC",
+    "SY",
+];
+/// Additional stop tags of `V2`: pre-final, final, connective and
+/// nominalising/adnominal endings.
+const KO_STOP_TAGS_V2_EXTRA: [&str; 5] = ["EP", "EF", "EC", "ETN", "ETM"];
+
+impl KoPosFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KoPosFilter::None => "none",
+            KoPosFilter::V1 => "v1",
+            KoPosFilter::V2 => "v2",
+        }
+    }
+
+    /// Exact tag set removed by this variant (empty for `None`).
+    pub fn stop_tags(self) -> Vec<&'static str> {
+        match self {
+            KoPosFilter::None => Vec::new(),
+            KoPosFilter::V1 => KO_STOP_TAGS_V1.to_vec(),
+            KoPosFilter::V2 => KO_STOP_TAGS_V1
+                .iter()
+                .chain(KO_STOP_TAGS_V2_EXTRA.iter())
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+/// Which analyzer the BM25 index really uses; a dictionary load failure is
+/// reported here instead of silently changing behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TokenizerStatus {
+    /// `lindera-ko-dic` or `simple-fallback`.
+    pub kind: String,
+    /// Filter variant actually applied (`none` when the fallback is active).
+    pub filter: String,
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// How passage text is rendered before embedding. `Legacy` keeps the original
+/// text and the original cache key bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PassageFormat {
+    #[default]
+    Legacy,
+    E5Prefix,
+    /// Metadata context line before the passage (`ctx1`).
+    Ctx1,
+    /// `passage: ` prefix plus the context line (`e5p+ctx1`).
+    E5PrefixCtx1,
+}
+
+impl PassageFormat {
+    /// Value stored in the cache key; `None` for legacy so the key is unchanged.
+    fn cache_tag(self) -> Option<&'static str> {
+        match self {
+            PassageFormat::Legacy => None,
+            PassageFormat::E5Prefix => Some("e5p"),
+            PassageFormat::Ctx1 => Some("ctx1"),
+            PassageFormat::E5PrefixCtx1 => Some("e5p+ctx1"),
+        }
+    }
+
+    fn has_e5_prefix(self) -> bool {
+        matches!(self, PassageFormat::E5Prefix | PassageFormat::E5PrefixCtx1)
+    }
+
+    fn has_context(self) -> bool {
+        matches!(self, PassageFormat::Ctx1 | PassageFormat::E5PrefixCtx1)
+    }
+
+    fn passage_text(self, text: String) -> String {
+        if self.has_e5_prefix() {
+            format!("passage: {text}")
+        } else {
+            text
+        }
+    }
+
+    fn query_text(self, q: &str) -> std::borrow::Cow<'_, str> {
+        if self.has_e5_prefix() {
+            std::borrow::Cow::Owned(format!("query: {q}"))
+        } else {
+            std::borrow::Cow::Borrowed(q)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VectorStatus {
     pub enabled: bool,
@@ -385,6 +635,8 @@ struct SearchFields {
     rule: Field,
     title: Field,
     body: Field,
+    /// Character-bigram field (PH-08); present only when `bigram_weight > 0`.
+    body_ng: Option<Field>,
 }
 
 #[derive(Clone)]
@@ -457,10 +709,26 @@ pub struct TantivyRulesIndex {
     vector_enabled_requested: bool,
     rrf_k: usize,
     vector_weight: f32,
+    search_options: SearchOptions,
+    tokenizer_status: TokenizerStatus,
+    /// Deterministic article/annex context strings (empty unless
+    /// `context_prefix` is on).
+    contexts: BTreeMap<String, String>,
 }
 
 impl TantivyRulesIndex {
     pub fn from_articles<I>(articles: I, status: PackStatus) -> Result<Self>
+    where
+        I: IntoIterator<Item = Article>,
+    {
+        Self::from_articles_with_options(articles, status, SearchOptions::default())
+    }
+
+    pub fn from_articles_with_options<I>(
+        articles: I,
+        status: PackStatus,
+        search_options: SearchOptions,
+    ) -> Result<Self>
     where
         I: IntoIterator<Item = Article>,
     {
@@ -473,8 +741,20 @@ impl TantivyRulesIndex {
             &[],
             status,
             &VectorSearchOptions::default(),
+            search_options,
             false,
         )
+    }
+
+    /// Analyzer actually used by the BM25 index.
+    pub fn tokenizer_status(&self) -> &TokenizerStatus {
+        &self.tokenizer_status
+    }
+
+    /// Test hook (like `enable_vectors_for_test`): pretend the analyzer degraded.
+    #[doc(hidden)]
+    pub fn set_tokenizer_status_for_test(&mut self, status: TokenizerStatus) {
+        self.tokenizer_status = status;
     }
 
     /// Builds the search index, summaries and graph exactly once.
@@ -487,10 +767,25 @@ impl TantivyRulesIndex {
         edges: &[GraphEdge],
         status: PackStatus,
         opts: &VectorSearchOptions,
+        search_options: SearchOptions,
         with_page_owners: bool,
     ) -> Result<Self> {
         link_neighbors(&mut articles);
-        let (index, fields) = build_search_index(articles.values(), annexes.values())?;
+        let (graph, node_indices) = build_ref_graph(articles.values(), nodes, edges);
+        let contexts = if search_options.context_prefix == ContextPrefix::None {
+            BTreeMap::new()
+        } else {
+            build_contexts(&articles, &annexes, &graph, &node_indices, nodes)
+        };
+        let bm25_contexts =
+            (search_options.context_prefix == ContextPrefix::Both).then_some(&contexts);
+        let (index, fields, tokenizer_status) = build_search_index(
+            articles.values(),
+            annexes.values(),
+            search_options.ko_pos_filter,
+            bm25_contexts,
+            search_options.bigram_enabled(),
+        )?;
         let reader = SearchReader(
             index
                 .reader_builder()
@@ -498,7 +793,6 @@ impl TantivyRulesIndex {
                 .try_into()?,
         );
         let summaries = build_rule_summaries(articles.values());
-        let (graph, node_indices) = build_ref_graph(articles.values(), nodes, edges);
         let page_owners = if with_page_owners {
             build_page_owners(articles.values(), annexes.values())
         } else {
@@ -522,6 +816,9 @@ impl TantivyRulesIndex {
             vector_enabled_requested: opts.enabled,
             rrf_k: opts.rrf_k,
             vector_weight: opts.vector_weight,
+            search_options,
+            tokenizer_status,
+            contexts,
         })
     }
 
@@ -548,6 +845,8 @@ impl TantivyRulesIndex {
             provider.as_ref(),
             cache_key,
             cache_dir,
+            self.search_options.passage_format(),
+            &self.contexts,
         )?);
         self.vector_provider = Some(StoredEmbeddingProvider(provider));
         Ok(())
@@ -561,12 +860,20 @@ impl TantivyRulesIndex {
         path: impl AsRef<Path>,
         vector_options: VectorSearchOptions,
     ) -> Result<Self> {
+        Self::from_pack_dir_with_options(path, vector_options, SearchOptions::default())
+    }
+
+    pub fn from_pack_dir_with_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+        search_options: SearchOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let mut manifest: PackManifest =
             serde_json::from_reader(File::open(path.join("manifest.json"))?)?;
         manifest.normalize_hashes();
         verify_manifest(path, &manifest)?;
-        let cache_key = pack_vector_cache_key(&manifest);
+        let cache_key = pack_vector_cache_key(&manifest, search_options.passage_format());
 
         let articles = load_articles_dir(path.join("articles"))?;
         let annexes = load_annexes_dir(path.join("annexes"))?;
@@ -590,6 +897,7 @@ impl TantivyRulesIndex {
             &edges,
             status,
             &vector_options,
+            search_options,
             true,
         )?;
         if let Some((corpus, provider)) =
@@ -611,9 +919,17 @@ impl TantivyRulesIndex {
         path: impl AsRef<Path>,
         vector_options: VectorSearchOptions,
     ) -> Result<Self> {
+        Self::from_pack_archive_with_options(path, vector_options, SearchOptions::default())
+    }
+
+    pub fn from_pack_archive_with_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+        search_options: SearchOptions,
+    ) -> Result<Self> {
         let tmp = tempfile::tempdir()?;
         unpack_pack_archive(path, tmp.path())?;
-        Self::from_pack_dir_with_vector_options(tmp.path(), vector_options)
+        Self::from_pack_dir_with_options(tmp.path(), vector_options, search_options)
     }
 
     pub fn search_with_routes(
@@ -635,7 +951,73 @@ impl TantivyRulesIndex {
         }
     }
 
+    /// Same result as [`Self::search_with_routes`] (`report`), plus the
+    /// per-ranker lists needed by `MultipackFusion::Global`.
+    pub fn search_with_routes_detailed(
+        &self,
+        q: &str,
+        k: usize,
+        filter: Option<RuleFilter>,
+    ) -> DetailedRouteReport {
+        if q.trim().is_empty() || k == 0 {
+            return DetailedRouteReport::default();
+        }
+        let pinned = self.direct_article_hit(q, filter.as_ref());
+        let (per_ranker, retrieval_hits) = match self.retrieval_rankers(q, k, filter.as_ref()) {
+            Err(fallback) => (vec![(RankerKind::Lexical, fallback.clone())], fallback),
+            Ok(rankers) => {
+                let fused = self.fuse_rankers(rankers.clone(), k);
+                (rankers, fused)
+            }
+        };
+        let hits = merge_pinned_hits(pinned.clone(), retrieval_hits.clone(), k);
+        DetailedRouteReport {
+            report: SearchRouteReport {
+                hits,
+                pin_hit: pinned.clone(),
+                retrieval_hits,
+            },
+            per_ranker,
+            weights: RankerKind::ALL
+                .iter()
+                .map(|kind| (*kind, self.ranker_weight(*kind)))
+                .collect(),
+            pinned,
+            rrf_k: self.rrf_k,
+        }
+    }
+
     fn search_retrieval(&self, q: &str, k: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        match self.retrieval_rankers(q, k, filter) {
+            Err(fallback) => fallback,
+            Ok(rankers) => self.fuse_rankers(rankers, k),
+        }
+    }
+
+    fn ranker_weight(&self, kind: RankerKind) -> f32 {
+        match kind {
+            RankerKind::Vector => self.vector_weight,
+            RankerKind::Bigram => self.search_options.bigram_weight,
+            _ => 1.0,
+        }
+    }
+
+    fn fuse_rankers(&self, rankers: Vec<(RankerKind, Vec<SearchHit>)>, k: usize) -> Vec<SearchHit> {
+        let (rankings, weights): (Vec<_>, Vec<_>) = rankers
+            .into_iter()
+            .map(|(kind, hits)| (hits, self.ranker_weight(kind)))
+            .unzip();
+        rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
+    }
+
+    /// Runs every ranker. `Err` carries the lexical fallback used when the
+    /// BM25 query itself fails.
+    fn retrieval_rankers(
+        &self,
+        q: &str,
+        k: usize,
+        filter: Option<&RuleFilter>,
+    ) -> std::result::Result<Vec<(RankerKind, Vec<SearchHit>)>, Vec<SearchHit>> {
         let query_terms = query_terms(q);
         let normalized_query = query_terms.join(" ");
         let parser_query = if normalized_query.is_empty() {
@@ -650,7 +1032,7 @@ impl TantivyRulesIndex {
         let searcher = self.reader.0.searcher();
         let candidate_limit = k * 4;
         let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(candidate_limit)) else {
-            return lexical_fallback(self.articles.values(), q, k, filter);
+            return Err(lexical_fallback(self.articles.values(), q, k, filter));
         };
 
         let mut bm25_hits = Vec::new();
@@ -703,23 +1085,78 @@ impl TantivyRulesIndex {
         );
         let annex_ref_hits = self.annex_reference_rank(q, candidate_limit, filter);
         let vector_hits = self.vector_rank(q, candidate_limit, filter);
-        let mut rankings = Vec::new();
-        let mut weights = Vec::new();
-        rankings.push(annex_ref_hits);
-        weights.push(1.0);
+        let bigram_hits = self.bigram_rank(q, candidate_limit, filter);
+        let mut rankers = Vec::new();
+        rankers.push((RankerKind::AnnexRef, annex_ref_hits));
         if !bm25_hits.is_empty() {
-            rankings.push(bm25_hits);
-            weights.push(1.0);
+            rankers.push((RankerKind::Bm25, bm25_hits));
         }
         if !vector_hits.is_empty() {
-            rankings.push(vector_hits);
-            weights.push(self.vector_weight);
+            rankers.push((RankerKind::Vector, vector_hits));
         }
-        rankings.push(rule_hits);
-        weights.push(1.0);
-        rankings.push(lexical_hits);
-        weights.push(1.0);
-        rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
+        rankers.push((RankerKind::Rule, rule_hits));
+        rankers.push((RankerKind::Lexical, lexical_hits));
+        if !bigram_hits.is_empty() {
+            rankers.push((RankerKind::Bigram, bigram_hits));
+        }
+        Ok(rankers)
+    }
+
+    /// BM25 ranking over the character-bigram field (PH-08). Empty unless the
+    /// field was indexed (`bigram_weight > 0`). The query is compacted the same
+    /// way as the indexed text and turned into a bag of bigram terms; a
+    /// `QueryParser` would build a phrase query out of them (bigram tokens all
+    /// share position 0), which cannot match.
+    fn bigram_rank(&self, q: &str, limit: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        let Some(field) = self.fields.body_ng else {
+            return Vec::new();
+        };
+        if !self.search_options.bigram_enabled() {
+            return Vec::new();
+        }
+        let compact = normalize_compact(q);
+        if compact.is_empty() {
+            return Vec::new();
+        }
+        let Some(mut analyzer) = self.index.tokenizers().get(BIGRAM_TOKENIZER) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let mut stream = analyzer.token_stream(&compact);
+        stream.process(&mut |token| {
+            if seen.insert(token.text.clone()) {
+                clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, &token.text),
+                        IndexRecordOption::WithFreqs,
+                    )),
+                ));
+            }
+        });
+        if clauses.is_empty() {
+            return Vec::new();
+        }
+        let query = BooleanQuery::new(clauses);
+        let searcher = self.reader.0.searcher();
+        let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(limit)) else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for (score, addr) in top_docs {
+            let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                continue;
+            };
+            let Some(id) = first_text(&doc, self.fields.id) else {
+                continue;
+            };
+            if let Some(hit) = self.search_hit_for_id(id, score, q, filter) {
+                hits.push(hit);
+            }
+        }
+        sort_hits_by_score_and_id(&mut hits);
+        hits
     }
 }
 
@@ -924,7 +1361,8 @@ impl TantivyRulesIndex {
         let Some(provider) = &self.vector_provider else {
             return Vec::new();
         };
-        let Ok(query) = provider.0.embed(q) else {
+        let query_text = self.search_options.passage_format().query_text(q);
+        let Ok(query) = provider.0.embed(&query_text) else {
             eprintln!("vector search query embedding failed; falling back for this query");
             return Vec::new();
         };
@@ -1011,6 +1449,8 @@ impl TantivyRulesIndex {
             provider.as_ref(),
             cache_key,
             Some(cache_dir),
+            self.search_options.passage_format(),
+            &self.contexts,
         )?;
         Ok((corpus, StoredEmbeddingProvider(provider)))
     }
@@ -1026,16 +1466,7 @@ impl TantivyRulesIndex {
     }
 
     fn reverse_neighbors(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
-        let Some(node) = self.node_indices.get(id).copied() else {
-            return Vec::new();
-        };
-        let mut out = BTreeSet::new();
-        for edge in self.graph.edges_directed(node, petgraph::Incoming) {
-            if accept(*edge.weight()) {
-                out.insert(self.graph[edge.source()].clone());
-            }
-        }
-        out.into_iter().collect()
+        reverse_neighbors_in(&self.graph, &self.node_indices, id, accept)
     }
 
     fn forward_traversal(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
@@ -1421,6 +1852,126 @@ pub fn merge_search_route_reports(reports: Vec<SearchRouteReport>, k: usize) -> 
     }
 }
 
+/// Namespaces every hit of a detailed report (see
+/// [`namespace_search_route_report`]).
+pub fn namespace_detailed_route_report(
+    mut detailed: DetailedRouteReport,
+    institution: &str,
+    prefix_article_ids: bool,
+) -> DetailedRouteReport {
+    detailed.report =
+        namespace_search_route_report(detailed.report, institution, prefix_article_ids);
+    for (_, hits) in &mut detailed.per_ranker {
+        for hit in hits {
+            namespace_search_hit(hit, institution, prefix_article_ids);
+        }
+    }
+    if let Some(hit) = &mut detailed.pinned {
+        namespace_search_hit(hit, institution, prefix_article_ids);
+    }
+    detailed
+}
+
+/// Multi-pack merge selected by `search.multipack_fusion` (PH-09). `Rrf`
+/// is exactly [`merge_search_route_reports`]. A single report is returned
+/// unchanged whatever the mode. `Global` needs `per_ranker` detail; reports
+/// without it are merged as `Score`.
+pub fn merge_search_route_reports_with(
+    reports: Vec<DetailedRouteReport>,
+    k: usize,
+    fusion: MultipackFusion,
+) -> SearchRouteReport {
+    if reports.len() <= 1 || k == 0 || fusion == MultipackFusion::Rrf {
+        return merge_search_route_reports(reports.into_iter().map(|d| d.report).collect(), k);
+    }
+    let has_detail = reports.iter().any(|d| !d.per_ranker.is_empty());
+    if fusion == MultipackFusion::Global && has_detail {
+        merge_global(&reports, k)
+    } else {
+        merge_by_score(reports.into_iter().map(|d| d.report).collect(), k)
+    }
+}
+
+/// Union by `article_id` keeping the higher-scored copy, ordered by
+/// `(score desc, article_id asc)`.
+fn union_by_score<'a>(
+    lists: impl Iterator<Item = &'a Vec<SearchHit>>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut by_id: BTreeMap<String, SearchHit> = BTreeMap::new();
+    for hit in lists.flatten() {
+        match by_id.get_mut(&hit.article_id) {
+            Some(existing) => {
+                if hit.score.total_cmp(&existing.score) == std::cmp::Ordering::Greater {
+                    *existing = hit.clone();
+                }
+            }
+            None => {
+                by_id.insert(hit.article_id.clone(), hit.clone());
+            }
+        }
+    }
+    let mut hits: Vec<SearchHit> = by_id.into_values().collect();
+    sort_hits_by_score_and_id(&mut hits);
+    hits.truncate(limit);
+    hits
+}
+
+fn merge_by_score(reports: Vec<SearchRouteReport>, k: usize) -> SearchRouteReport {
+    let hits = union_by_score(reports.iter().map(|r| &r.hits), k);
+    let retrieval_hits = union_by_score(reports.iter().map(|r| &r.retrieval_hits), k);
+    let pins: Vec<SearchHit> = reports.iter().filter_map(|r| r.pin_hit.clone()).collect();
+    let pin_hit = union_by_score(std::iter::once(&pins), 1).into_iter().next();
+    SearchRouteReport {
+        hits,
+        pin_hit,
+        retrieval_hits,
+    }
+}
+
+fn merge_global(reports: &[DetailedRouteReport], k: usize) -> SearchRouteReport {
+    let rrf_k = reports.first().map_or(DEFAULT_RRF_K, |d| d.rrf_k);
+    let limit = k.saturating_mul(4);
+    let mut rankings = Vec::new();
+    let mut weights = Vec::new();
+    for kind in RankerKind::ALL {
+        let lists: Vec<&Vec<SearchHit>> = reports
+            .iter()
+            .flat_map(|d| d.per_ranker.iter())
+            .filter(|(k2, _)| *k2 == kind)
+            .map(|(_, hits)| hits)
+            .collect();
+        let merged = union_by_score(lists.into_iter(), limit);
+        if merged.is_empty() {
+            continue;
+        }
+        let weight = reports
+            .iter()
+            .flat_map(|d| d.weights.iter())
+            .find(|(k2, _)| *k2 == kind)
+            .map_or(1.0, |(_, w)| *w);
+        rankings.push(merged);
+        weights.push(weight);
+    }
+    let retrieval_hits = rrf_fuse_weighted(rankings, k, rrf_k, &weights);
+
+    let pins_raw: Vec<SearchHit> = reports.iter().filter_map(|d| d.pinned.clone()).collect();
+    let pins = union_by_score(std::iter::once(&pins_raw), k);
+    let mut hits = pins.clone();
+    hits.extend(
+        retrieval_hits
+            .iter()
+            .filter(|hit| !pins.iter().any(|pin| pin.article_id == hit.article_id))
+            .cloned(),
+    );
+    hits.truncate(k);
+    SearchRouteReport {
+        hits,
+        pin_hit: pins.into_iter().next(),
+        retrieval_hits,
+    }
+}
+
 fn namespace_search_hit(hit: &mut SearchHit, institution: &str, prefix_article_ids: bool) {
     hit.institution = institution.to_string();
     if prefix_article_ids {
@@ -1616,7 +2167,10 @@ thread_local! {
 fn build_search_index<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
-) -> Result<(Index, SearchFields)> {
+    ko_pos_filter: KoPosFilter,
+    body_contexts: Option<&BTreeMap<String, String>>,
+    with_bigram: bool,
+) -> Result<(Index, SearchFields, TokenizerStatus)> {
     #[cfg(test)]
     SEARCH_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
     let mut schema_builder = Schema::builder();
@@ -1632,31 +2186,59 @@ fn build_search_index<'a>(
     let title = schema_builder.add_text_field("title", ko_text.clone());
     let effective = schema_builder.add_text_field("effective", STRING | STORED);
     let body = schema_builder.add_text_field("body", ko_text);
+    let body_ng = with_bigram.then(|| {
+        schema_builder.add_text_field(
+            "body_ng",
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(BIGRAM_TOKENIZER)
+                    .set_index_option(IndexRecordOption::WithFreqs),
+            ),
+        )
+    });
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
-    register_ko_tokenizer(&index);
+    let tokenizer_status = register_ko_tokenizer(&index, ko_pos_filter);
+    if with_bigram {
+        register_bigram_tokenizer(&index)?;
+    }
 
     let fields = SearchFields {
         id,
         rule,
         title,
         body,
+        body_ng,
     };
     let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
     for entry in articles
         .map(SearchEntry::from_article)
         .chain(annexes.map(SearchEntry::from_annex))
     {
-        writer.add_document(doc!(
+        // Bigram source: compacted title + body without any context prefix.
+        let bigram_source = if with_bigram {
+            normalize_compact(&format!("{}\n{}", entry.title, entry.body))
+        } else {
+            String::new()
+        };
+        let entry_body = match body_contexts.and_then(|contexts| contexts.get(&entry.id)) {
+            Some(context) => format!("{context}\n{}", entry.body),
+            None => entry.body,
+        };
+        let mut document = doc!(
             id => entry.id,
             rule => entry.rule,
             title => entry.title,
             effective => entry.effective,
-            body => entry.body,
-        ))?;
+            body => entry_body,
+        );
+        if let Some(field) = body_ng {
+            document.add_text(field, bigram_source);
+        }
+        writer.add_document(document)?;
     }
     writer.commit()?;
-    Ok((index, fields))
+    Ok((index, fields, tokenizer_status))
 }
 
 struct SearchEntry {
@@ -1719,6 +2301,20 @@ fn searchable_text_with_compact(text: &str) -> String {
     }
 }
 
+const BIGRAM_TOKENIZER: &str = "ko_ng";
+
+/// `ko_ng` analyzer: lower-cased character 2-grams (no whitespace handling,
+/// the source text is already compacted).
+fn register_bigram_tokenizer(index: &Index) -> Result<()> {
+    use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
+    let tokenizer = NgramTokenizer::new(2, 2, false)?;
+    index.tokenizers().register(
+        BIGRAM_TOKENIZER,
+        TextAnalyzer::builder(tokenizer).filter(LowerCaser).build(),
+    );
+    Ok(())
+}
+
 fn normalize_compact(text: &str) -> String {
     text.nfkc()
         .filter(|ch| !ch.is_whitespace())
@@ -1726,23 +2322,79 @@ fn normalize_compact(text: &str) -> String {
 }
 
 #[cfg(feature = "korean-tokenizer")]
-fn register_ko_tokenizer(index: &Index) {
-    use lindera::dictionary::load_dictionary;
-    use lindera::mode::Mode;
-    use lindera::segmenter::Segmenter;
-
-    let tokenizer = load_dictionary("embedded://ko-dic")
-        .map(|dictionary| Segmenter::new(Mode::Normal, dictionary, None))
-        .map(lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter);
-    match tokenizer {
-        Ok(tokenizer) => index.tokenizers().register("ko", tokenizer),
-        Err(_) => register_simple_ko_tokenizer(index),
-    }
+fn register_ko_tokenizer(index: &Index, filter: KoPosFilter) -> TokenizerStatus {
+    register_ko_tokenizer_with(index, filter, || {
+        lindera::dictionary::load_dictionary("embedded://ko-dic")
+    })
 }
 
 #[cfg(not(feature = "korean-tokenizer"))]
-fn register_ko_tokenizer(index: &Index) {
+fn register_ko_tokenizer(index: &Index, _filter: KoPosFilter) -> TokenizerStatus {
     register_simple_ko_tokenizer(index);
+    TokenizerStatus {
+        kind: "simple-fallback".to_string(),
+        filter: KoPosFilter::None.as_str().to_string(),
+        degraded: true,
+        reason: Some("korean-tokenizer feature disabled".to_string()),
+    }
+}
+
+/// Registers the `ko` analyzer. `loader` supplies the dictionary so that a
+/// load failure can be exercised; on failure the simple tokenizer is used, an
+/// `ERROR tokenizer` line is written to stderr and the status says so.
+#[cfg(feature = "korean-tokenizer")]
+fn register_ko_tokenizer_with<F>(index: &Index, filter: KoPosFilter, loader: F) -> TokenizerStatus
+where
+    F: FnOnce() -> lindera::LinderaResult<lindera::dictionary::Dictionary>,
+{
+    use lindera::character_filter::unicode_normalize::{
+        UnicodeNormalizeCharacterFilter, UnicodeNormalizeKind,
+    };
+    use lindera::character_filter::BoxCharacterFilter;
+    use lindera::mode::Mode;
+    use lindera::segmenter::Segmenter;
+    use lindera::token_filter::korean_stop_tags::KoreanStopTagsTokenFilter;
+    use lindera::token_filter::lowercase::LowercaseTokenFilter;
+    use lindera::token_filter::BoxTokenFilter;
+
+    match loader() {
+        Ok(dictionary) => {
+            let mut tokenizer = lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter(
+                Segmenter::new(Mode::Normal, dictionary, None),
+            );
+            if filter != KoPosFilter::None {
+                let tags = filter.stop_tags().into_iter().map(String::from).collect();
+                tokenizer.append_character_filter(BoxCharacterFilter::from(
+                    UnicodeNormalizeCharacterFilter::new(UnicodeNormalizeKind::NFKC),
+                ));
+                tokenizer.append_token_filter(BoxTokenFilter::from(LowercaseTokenFilter::new()));
+                tokenizer.append_token_filter(BoxTokenFilter::from(
+                    KoreanStopTagsTokenFilter::new(tags),
+                ));
+            }
+            index.tokenizers().register("ko", tokenizer);
+            TokenizerStatus {
+                kind: "lindera-ko-dic".to_string(),
+                filter: filter.as_str().to_string(),
+                degraded: false,
+                reason: None,
+            }
+        }
+        Err(error) => {
+            let reason = format!("ko-dic load failed: {error}");
+            eprintln!(
+                "ERROR tokenizer {reason}; using simple fallback (pos filter {} not applied)",
+                filter.as_str()
+            );
+            register_simple_ko_tokenizer(index);
+            TokenizerStatus {
+                kind: "simple-fallback".to_string(),
+                filter: KoPosFilter::None.as_str().to_string(),
+                degraded: true,
+                reason: Some(reason),
+            }
+        }
+    }
 }
 
 fn register_simple_ko_tokenizer(index: &Index) {
@@ -1770,6 +2422,135 @@ fn build_rule_summaries<'a>(articles: impl Iterator<Item = &'a Article>) -> Vec<
         }
     }
     by_rule.into_values().collect()
+}
+
+const CONTEXT_SEPARATOR: &str = " · ";
+const ANNEX_REFS_LABEL: &str = "참조 조문:";
+const ANNEX_REFS_MAX_TITLES: usize = 5;
+const ANNEX_REFS_MAX_CHARS: usize = 200;
+
+/// Institution slug -> display label from `Institution` graph nodes.
+fn institution_labels(nodes: &[GraphNode]) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    for node in nodes.iter().filter(|n| n.kind == NodeKind::Institution) {
+        if node.label.trim().is_empty() {
+            continue;
+        }
+        labels
+            .entry(node.id.clone())
+            .or_insert_with(|| node.label.clone());
+        if let Some(slug) = node.meta.get("institution").and_then(|v| v.as_str()) {
+            labels
+                .entry(slug.to_string())
+                .or_insert_with(|| node.label.clone());
+        }
+    }
+    labels
+}
+
+/// `"{institution label} · {rule} · {article}({title})"`; the title
+/// parentheses are omitted for an empty title.
+fn article_context(institution_label: &str, article: &Article) -> String {
+    let mut out = [institution_label, &article.rule, &article.article].join(CONTEXT_SEPARATOR);
+    let title = article.title.trim();
+    if !title.is_empty() {
+        out.push('(');
+        out.push_str(title);
+        out.push(')');
+    }
+    out
+}
+
+/// `"{rule} · {annex title} · 참조 조문: {t1}, {t2}, …"`; the reference part is
+/// omitted when no article references the annex. The joined title list is
+/// cut at 200 characters (never inside a character).
+fn annex_context(annex: &Annex, referencing_titles: &[String]) -> String {
+    let mut out = [annex.rule.as_str(), annex_search_title(annex).as_str()].join(CONTEXT_SEPARATOR);
+    if !referencing_titles.is_empty() {
+        let joined = referencing_titles.join(", ");
+        let cut: String = joined.chars().take(ANNEX_REFS_MAX_CHARS).collect();
+        out.push_str(CONTEXT_SEPARATOR);
+        out.push_str(ANNEX_REFS_LABEL);
+        out.push(' ');
+        out.push_str(&cut);
+    }
+    out
+}
+
+/// Titles of the first five same-institution articles (by article number) that
+/// point at the annex through `AppliesTo` or `Cites`. An article without a
+/// title contributes its article number.
+fn annex_referencing_titles(
+    articles: &BTreeMap<String, Article>,
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    annex: &Annex,
+) -> Vec<String> {
+    let mut sources = reverse_neighbors_in(graph, node_indices, &annex.id, |kind| {
+        matches!(kind, EdgeKind::AppliesTo | EdgeKind::Cites)
+    })
+    .into_iter()
+    .filter_map(|id| articles.get(&id))
+    .filter(|article| article.institution == annex.institution)
+    .collect::<Vec<_>>();
+    sources.sort_by(|a, b| {
+        article_sort_key(&a.article)
+            .cmp(&article_sort_key(&b.article))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sources
+        .into_iter()
+        .take(ANNEX_REFS_MAX_TITLES)
+        .map(|article| {
+            let title = article.title.trim();
+            if title.is_empty() {
+                article.article.clone()
+            } else {
+                title.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Context string per article/annex id (pure function of the pack contents).
+fn build_contexts(
+    articles: &BTreeMap<String, Article>,
+    annexes: &BTreeMap<String, Annex>,
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    nodes: &[GraphNode],
+) -> BTreeMap<String, String> {
+    let labels = institution_labels(nodes);
+    let mut contexts = BTreeMap::new();
+    for article in articles.values() {
+        let label = labels
+            .get(&article.institution)
+            .unwrap_or(&article.institution);
+        contexts.insert(article.id.clone(), article_context(label, article));
+    }
+    for annex in annexes.values() {
+        let titles = annex_referencing_titles(articles, graph, node_indices, annex);
+        contexts.insert(annex.id.clone(), annex_context(annex, &titles));
+    }
+    contexts
+}
+
+fn reverse_neighbors_in(
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    id: &str,
+    accept: impl Fn(EdgeKind) -> bool,
+) -> Vec<String> {
+    let Some(node) = node_indices.get(id).copied() else {
+        return Vec::new();
+    };
+    let mut out = BTreeSet::new();
+    for edge in graph.edges_directed(node, petgraph::Incoming) {
+        if accept(*edge.weight()) {
+            out.insert(graph[edge.source()].clone());
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn build_ref_graph<'a>(
@@ -1914,8 +2695,8 @@ fn sha256_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn pack_vector_cache_key(manifest: &PackManifest) -> String {
-    let value = serde_json::json!({
+fn pack_vector_cache_key(manifest: &PackManifest, format: PassageFormat) -> String {
+    let mut value = serde_json::json!({
         "cache_version": VECTOR_CACHE_VERSION,
         "model_id": VECTOR_MODEL_ID,
         "model_revision": VECTOR_MODEL_REVISION,
@@ -1925,6 +2706,10 @@ fn pack_vector_cache_key(manifest: &PackManifest) -> String {
         "source_commit": manifest.source_commit,
         "files": manifest.files,
     });
+    // Inserted only for non-legacy formats so legacy keys stay byte-identical.
+    if let (Some(tag), Some(map)) = (format.cache_tag(), value.as_object_mut()) {
+        map.insert("passage_format".to_string(), serde_json::json!(tag));
+    }
     sha256_text(&serde_json::to_string(&value).unwrap_or_default())
 }
 
@@ -1938,8 +2723,10 @@ fn build_or_load_vector_corpus<'a>(
     provider: &dyn EmbeddingProvider,
     cache_key: &str,
     cache_dir: Option<&Path>,
+    format: PassageFormat,
+    contexts: &BTreeMap<String, String>,
 ) -> anyhow::Result<VectorCorpus> {
-    let entries = vector_source_entries(articles, annexes);
+    let entries = vector_source_entries(articles, annexes, format, contexts);
     if let Some(cache_dir) = cache_dir {
         let path = vector_cache_path(cache_dir, cache_key);
         if let Some(corpus) = load_vector_corpus_cache(&path, cache_key, &entries)? {
@@ -2021,10 +2808,30 @@ fn compute_vector_corpus(
 fn vector_source_entries<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
+    fmt: PassageFormat,
+    contexts: &BTreeMap<String, String>,
 ) -> Vec<(String, String, String, String)> {
+    // `ctx1` passages start with the context line; a missing entry (never in
+    // practice) degrades to the plain passage.
+    let context_line = |id: &str| -> String {
+        if fmt.has_context() {
+            contexts
+                .get(id)
+                .map(|context| format!("{context}\n"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
     let mut entries = articles
         .map(|article| {
-            let text = format!("{} {}\n{}", article.rule, article.title, article.body);
+            let text = fmt.passage_text(format!(
+                "{}{} {}\n{}",
+                context_line(&article.id),
+                article.rule,
+                article.title,
+                article.body
+            ));
             (
                 article.id.clone(),
                 "article".to_string(),
@@ -2033,12 +2840,13 @@ fn vector_source_entries<'a>(
             )
         })
         .chain(annexes.map(|annex| {
-            let text = format!(
-                "{} {}\n{}",
+            let text = fmt.passage_text(format!(
+                "{}{} {}\n{}",
+                context_line(&annex.id),
                 annex.rule,
                 annex_search_title(annex),
                 annex.body
-            );
+            ));
             (
                 annex.id.clone(),
                 "annex".to_string(),
@@ -2563,6 +3371,157 @@ refs:
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingProvider {
+        texts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.texts.lock().unwrap().push(text.to_string());
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    fn e5_test_index(e5_prefix: bool, provider: RecordingProvider) -> TantivyRulesIndex {
+        let mut index = TantivyRulesIndex::from_articles(
+            vec![article_fixture(
+                "cni",
+                "시험규칙",
+                "제1조",
+                "목적",
+                "시험 본문",
+            )],
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        index.search_options = SearchOptions {
+            e5_prefix,
+            ..SearchOptions::default()
+        };
+        index
+            .enable_vectors_for_test(provider, "test-key", None, 60, 1.0)
+            .unwrap();
+        index
+    }
+
+    fn test_manifest() -> PackManifest {
+        PackManifest {
+            schema_version: 1,
+            institution: "cni".to_string(),
+            effective_date: "2026-03-01".to_string(),
+            source_commit: "abc123".to_string(),
+            created_at: "2026-03-01T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
+            files: BTreeMap::from([
+                ("articles/a.md".to_string(), "aa11".to_string()),
+                ("manifest.json".to_string(), "bb22".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn e5_prefix_applies_to_both_passage_and_query() {
+        let provider = RecordingProvider::default();
+        let index = e5_test_index(true, provider.clone());
+        index.search("시험질의", 5, None);
+
+        let texts = provider.texts.lock().unwrap().clone();
+        let passage = "passage: 시험규칙 목적\n시험 본문\n";
+        assert!(
+            texts.iter().any(|t| t.starts_with("passage: ")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == passage), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "query: 시험질의"), "{texts:?}");
+        // Neither side may be embedded without its prefix.
+        assert!(!texts.iter().any(|t| t == "시험질의"), "{texts:?}");
+        assert!(texts
+            .iter()
+            .all(|t| t.starts_with("passage: ") || t.starts_with("query: ")));
+    }
+
+    #[test]
+    fn e5_prefix_off_keeps_legacy_texts() {
+        let provider = RecordingProvider::default();
+        let index = e5_test_index(false, provider.clone());
+        index.search("시험질의", 5, None);
+
+        let texts = provider.texts.lock().unwrap().clone();
+        assert_eq!(
+            texts,
+            vec![
+                "시험규칙 목적\n시험 본문\n".to_string(),
+                "시험질의".to_string()
+            ]
+        );
+        assert_eq!(texts[0].as_bytes(), "시험규칙 목적\n시험 본문\n".as_bytes());
+    }
+
+    #[test]
+    fn legacy_passage_format_keeps_cache_key_bytes() {
+        let manifest = test_manifest();
+        // Replica of the 2f259192 key formula.
+        let old_value = serde_json::json!({
+            "cache_version": VECTOR_CACHE_VERSION,
+            "model_id": VECTOR_MODEL_ID,
+            "model_revision": VECTOR_MODEL_REVISION,
+            "schema_version": manifest.schema_version,
+            "institution": manifest.institution,
+            "effective_date": manifest.effective_date,
+            "source_commit": manifest.source_commit,
+            "files": manifest.files,
+        });
+        let old_key = sha256_text(&serde_json::to_string(&old_value).unwrap());
+        let new_key = pack_vector_cache_key(&manifest, PassageFormat::Legacy);
+        println!("old cache key: {old_key}");
+        println!("new cache key: {new_key}");
+        assert_eq!(old_key, new_key);
+        assert_eq!(
+            SearchOptions::default().passage_format(),
+            PassageFormat::Legacy
+        );
+    }
+
+    #[test]
+    fn prefixed_format_uses_distinct_cache_file() {
+        let manifest = test_manifest();
+        let legacy_key = pack_vector_cache_key(&manifest, PassageFormat::Legacy);
+        let e5_key = pack_vector_cache_key(&manifest, PassageFormat::E5Prefix);
+        assert_ne!(legacy_key, e5_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let articles = [article_fixture(
+            "cni",
+            "시험규칙",
+            "제1조",
+            "목적",
+            "시험 본문",
+        )];
+        for (key, fmt) in [
+            (&legacy_key, PassageFormat::Legacy),
+            (&e5_key, PassageFormat::E5Prefix),
+        ] {
+            build_or_load_vector_corpus(
+                articles.iter(),
+                std::iter::empty(),
+                &RecordingProvider::default(),
+                key,
+                Some(dir.path()),
+                fmt,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        assert!(vector_cache_path(dir.path(), &legacy_key).is_file());
+        assert!(vector_cache_path(dir.path(), &e5_key).is_file());
+        assert_ne!(
+            vector_cache_path(dir.path(), &legacy_key),
+            vector_cache_path(dir.path(), &e5_key)
+        );
+    }
+
     #[test]
     fn parses_frontmatter_article_id_and_refs() {
         let article = fixture_articles().remove(1);
@@ -2847,8 +3806,14 @@ refs:
             .into_iter()
             .map(|annex| (annex.id.clone(), annex))
             .collect();
-        (index.index, index.fields) =
-            build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        (index.index, index.fields, index.tokenizer_status) = build_search_index(
+            index.articles.values(),
+            index.annexes.values(),
+            index.search_options.ko_pos_filter,
+            None,
+            false,
+        )
+        .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
         index
     }
@@ -3314,8 +4279,14 @@ refs:
         index.annexes = annexes.into_iter().map(|a| (a.id.clone(), a)).collect();
         index.page_owners = build_page_owners(index.articles.values(), index.annexes.values());
         index.pages = pages;
-        (index.index, index.fields) =
-            build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        (index.index, index.fields, index.tokenizer_status) = build_search_index(
+            index.articles.values(),
+            index.annexes.values(),
+            index.search_options.ko_pos_filter,
+            None,
+            false,
+        )
+        .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
         let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
         index.graph = graph;
@@ -3422,5 +4393,1103 @@ refs:
             };
             assert_eq!(key(&a), key(&b), "query: {q}");
         }
+    }
+
+    fn pos_index(filter: KoPosFilter, bodies: &[&str]) -> TantivyRulesIndex {
+        let articles = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                article_fixture("cni", "시험규칙", &format!("제{}조", i + 1), "목적", body)
+            })
+            .collect::<Vec<_>>();
+        TantivyRulesIndex::from_articles_with_options(
+            articles,
+            default_pack_status("cni", "2026-03-01"),
+            SearchOptions {
+                ko_pos_filter: filter,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn ko_tokens(filter: KoPosFilter, text: &str) -> Vec<String> {
+        use tantivy::tokenizer::TokenStream;
+        let index = pos_index(filter, &["본문"]);
+        let mut analyzer = index.index.tokenizers().get("ko").unwrap();
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    fn without(tokens: &[String], removed: &[&str]) -> Vec<String> {
+        tokens
+            .iter()
+            .filter(|t| !removed.iter().any(|r| **t == **r))
+            .cloned()
+            .collect()
+    }
+
+    const POS_SAMPLE: &str = "시험규칙에 따라 제3조 (적용 범위) 를 정하고 하는 시험을 끝나며 했다.";
+
+    #[test]
+    fn ko_pos_filter_tag_sets_are_exact() {
+        assert!(KoPosFilter::None.stop_tags().is_empty());
+        let mut v1 = KoPosFilter::V1.stop_tags();
+        v1.sort_unstable();
+        let mut expected_v1 = vec![
+            "JKS", "JKC", "JKG", "JKO", "JKB", "JKV", "JKQ", "JX", "JC", "SF", "SE", "SSO", "SSC",
+            "SC", "SY",
+        ];
+        expected_v1.sort_unstable();
+        assert_eq!(v1, expected_v1);
+        let mut v2 = KoPosFilter::V2.stop_tags();
+        v2.sort_unstable();
+        let mut expected_v2 = expected_v1.clone();
+        expected_v2.extend(["EP", "EF", "EC", "ETN", "ETM"]);
+        expected_v2.sort_unstable();
+        assert_eq!(v2, expected_v2);
+        for kept in [
+            "SN", "SL", "SH", "NNG", "NNP", "VV", "VA", "MM", "MAG", "XR",
+        ] {
+            assert!(!expected_v2.contains(&kept), "{kept} must be preserved");
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_v1_drops_particles_and_symbols_only() {
+        let none = ko_tokens(KoPosFilter::None, POS_SAMPLE);
+        let v1 = ko_tokens(KoPosFilter::V1, POS_SAMPLE);
+        // particles (JKB/JKO), brackets and the sentence-final period are gone
+        assert_eq!(v1, without(&none, &["에", "(", ")", "를", "을", "."]));
+        // the number (SN) and the endings (EC/ETM/EF) survive v1
+        for kept in ["3", "고", "는", "며", "다"] {
+            assert!(v1.iter().any(|t| t == kept), "{kept} missing: {v1:?}");
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_v2_also_drops_endings() {
+        let v1 = ko_tokens(KoPosFilter::V1, POS_SAMPLE);
+        let v2 = ko_tokens(KoPosFilter::V2, POS_SAMPLE);
+        assert_eq!(v2, without(&v1, &["고", "는", "며", "다"]));
+        assert!(v2.iter().any(|t| t == "3"));
+        // compound tags such as VV+EC are not exact matches and stay (PH-00 probe)
+        assert!(v2.iter().any(|t| t == "정하"));
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn pos_filter_never_drops_numbers_latin_hanja() {
+        let text = "제12조 ABC test 法 version2 100";
+        for filter in [KoPosFilter::V1, KoPosFilter::V2] {
+            let tokens = ko_tokens(filter, text);
+            for kept in ["12", "abc", "test", "法", "version", "2", "100"] {
+                assert!(
+                    tokens.iter().any(|t| t == kept),
+                    "{filter:?}: {kept} missing in {tokens:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn nfkc_and_lowercase_normalize_fullwidth_and_case() {
+        let text = "ＡＢＣ Test １２";
+        for filter in [KoPosFilter::V1, KoPosFilter::V2] {
+            let tokens = ko_tokens(filter, text);
+            for wanted in ["abc", "test", "12"] {
+                assert!(
+                    tokens.iter().any(|t| t == wanted),
+                    "{filter:?}: {wanted} missing in {tokens:?}"
+                );
+            }
+        }
+        let legacy = ko_tokens(KoPosFilter::None, text);
+        assert!(
+            !legacy.iter().any(|t| t == "abc" || t == "12"),
+            "{legacy:?}"
+        );
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn query_and_document_share_analyzer() {
+        use tantivy::collector::Count;
+        // documents hold ASCII upper case / full-width; queries the other form.
+        let bodies = ["ABC 시험 본문", "ＸＹＺ 시험 본문"];
+        for (filter, expected) in [(KoPosFilter::V1, 1usize), (KoPosFilter::None, 0)] {
+            let index = pos_index(filter, &bodies);
+            let parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
+            let searcher = index.reader.0.searcher();
+            for query in ["ＡＢＣ", "xyz"] {
+                let parsed = parser.parse_query(query).unwrap();
+                let hits = searcher.search(&parsed, &Count).unwrap();
+                assert_eq!(hits, expected, "{filter:?} query {query}");
+            }
+        }
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn tokenizer_load_failure_is_reported_not_silent() {
+        use tantivy::tokenizer::TokenStream;
+        let index = Index::create_in_ram(Schema::builder().build());
+        let status = register_ko_tokenizer_with(&index, KoPosFilter::V2, || {
+            Err(lindera::error::LinderaErrorKind::NotFound.with_error(io::Error::other("no dict")))
+        });
+        assert_eq!(status.kind, "simple-fallback");
+        assert!(status.degraded);
+        assert_eq!(status.filter, "none");
+        assert!(status.reason.as_deref().unwrap().contains("no dict"));
+        // the fallback analyzer is registered so indexing keeps working
+        let mut analyzer = index.tokenizers().get("ko").unwrap();
+        let mut stream = analyzer.token_stream("가 나");
+        assert!(stream.advance());
+
+        let healthy = register_ko_tokenizer_with(&index, KoPosFilter::V1, || {
+            lindera::dictionary::load_dictionary("embedded://ko-dic")
+        });
+        assert_eq!(healthy.kind, "lindera-ko-dic");
+        assert!(!healthy.degraded);
+        assert_eq!(healthy.filter, "v1");
+        assert_eq!(healthy.reason, None);
+    }
+
+    #[cfg(feature = "korean-tokenizer")]
+    #[test]
+    fn default_filter_none_keeps_legacy_token_stream() {
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+        use tantivy::tokenizer::{TextAnalyzer, TokenStream};
+        let legacy = lindera_tantivy::tokenizer::LinderaTokenizer::from_segmenter(Segmenter::new(
+            Mode::Normal,
+            lindera::dictionary::load_dictionary("embedded://ko-dic").unwrap(),
+            None,
+        ));
+        let mut legacy = TextAnalyzer::builder(legacy).build();
+        let index = TantivyRulesIndex::from_articles(
+            vec![article_fixture("cni", "시험규칙", "제1조", "목적", "본문")],
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        assert_eq!(SearchOptions::default().ko_pos_filter, KoPosFilter::None);
+        assert_eq!(index.tokenizer_status().filter, "none");
+        assert!(!index.tokenizer_status().degraded);
+        let mut current = index.index.tokenizers().get("ko").unwrap();
+        for text in [
+            POS_SAMPLE,
+            "ＡＢＣ Test １２ 시험을 하고",
+            "가상법 제12조에 따른 위임",
+        ] {
+            let collect = |analyzer: &mut TextAnalyzer| {
+                let mut stream = analyzer.token_stream(text);
+                let mut out = Vec::new();
+                while stream.advance() {
+                    let t = stream.token();
+                    out.push((t.text.clone(), t.offset_from, t.offset_to, t.position));
+                }
+                out
+            };
+            assert_eq!(collect(&mut legacy), collect(&mut current), "{text}");
+        }
+    }
+
+    // --- PH-07 deterministic context injection ---
+
+    fn ctx_node(id: &str, kind: NodeKind, label: &str) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            kind,
+            label: label.to_string(),
+            meta: BTreeMap::new(),
+        }
+    }
+
+    fn ctx_edge(src: &str, dst: &str, kind: EdgeKind) -> GraphEdge {
+        GraphEdge {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            kind,
+            meta: BTreeMap::new(),
+        }
+    }
+
+    fn ctx_options(context_prefix: ContextPrefix, e5_prefix: bool) -> SearchOptions {
+        SearchOptions {
+            context_prefix,
+            e5_prefix,
+            ..SearchOptions::default()
+        }
+    }
+
+    fn ctx_index(
+        articles: Vec<Article>,
+        annexes: Vec<Annex>,
+        nodes: &[GraphNode],
+        edges: &[GraphEdge],
+        options: SearchOptions,
+    ) -> TantivyRulesIndex {
+        TantivyRulesIndex::assemble(
+            articles.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            annexes.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            None,
+            nodes,
+            edges,
+            default_pack_status("cni", "2026-03-01"),
+            &VectorSearchOptions::default(),
+            options,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn bigram_options(weight: f32) -> SearchOptions {
+        SearchOptions {
+            bigram_weight: weight,
+            ..SearchOptions::default()
+        }
+    }
+
+    fn bigram_corpus() -> Vec<Article> {
+        vec![
+            article_fixture(
+                "cni",
+                "테스트규정",
+                "제1조",
+                "총칙",
+                "쿼틱스람다파이 절차를 따른다.",
+            ),
+            article_fixture(
+                "cni",
+                "테스트규정",
+                "제2조",
+                "잡담",
+                "무관한 내용의 조문이다.",
+            ),
+            article_fixture("cni", "시험규칙", "제1조", "보충", "다른 문장만 있다."),
+        ]
+    }
+
+    fn bigram_index(weight: f32) -> TantivyRulesIndex {
+        TantivyRulesIndex::from_articles_with_options(
+            bigram_corpus(),
+            default_pack_status("cni", "2026-03-01"),
+            bigram_options(weight),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bigram_list_recovers_spacing_variants() {
+        let index = bigram_index(1.0);
+        let target = "테스트규정#제1조";
+        // The document has no space inside the compound; the query splits it
+        // differently. The bigram list must still surface the document.
+        let hits = index.bigram_rank("쿼틱 스람다 파이", 10, None);
+        assert_eq!(hits.first().map(|h| h.article_id.as_str()), Some(target));
+        assert!(hits.iter().all(|h| h.article_id != "테스트규정#제2조"));
+
+        // A query in another spacing that shares no whole token with the body.
+        let hits = index.bigram_rank("쿼틱스 람다파이", 10, None);
+        assert_eq!(hits.first().map(|h| h.article_id.as_str()), Some(target));
+
+        // Fused search: the document is returned with the bigram list on.
+        let fused = index.search("쿼틱 스람다 파이", 5, None);
+        assert!(fused.iter().any(|h| h.article_id == target));
+
+        // Empty / whitespace-only queries produce no bigram list.
+        assert!(index.bigram_rank("   ", 10, None).is_empty());
+        // Disabled index computes nothing.
+        assert!(bigram_index(0.0)
+            .bigram_rank("쿼틱스 람다파이", 10, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn bigram_weight_zero_is_bit_identical_to_baseline() {
+        let baseline = TantivyRulesIndex::from_articles(
+            bigram_corpus(),
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        let zero = bigram_index(0.0);
+        for q in [
+            "쿼틱스 람다파이",
+            "절차",
+            "무관한 내용",
+            "시험규칙 제1조",
+            "없는말",
+        ] {
+            let a = baseline.search_with_routes(q, 10, None);
+            let b = zero.search_with_routes(q, 10, None);
+            let key = |r: &SearchRouteReport| {
+                r.hits
+                    .iter()
+                    .map(|h| (h.article_id.clone(), h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(key(&a), key(&b), "query {q}");
+            let retrieval = |r: &SearchRouteReport| {
+                r.retrieval_hits
+                    .iter()
+                    .map(|h| (h.article_id.clone(), h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(retrieval(&a), retrieval(&b), "query {q}");
+        }
+        assert_eq!(SearchOptions::default().bigram_weight, 0.0);
+    }
+
+    #[test]
+    fn bigram_field_not_indexed_when_disabled() {
+        let off = bigram_index(0.0);
+        assert!(off.fields.body_ng.is_none());
+        assert!(off.index.schema().get_field("body_ng").is_err());
+        assert!(off.index.tokenizers().get(BIGRAM_TOKENIZER).is_none());
+        assert_eq!(off.index.schema().fields().count(), 5);
+
+        let on = bigram_index(0.5);
+        assert!(on.fields.body_ng.is_some());
+        assert!(on.index.schema().get_field("body_ng").is_ok());
+        assert_eq!(on.index.schema().fields().count(), 6);
+        // Weight validation used by the config layer.
+        assert!(validate_bigram_weight(0.0).is_ok());
+        assert!(validate_bigram_weight(2.0).is_ok());
+        assert!(validate_bigram_weight(-0.01).is_err());
+        assert!(validate_bigram_weight(2.01).is_err());
+        assert!(validate_bigram_weight(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn article_context_uses_institution_label_rule_and_number() {
+        let nodes = [ctx_node("cni", NodeKind::Institution, "가상연구원")];
+        let mut untitled = article_fixture("cni", "테스트규정", "제3조", "x", "본문");
+        untitled.title = String::new();
+        let articles = [
+            article_fixture("cni", "테스트규정", "제1조", "목적", "본문"),
+            untitled,
+            // Institution without a node: the slug is the display name.
+            article_fixture("zzz", "시험규칙", "제2조", "정의", "본문"),
+        ];
+        let map = articles.iter().map(|a| (a.id.clone(), a.clone())).collect();
+        let (graph, indices) = build_ref_graph(articles.iter(), &nodes, &[]);
+        let contexts = build_contexts(&map, &BTreeMap::new(), &graph, &indices, &nodes);
+        assert_eq!(
+            contexts["테스트규정#제1조"],
+            "가상연구원 · 테스트규정 · 제1조(목적)"
+        );
+        // Empty title: no parentheses at all.
+        assert_eq!(
+            contexts["테스트규정#제3조"],
+            "가상연구원 · 테스트규정 · 제3조"
+        );
+        // No Institution node: slug fallback.
+        assert_eq!(contexts["시험규칙#제2조"], "zzz · 시험규칙 · 제2조(정의)");
+    }
+
+    #[test]
+    fn annex_context_lists_referencing_article_titles_sorted_and_capped() {
+        let rule = "테스트규정";
+        // Seven referencing articles inserted out of order; 10 sorts after 9.
+        let numbers = [10, 2, 1, 7, 3, 9, 5];
+        let mut articles = numbers
+            .iter()
+            .map(|n| {
+                article_fixture(
+                    "cni",
+                    rule,
+                    &format!("제{n}조"),
+                    &format!("제목{n}"),
+                    "본문",
+                )
+            })
+            .collect::<Vec<_>>();
+        // Same rule name but another institution must not be listed.
+        articles.push(article_fixture(
+            "ctp",
+            "외부규정",
+            "제1조",
+            "타기관",
+            "본문",
+        ));
+        let annexes = vec![annex_fixture("cni", rule, "별표1", "시험표", "| a | b |")];
+        let annex_id = annexes[0].id.clone();
+        let mut edges = numbers
+            .iter()
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::Cites))
+            .collect::<Vec<_>>();
+        edges.push(ctx_edge("외부규정#제1조", &annex_id, EdgeKind::Cites));
+        // Non-article sources and other edge kinds are ignored.
+        edges.push(ctx_edge(
+            &format!("rule:{rule}"),
+            &annex_id,
+            EdgeKind::AppliesTo,
+        ));
+        edges.push(ctx_edge(
+            &format!("{rule}#제10조"),
+            &annex_id,
+            EdgeKind::Delegates,
+        ));
+
+        let index = ctx_index(
+            articles.clone(),
+            annexes.clone(),
+            &[],
+            &edges,
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        assert_eq!(
+            index.contexts[&annex_id],
+            format!("{rule} · 별표1 시험표 · 참조 조문: 제목1, 제목2, 제목3, 제목5, 제목7")
+        );
+
+        // No referencing article: the reference part is omitted.
+        let lonely = ctx_index(
+            vec![],
+            annexes.clone(),
+            &[],
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        assert_eq!(lonely.contexts[&annex_id], format!("{rule} · 별표1 시험표"));
+
+        // 200-character cap on multibyte titles, cut on a character boundary.
+        let long_title = "가".repeat(60);
+        let long_articles = (1..=5)
+            .map(|n| article_fixture("cni", rule, &format!("제{n}조"), &long_title, "본문"))
+            .collect::<Vec<_>>();
+        let long_edges = (1..=5)
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::AppliesTo))
+            .collect::<Vec<_>>();
+        let capped = ctx_index(
+            long_articles,
+            annexes,
+            &[],
+            &long_edges,
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        let context = &capped.contexts[&annex_id];
+        let refs = context.split_once("참조 조문: ").unwrap().1;
+        assert_eq!(refs.chars().count(), 200);
+        assert!(
+            refs.len() > 200,
+            "multibyte titles: byte length exceeds 200"
+        );
+        assert!(refs.starts_with(&long_title));
+    }
+
+    fn ctx_articles() -> Vec<Article> {
+        vec![article_fixture(
+            "cni",
+            "시험규칙",
+            "제1조",
+            "목적",
+            "시험 본문",
+        )]
+    }
+
+    fn ctx_nodes() -> Vec<GraphNode> {
+        vec![ctx_node("cni", NodeKind::Institution, "구름연구소")]
+    }
+
+    #[test]
+    fn context_prefix_vector_changes_only_passages() {
+        let context = "구름연구소 · 시험규칙 · 제1조(목적)";
+        for (e5, expected) in [
+            (false, format!("{context}\n시험규칙 목적\n시험 본문\n")),
+            (
+                true,
+                format!("passage: {context}\n시험규칙 목적\n시험 본문\n"),
+            ),
+        ] {
+            let provider = RecordingProvider::default();
+            let mut index = ctx_index(
+                ctx_articles(),
+                vec![],
+                &ctx_nodes(),
+                &[],
+                ctx_options(ContextPrefix::Vector, e5),
+            );
+            index
+                .enable_vectors_for_test(provider.clone(), "k", None, 60, 1.0)
+                .unwrap();
+            index.search("시험질의", 5, None);
+            let texts = provider.texts.lock().unwrap().clone();
+            assert_eq!(texts[0], expected, "e5={e5}");
+            // The query side never carries the context.
+            let query = if e5 {
+                "query: 시험질의"
+            } else {
+                "시험질의"
+            };
+            assert_eq!(texts[1], query);
+            assert_eq!(texts.len(), 2);
+        }
+
+        // BM25 side: results and the indexed body are those of `none`.
+        let plain = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            SearchOptions::default(),
+        );
+        let vector = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        for q in ["시험 본문", "구름연구소", "목적"] {
+            assert_eq!(plain.search(q, 5, None), vector.search(q, 5, None), "{q}");
+        }
+        assert_eq!(body_field_hits(&vector, "구름연구소"), 0);
+    }
+
+    fn body_field_hits(index: &TantivyRulesIndex, term: &str) -> usize {
+        let parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
+        let (query, _) = parser.parse_query_lenient(term);
+        index
+            .reader
+            .0
+            .searcher()
+            .search(&query, &TopDocs::with_limit(10))
+            .unwrap()
+            .len()
+    }
+
+    fn title_field_hits(index: &TantivyRulesIndex, term: &str) -> usize {
+        let parser = QueryParser::for_index(&index.index, vec![index.fields.title]);
+        let (query, _) = parser.parse_query_lenient(term);
+        index
+            .reader
+            .0
+            .searcher()
+            .search(&query, &TopDocs::with_limit(10))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn context_prefix_both_prefixes_bm25_body_only() {
+        let label = "구름연구소";
+        let none = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            SearchOptions::default(),
+        );
+        let vector = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        let both = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Both, false),
+        );
+        assert_eq!(body_field_hits(&none, label), 0);
+        assert_eq!(body_field_hits(&vector, label), 0);
+        assert_eq!(body_field_hits(&both, label), 1);
+        // title and rule fields are untouched; the stored article body too.
+        assert_eq!(title_field_hits(&both, label), 0);
+        assert_eq!(
+            both.get_article("시험규칙#제1조").unwrap(),
+            none.get_article("시험규칙#제1조").unwrap()
+        );
+        assert!(both
+            .search(label, 5, None)
+            .iter()
+            .any(|h| h.article_id == "시험규칙#제1조"));
+        assert!(none.search(label, 5, None).is_empty());
+
+        // Vector passages equal the `vector` variant (same `ctx1` format).
+        let record = |index: &mut TantivyRulesIndex| {
+            let provider = RecordingProvider::default();
+            index
+                .enable_vectors_for_test(provider.clone(), "k", None, 60, 1.0)
+                .unwrap();
+            let texts = provider.texts.lock().unwrap().clone();
+            texts
+        };
+        let mut vector = vector;
+        let mut both = both;
+        assert_eq!(record(&mut vector), record(&mut both));
+    }
+
+    #[test]
+    fn context_strings_are_deterministic_across_rebuilds() {
+        let rule = "테스트규정";
+        let mut articles = (1..=6)
+            .map(|n| {
+                article_fixture(
+                    "cni",
+                    rule,
+                    &format!("제{n}조"),
+                    &format!("제목{n}"),
+                    "본문",
+                )
+            })
+            .collect::<Vec<_>>();
+        let annexes = vec![annex_fixture("cni", rule, "별표1", "시험표", "| a |")];
+        let annex_id = annexes[0].id.clone();
+        let mut edges = (1..=6)
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::AppliesTo))
+            .collect::<Vec<_>>();
+        let nodes = ctx_nodes();
+        let first = ctx_index(
+            articles.clone(),
+            annexes.clone(),
+            &nodes,
+            &edges,
+            ctx_options(ContextPrefix::Both, false),
+        );
+        // Rebuild with shuffled input order.
+        articles.reverse();
+        edges.reverse();
+        let second = ctx_index(
+            articles,
+            annexes,
+            &nodes,
+            &edges,
+            ctx_options(ContextPrefix::Both, false),
+        );
+        assert_eq!(first.contexts, second.contexts);
+        assert_eq!(first.contexts.len(), 7);
+        let texts = |index: &TantivyRulesIndex| {
+            vector_source_entries(
+                index.articles.values(),
+                index.annexes.values(),
+                PassageFormat::Ctx1,
+                &index.contexts,
+            )
+        };
+        assert_eq!(texts(&first), texts(&second));
+    }
+
+    #[test]
+    fn context_prefix_uses_distinct_cache_key() {
+        let manifest = test_manifest();
+        let keys = [
+            (SearchOptions::default(), None),
+            (ctx_options(ContextPrefix::None, true), Some("e5p")),
+            (ctx_options(ContextPrefix::Vector, false), Some("ctx1")),
+            (ctx_options(ContextPrefix::Both, false), Some("ctx1")),
+            (ctx_options(ContextPrefix::Vector, true), Some("e5p+ctx1")),
+            (ctx_options(ContextPrefix::Both, true), Some("e5p+ctx1")),
+        ];
+        for (options, tag) in &keys {
+            assert_eq!(options.passage_format().cache_tag(), *tag);
+        }
+        let key = |o: SearchOptions| pack_vector_cache_key(&manifest, o.passage_format());
+        let legacy = key(SearchOptions::default());
+        let e5 = key(ctx_options(ContextPrefix::None, true));
+        let ctx1 = key(ctx_options(ContextPrefix::Vector, false));
+        let both_e5 = key(ctx_options(ContextPrefix::Both, true));
+        let all = [&legacy, &e5, &ctx1, &both_e5];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // `both` embeds exactly like `vector`, so it shares the vector cache file.
+        assert_eq!(ctx1, key(ctx_options(ContextPrefix::Both, false)));
+        // The cache file structure did not change, so the version stays put.
+        assert_eq!(VECTOR_CACHE_VERSION, 1);
+
+        // Separate files per format when built through the real cache path.
+        let dir = tempfile::tempdir().unwrap();
+        let index = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        for (k, fmt) in [
+            (&legacy, PassageFormat::Legacy),
+            (&ctx1, PassageFormat::Ctx1),
+        ] {
+            build_or_load_vector_corpus(
+                index.articles.values(),
+                index.annexes.values(),
+                &RecordingProvider::default(),
+                k,
+                Some(dir.path()),
+                fmt,
+                &index.contexts,
+            )
+            .unwrap();
+        }
+        assert!(vector_cache_path(dir.path(), &legacy).is_file());
+        assert!(vector_cache_path(dir.path(), &ctx1).is_file());
+        // A legacy corpus never picks up context text and vice versa.
+        let hash = |fmt| {
+            vector_source_entries(
+                index.articles.values(),
+                index.annexes.values(),
+                fmt,
+                &index.contexts,
+            )[0]
+            .2
+            .clone()
+        };
+        assert_ne!(hash(PassageFormat::Legacy), hash(PassageFormat::Ctx1));
+    }
+
+    // ---- PH-09 multi-pack fusion ----
+
+    fn fusion_hit(id: &str, score: f32) -> SearchHit {
+        SearchHit {
+            article_id: id.to_string(),
+            institution: id.split('/').next().unwrap_or_default().to_string(),
+            score,
+            snippet: String::new(),
+            rule: "시험규칙".to_string(),
+            title: "시험".to_string(),
+            effective: "2026-03-01".to_string(),
+            kind: "article".to_string(),
+        }
+    }
+
+    fn fusion_report(hits: Vec<SearchHit>, pin: Option<SearchHit>) -> SearchRouteReport {
+        SearchRouteReport {
+            hits: hits.clone(),
+            pin_hit: pin,
+            retrieval_hits: hits,
+        }
+    }
+
+    fn hit_bits(hits: &[SearchHit]) -> Vec<(String, u32)> {
+        hits.iter()
+            .map(|h| (h.article_id.clone(), h.score.to_bits()))
+            .collect()
+    }
+
+    fn fusion_fixture_indices() -> (TantivyRulesIndex, TantivyRulesIndex) {
+        let make = |institution: &str, rule: &str| {
+            TantivyRulesIndex::from_articles(
+                vec![
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제1조",
+                        "시험목적",
+                        "① 시험 목적을 정한다.",
+                    ),
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제2조",
+                        "시험수당",
+                        "① 시험 수당은 별도로 정한다.",
+                    ),
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제3조",
+                        "시험휴가",
+                        "① 시험 휴가를 신청할 수 있다.",
+                    ),
+                ],
+                default_pack_status(institution, "2026-03-01"),
+            )
+            .unwrap()
+        };
+        (make("cni", "테스트규정"), make("ctp", "시험규칙"))
+    }
+
+    #[test]
+    fn rrf_fusion_default_is_bit_identical() {
+        assert_eq!(MultipackFusion::default(), MultipackFusion::Rrf);
+        let (cni, ctp) = fusion_fixture_indices();
+        for q in [
+            "시험 수당",
+            "시험휴가 신청",
+            "테스트규정 제2조",
+            "없는질의어",
+        ] {
+            let plain = |index: &TantivyRulesIndex, inst: &str| {
+                namespace_search_route_report(index.search_with_routes(q, 5, None), inst, true)
+            };
+            let detailed = |index: &TantivyRulesIndex, inst: &str| {
+                namespace_detailed_route_report(
+                    index.search_with_routes_detailed(q, 5, None),
+                    inst,
+                    true,
+                )
+            };
+            // the detailed API carries exactly the legacy report
+            let d_cni = detailed(&cni, "cni");
+            let p_cni = plain(&cni, "cni");
+            assert_eq!(hit_bits(&d_cni.report.hits), hit_bits(&p_cni.hits));
+            assert_eq!(
+                hit_bits(&d_cni.report.retrieval_hits),
+                hit_bits(&p_cni.retrieval_hits)
+            );
+            assert_eq!(d_cni.report.pin_hit, p_cni.pin_hit);
+
+            let legacy =
+                merge_search_route_reports(vec![plain(&cni, "cni"), plain(&ctp, "ctp")], 5);
+            let with = merge_search_route_reports_with(
+                vec![detailed(&cni, "cni"), detailed(&ctp, "ctp")],
+                5,
+                MultipackFusion::Rrf,
+            );
+            assert_eq!(hit_bits(&legacy.hits), hit_bits(&with.hits));
+            assert_eq!(
+                hit_bits(&legacy.retrieval_hits),
+                hit_bits(&with.retrieval_hits)
+            );
+            assert_eq!(legacy.pin_hit, with.pin_hit);
+
+            // one report: every mode is a pass-through
+            for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+                let single =
+                    merge_search_route_reports_with(vec![detailed(&cni, "cni")], 5, fusion);
+                assert_eq!(hit_bits(&single.hits), hit_bits(&p_cni.hits));
+            }
+        }
+    }
+
+    #[test]
+    fn score_fusion_orders_by_in_pack_fused_score() {
+        let a = fusion_report(
+            vec![fusion_hit("a/x#1", 0.030), fusion_hit("a/x#2", 0.010)],
+            None,
+        );
+        let b = fusion_report(
+            vec![fusion_hit("b/y#1", 0.020), fusion_hit("b/y#2", 0.005)],
+            None,
+        );
+        let reports = || {
+            vec![
+                DetailedRouteReport::from_report(a.clone()),
+                DetailedRouteReport::from_report(b.clone()),
+            ]
+        };
+        let merged = merge_search_route_reports_with(reports(), 4, MultipackFusion::Score);
+        let ids: Vec<_> = merged.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["a/x#1", "b/y#1", "a/x#2", "b/y#2"]);
+        // in-pack scores are kept as-is
+        assert_eq!(merged.hits[1].score, 0.020);
+        // rrf would alternate by rank regardless of scores
+        let rrf = merge_search_route_reports_with(reports(), 4, MultipackFusion::Rrf);
+        assert_eq!(rrf.hits[0].article_id, "a/x#1");
+        assert_eq!(rrf.hits[1].article_id, "b/y#1");
+        // top_k truncation
+        let top2 = merge_search_route_reports_with(reports(), 2, MultipackFusion::Score);
+        assert_eq!(top2.hits.len(), 2);
+        // a strong pack is not diluted by a weak one
+        let weak = fusion_report(
+            vec![fusion_hit("b/y#1", 0.001), fusion_hit("b/y#2", 0.0005)],
+            None,
+        );
+        let skew = merge_search_route_reports_with(
+            vec![
+                DetailedRouteReport::from_report(a.clone()),
+                DetailedRouteReport::from_report(weak),
+            ],
+            4,
+            MultipackFusion::Score,
+        );
+        assert_eq!(
+            skew.hits
+                .iter()
+                .map(|h| h.article_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a/x#1", "a/x#2", "b/y#1", "b/y#2"]
+        );
+    }
+
+    #[test]
+    fn score_fusion_keeps_pins_first() {
+        let pin = fusion_hit("b/y#9", f32::MAX);
+        let a = fusion_report(vec![fusion_hit("a/x#1", 0.5)], None);
+        let b = fusion_report(
+            vec![pin.clone(), fusion_hit("b/y#1", 0.001)],
+            Some(pin.clone()),
+        );
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let detailed_b = DetailedRouteReport {
+                report: b.clone(),
+                per_ranker: vec![(RankerKind::Bm25, vec![fusion_hit("b/y#1", 3.0)])],
+                weights: vec![(RankerKind::Bm25, 1.0)],
+                pinned: Some(pin.clone()),
+                rrf_k: 60,
+            };
+            let detailed_a = DetailedRouteReport {
+                report: a.clone(),
+                per_ranker: vec![(RankerKind::Bm25, vec![fusion_hit("a/x#1", 9.0)])],
+                weights: vec![(RankerKind::Bm25, 1.0)],
+                pinned: None,
+                rrf_k: 60,
+            };
+            let merged = merge_search_route_reports_with(vec![detailed_a, detailed_b], 3, fusion);
+            assert_eq!(merged.hits[0].article_id, "b/y#9", "{fusion:?}");
+            assert_eq!(
+                merged.pin_hit.as_ref().map(|h| h.article_id.as_str()),
+                Some("b/y#9")
+            );
+            assert_eq!(
+                merged
+                    .hits
+                    .iter()
+                    .filter(|h| h.article_id == "b/y#9")
+                    .count(),
+                1
+            );
+            assert_eq!(merged.hits[1].article_id, "a/x#1");
+        }
+    }
+
+    #[test]
+    fn global_fusion_merges_rankers_before_rrf() {
+        // Hand calculation, rrf_k = 60, bm25 weight 1, vector weight 1.
+        // bm25: A [a1 5.0, a2 1.0], B [b1 3.0, b2 2.0] -> merged a1, b1, b2, a2
+        // vector: A [a2 0.9], B [b1 0.8]              -> merged a2, b1
+        //   a1 = 1/61           b1 = 1/62 + 1/62 = 2/62
+        //   b2 = 1/63           a2 = 1/64 + 1/61
+        // order: b1 (0.03226) > a2 (0.03202) > a1 (0.01639) > b2 (0.01587)
+        let detailed = |ranks: Vec<(RankerKind, Vec<SearchHit>)>| DetailedRouteReport {
+            report: SearchRouteReport::default(),
+            per_ranker: ranks,
+            weights: vec![(RankerKind::Bm25, 1.0), (RankerKind::Vector, 1.0)],
+            pinned: None,
+            rrf_k: 60,
+        };
+        let pack_a = detailed(vec![
+            (
+                RankerKind::Bm25,
+                vec![fusion_hit("a/x#1", 5.0), fusion_hit("a/x#2", 1.0)],
+            ),
+            (RankerKind::Vector, vec![fusion_hit("a/x#2", 0.9)]),
+        ]);
+        let pack_b = detailed(vec![
+            (
+                RankerKind::Bm25,
+                vec![fusion_hit("b/y#1", 3.0), fusion_hit("b/y#2", 2.0)],
+            ),
+            (RankerKind::Vector, vec![fusion_hit("b/y#1", 0.8)]),
+        ]);
+        let merged = merge_search_route_reports_with(
+            vec![pack_a.clone(), pack_b.clone()],
+            4,
+            MultipackFusion::Global,
+        );
+        let ids: Vec<_> = merged.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["b/y#1", "a/x#2", "a/x#1", "b/y#2"]);
+        let expected = [
+            2.0f32 / 62.0,
+            1.0 / 64.0 + 1.0 / 61.0,
+            1.0 / 61.0,
+            1.0 / 63.0,
+        ];
+        for (hit, want) in merged.hits.iter().zip(expected) {
+            assert!(
+                (hit.score - want).abs() < 1e-6,
+                "{} {} vs {}",
+                hit.article_id,
+                hit.score,
+                want
+            );
+        }
+        assert_eq!(hit_bits(&merged.hits), hit_bits(&merged.retrieval_hits));
+
+        // a heavier vector weight (3.0) changes the order
+        let reweigh = |mut d: DetailedRouteReport| {
+            d.weights = vec![(RankerKind::Bm25, 1.0), (RankerKind::Vector, 3.0)];
+            d
+        };
+        let heavy = merge_search_route_reports_with(
+            vec![reweigh(pack_a), reweigh(pack_b)],
+            4,
+            MultipackFusion::Global,
+        );
+        // a2 = 1/64 + 3/61 = 0.06478, b1 = 1/62 + 3/62 = 0.06452
+        assert_eq!(heavy.hits[0].article_id, "a/x#2");
+        assert_eq!(heavy.hits[1].article_id, "b/y#1");
+    }
+
+    #[test]
+    fn global_fusion_over_real_indices_is_deterministic_and_bounded() {
+        let (cni, ctp) = fusion_fixture_indices();
+        let run = |swap: bool| {
+            let mut reports = vec![
+                namespace_detailed_route_report(
+                    cni.search_with_routes_detailed("시험 수당", 4, None),
+                    "cni",
+                    true,
+                ),
+                namespace_detailed_route_report(
+                    ctp.search_with_routes_detailed("시험 수당", 4, None),
+                    "ctp",
+                    true,
+                ),
+            ];
+            if swap {
+                reports.reverse();
+            }
+            merge_search_route_reports_with(reports, 4, MultipackFusion::Global)
+        };
+        let first = run(false);
+        assert_eq!(hit_bits(&first.hits), hit_bits(&run(true).hits));
+        assert!(first.hits.len() <= 4 && !first.hits.is_empty());
+        assert!(first
+            .hits
+            .iter()
+            .all(|h| h.article_id.starts_with("cni/") || h.article_id.starts_with("ctp/")));
+    }
+
+    #[test]
+    fn fusion_tie_break_is_deterministic() {
+        let a = fusion_report(
+            vec![fusion_hit("b/y#1", 0.02), fusion_hit("b/y#2", 0.02)],
+            None,
+        );
+        let b = fusion_report(vec![fusion_hit("a/x#1", 0.02)], None);
+        let to_global = |report: &SearchRouteReport| DetailedRouteReport {
+            report: report.clone(),
+            per_ranker: vec![(RankerKind::Bm25, report.hits.clone())],
+            weights: vec![(RankerKind::Bm25, 1.0)],
+            pinned: None,
+            rrf_k: 60,
+        };
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let forward =
+                merge_search_route_reports_with(vec![to_global(&a), to_global(&b)], 3, fusion);
+            let backward =
+                merge_search_route_reports_with(vec![to_global(&b), to_global(&a)], 3, fusion);
+            assert_eq!(
+                hit_bits(&forward.hits),
+                hit_bits(&backward.hits),
+                "{fusion:?}"
+            );
+        }
+        let score = merge_search_route_reports_with(
+            vec![
+                DetailedRouteReport::from_report(a),
+                DetailedRouteReport::from_report(b),
+            ],
+            3,
+            MultipackFusion::Score,
+        );
+        let ids: Vec<_> = score.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["a/x#1", "b/y#1", "b/y#2"]);
     }
 }

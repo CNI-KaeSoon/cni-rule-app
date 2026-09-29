@@ -17,9 +17,11 @@ use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
-    LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions, VectorStatus,
+    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article,
+    ContextPrefix, DetailedRouteReport, GraphNode, KoPosFilter, LegalBasis, MultipackFusion,
+    NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit, SearchOptions,
+    SearchRouteReport, SourcePage, TantivyRulesIndex, TokenizerStatus, VectorSearchOptions,
+    VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -121,6 +123,49 @@ pub struct ServerConfig {
     pub extra_packs: Vec<ExtraPackConfig>,
     #[serde(default)]
     pub vectors: VectorConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+/// `[search]` section of the server config (PRD 2.3). Absent keys mean the
+/// legacy behaviour.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub e5_prefix: bool,
+    /// `"none"` (default) | `"v1"` | `"v2"`; other values fail config loading.
+    #[serde(default)]
+    pub ko_pos_filter: KoPosFilter,
+    /// `"none"` (default) | `"vector"` | `"both"`; other values fail config loading.
+    #[serde(default)]
+    pub context_prefix: ContextPrefix,
+    /// RRF weight of the character-bigram list, `0.0..=2.0` (default 0.0 =
+    /// off); values outside the range fail config loading.
+    #[serde(default, deserialize_with = "deserialize_bigram_weight")]
+    pub bigram_weight: f32,
+    /// Multi-pack merge of `search_rules`: `"rrf"` (default) | `"score"` |
+    /// `"global"`; other values fail config loading.
+    #[serde(default)]
+    pub multipack_fusion: MultipackFusion,
+}
+
+fn deserialize_bigram_weight<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let weight = f32::deserialize(deserializer)?;
+    rules_core::validate_bigram_weight(weight).map_err(serde::de::Error::custom)
+}
+
+impl SearchConfig {
+    fn to_search_options(&self) -> SearchOptions {
+        SearchOptions {
+            e5_prefix: self.e5_prefix,
+            ko_pos_filter: self.ko_pos_filter,
+            context_prefix: self.context_prefix,
+            bigram_weight: self.bigram_weight,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -434,6 +479,8 @@ pub struct StatusResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<LoadedPackStatus>,
     pub vectors: VectorStatus,
+    /// True when any loaded pack fell back to the simple tokenizer.
+    pub tokenizer_degraded: bool,
     pub meta: FreshnessMeta,
 }
 
@@ -444,6 +491,8 @@ pub struct LoadedPackStatus {
     pub source_commit: String,
     pub index_built_at: String,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<TokenizerStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -462,6 +511,7 @@ pub struct PublicRulesServer {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     search_semaphore: Arc<Semaphore>,
+    multipack_fusion: MultipackFusion,
     query_logger: Option<QueryLogger>,
 }
 
@@ -486,6 +536,7 @@ impl PublicRulesServer {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
             query_logger: None,
         }
     }
@@ -500,11 +551,14 @@ impl PublicRulesServer {
         let mut seen = BTreeMap::new();
         seen.insert(default_institution.clone(), ());
         let vector_options = config.vectors.to_search_options();
+        let search_options = config.search.to_search_options();
+        let multipack_fusion = config.search.multipack_fusion;
         let default_pack_path = config.pack.path.clone();
         let default_index = load_pack(
             default_institution.clone(),
             config.pack,
             vector_options.clone(),
+            search_options,
         )?;
         let mut packs = vec![LoadedPack {
             institution: default_institution.clone(),
@@ -527,6 +581,7 @@ impl PublicRulesServer {
                 extra.institution.clone(),
                 extra.pack,
                 vector_options.clone(),
+                search_options,
             )?;
             packs.push(LoadedPack {
                 institution: extra.institution.clone(),
@@ -546,6 +601,7 @@ impl PublicRulesServer {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion,
             query_logger: None,
         })
     }
@@ -930,14 +986,15 @@ fn load_pack(
     institution: String,
     pack: PackConfig,
     vector_options: VectorSearchOptions,
+    search_options: SearchOptions,
 ) -> anyhow::Result<TantivyRulesIndex> {
     let path = pack
         .path
         .ok_or_else(|| anyhow::anyhow!("pack.path is required for M0 local stdio server"))?;
     let index = if path.is_file() {
-        TantivyRulesIndex::from_pack_archive_with_vector_options(path, vector_options)?
+        TantivyRulesIndex::from_pack_archive_with_options(path, vector_options, search_options)?
     } else if path.join("manifest.json").is_file() {
-        TantivyRulesIndex::from_pack_dir_with_vector_options(path, vector_options)?
+        TantivyRulesIndex::from_pack_dir_with_options(path, vector_options, search_options)?
     } else {
         if vector_options.enabled {
             eprintln!("vector search disabled for bare articles dir: pack manifest is required for a stable cache key");
@@ -1055,6 +1112,89 @@ fn search_pack_report(
         }),
     );
     rules_core::namespace_search_route_report(report, &pack.institution, multi_pack)
+}
+
+fn search_pack_detailed_report(
+    pack: &LoadedPack,
+    query: &str,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+) -> DetailedRouteReport {
+    let report = pack.index.search_with_routes_detailed(
+        query,
+        limit,
+        Some(RuleFilter {
+            institution: None,
+            rule,
+            ..RuleFilter::default()
+        }),
+    );
+    rules_core::namespace_detailed_route_report(report, &pack.institution, multi_pack)
+}
+
+/// Per-pack reports for `search_rules`, ready for
+/// `merge_search_route_reports_with`. Only `global` pays for the per-ranker
+/// detail; other modes use the legacy single-report path.
+async fn search_rules_pack_reports(
+    packs: Vec<LoadedPack>,
+    query: &str,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+    fusion: MultipackFusion,
+    semaphore: Arc<Semaphore>,
+) -> Vec<DetailedRouteReport> {
+    let detailed = fusion == MultipackFusion::Global;
+    if packs.len() <= 1 {
+        return packs
+            .iter()
+            .map(|pack| {
+                if detailed {
+                    search_pack_detailed_report(pack, query, limit, rule.clone(), multi_pack)
+                } else {
+                    DetailedRouteReport::from_report(search_pack_report(
+                        pack,
+                        query,
+                        limit,
+                        rule.clone(),
+                        multi_pack,
+                    ))
+                }
+            })
+            .collect();
+    }
+    if !detailed {
+        let jobs = packs
+            .into_iter()
+            .map(|pack| (pack, query.to_string()))
+            .collect();
+        return search_pack_reports_blocking(jobs, limit, rule, multi_pack, semaphore)
+            .await
+            .into_iter()
+            .filter_map(|result| result.result.ok())
+            .map(DetailedRouteReport::from_report)
+            .collect();
+    }
+    let mut handles = Vec::with_capacity(packs.len());
+    for pack in packs {
+        let permit = semaphore.clone().acquire_owned().await;
+        let query = query.to_string();
+        let rule = rule.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit.map_err(|error| error.to_string())?;
+            Ok::<_, String>(search_pack_detailed_report(
+                &pack, &query, limit, rule, multi_pack,
+            ))
+        }));
+    }
+    let mut reports = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok(Ok(report)) = handle.await {
+            reports.push(report);
+        }
+    }
+    reports
 }
 
 #[derive(Debug)]
@@ -1619,30 +1759,23 @@ impl PublicRulesServer {
         let rule = params.rule.clone();
         let institution = params.institution.clone();
         let limit = top_k.unwrap_or(5);
-        let selected_packs = self.selected_packs_for_query(institution.as_deref(), &query);
-        let reports = if selected_packs.len() <= 1 {
-            selected_packs
-                .into_iter()
-                .map(|pack| search_pack_report(pack, &query, limit, rule.clone(), self.multi_pack))
-                .collect::<Vec<_>>()
-        } else {
-            let jobs = selected_packs
-                .into_iter()
-                .map(|pack| (pack.clone(), query.clone()))
-                .collect();
-            search_pack_reports_blocking(
-                jobs,
-                limit,
-                rule.clone(),
-                self.multi_pack,
-                self.search_semaphore.clone(),
-            )
-            .await
+        let selected_packs = self
+            .selected_packs_for_query(institution.as_deref(), &query)
             .into_iter()
-            .filter_map(|result| result.result.ok())
-            .collect()
-        };
-        let hits = rules_core::merge_search_route_reports(reports, limit).hits;
+            .cloned()
+            .collect::<Vec<_>>();
+        let reports = search_rules_pack_reports(
+            selected_packs,
+            &query,
+            limit,
+            rule.clone(),
+            self.multi_pack,
+            self.multipack_fusion,
+            self.search_semaphore.clone(),
+        )
+        .await;
+        let hits =
+            rules_core::merge_search_route_reports_with(reports, limit, self.multipack_fusion).hits;
         let hit_meta = if self.multi_pack {
             self.hit_meta(&hits)
         } else {
@@ -2021,7 +2154,10 @@ impl PublicRulesServer {
         let packs = if self.multi_pack {
             self.packs
                 .iter()
-                .map(|pack| LoadedPackStatus::from(pack.index.status()))
+                .map(|pack| LoadedPackStatus {
+                    tokenizer: Some(pack.index.tokenizer_status().clone()),
+                    ..LoadedPackStatus::from(pack.index.status())
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -2034,6 +2170,10 @@ impl PublicRulesServer {
         } else {
             Vec::new()
         };
+        let tokenizer_degraded = self
+            .packs
+            .iter()
+            .any(|pack| pack.index.tokenizer_status().degraded);
         StatusResult {
             institution: default_status.institution.clone(),
             effective_date: default_status.effective_date.clone(),
@@ -2043,6 +2183,7 @@ impl PublicRulesServer {
             institutions,
             packs,
             vectors: self.vector_status(),
+            tokenizer_degraded,
             meta: FreshnessMeta {
                 effective: default_status.effective_date.clone(),
                 amended: default_status.effective_date,
@@ -2126,6 +2267,7 @@ impl From<PackStatus> for StatusResult {
             institutions: Vec::new(),
             packs: Vec::new(),
             vectors: VectorStatus::default(),
+            tokenizer_degraded: false,
             meta,
         }
     }
@@ -2139,6 +2281,7 @@ impl From<PackStatus> for LoadedPackStatus {
             source_commit: status.source_commit,
             index_built_at: status.index_built_at,
             stale: status.stale,
+            tokenizer: None,
         }
     }
 }
@@ -2775,6 +2918,7 @@ refs: []
             tool_router: PublicRulesServer::tool_router(),
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
             query_logger: None,
         }
     }
@@ -3041,6 +3185,7 @@ table_structured: true
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
 
@@ -3104,6 +3249,7 @@ table_structured: true
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         };
         config.extra_packs.push(ExtraPackConfig {
             institution: "ctp".to_string(),
@@ -3381,6 +3527,7 @@ table_structured: true
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             query_logger: None,
+            multipack_fusion: MultipackFusion::default(),
         };
         let cni_result = legal_links_of(&server, "cni/시험규칙#제1조").await;
         assert_eq!(cni_result.links[0].resolution, "local_bundled");
@@ -3494,6 +3641,7 @@ table_structured: true
                 model_dir: Some(bogus_model),
                 ..VectorConfig::default()
             },
+            search: SearchConfig::default(),
         })
         .unwrap();
 
@@ -3501,6 +3649,158 @@ table_structured: true
 
         assert!(result.vectors.enabled);
         assert!(!result.vectors.model_ready);
+    }
+
+    fn tokenizer_status_fixture_server(degrade_ctp: bool) -> PublicRulesServer {
+        let build = |institution: &str| {
+            TantivyRulesIndex::from_articles(
+                vec![fixture_article(
+                    institution,
+                    "시험규칙",
+                    "제1조",
+                    "목적",
+                    "2026-03-01",
+                    "① 시험 본문이다.",
+                )],
+                default_pack_status(institution, "2026-03-01"),
+            )
+            .unwrap()
+        };
+        let cni = build("cni");
+        let mut ctp = build("ctp");
+        if degrade_ctp {
+            ctp.set_tokenizer_status_for_test(TokenizerStatus {
+                kind: "simple-fallback".to_string(),
+                filter: "none".to_string(),
+                degraded: true,
+                reason: Some("ko-dic load failed: test".to_string()),
+            });
+        }
+        let pack = |institution: &str, index: TantivyRulesIndex| LoadedPack {
+            institution: institution.to_string(),
+            aliases: vec![institution.to_string()],
+            index: Arc::new(index),
+        };
+        PublicRulesServer {
+            packs: Arc::new(vec![pack("cni", cni), pack("ctp", ctp)]),
+            default_institution: "cni".to_string(),
+            multi_pack: true,
+            tool_router: PublicRulesServer::tool_router(),
+            prompt_router: PublicRulesServer::prompt_router(),
+            search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
+            query_logger: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_tool_reports_tokenizer_degradation() {
+        let Json(healthy) = tokenizer_status_fixture_server(false).status().await;
+        assert!(!healthy.tokenizer_degraded);
+        assert!(healthy
+            .packs
+            .iter()
+            .all(|p| p.tokenizer.as_ref().is_some_and(|t| !t.degraded)));
+
+        let Json(degraded) = tokenizer_status_fixture_server(true).status().await;
+        assert!(degraded.tokenizer_degraded);
+        let ctp = degraded
+            .packs
+            .iter()
+            .find(|p| p.institution == "ctp")
+            .unwrap();
+        let status = ctp.tokenizer.as_ref().unwrap();
+        assert!(status.degraded);
+        assert_eq!(status.kind, "simple-fallback");
+        assert!(status.reason.as_deref().unwrap().contains("ko-dic"));
+        let cni = degraded
+            .packs
+            .iter()
+            .find(|p| p.institution == "cni")
+            .unwrap();
+        assert!(!cni.tokenizer.as_ref().unwrap().degraded);
+        // the flag is always serialised, even when false
+        let json = serde_json::to_value(&healthy).unwrap();
+        assert_eq!(json["tokenizer_degraded"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn search_ko_pos_filter_parses_and_rejects_unknown_values() {
+        let config: ServerConfig =
+            toml::from_str("institution = \"cni\"\n\n[search]\nko_pos_filter = \"v2\"\n").unwrap();
+        assert_eq!(config.search.ko_pos_filter, KoPosFilter::V2);
+        assert_eq!(
+            config.search.to_search_options().ko_pos_filter,
+            KoPosFilter::V2
+        );
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\nko_pos_filter = \"v3\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("none") && error.contains("v1") && error.contains("v2"));
+    }
+
+    #[test]
+    fn search_context_prefix_parses_and_rejects_unknown_values() {
+        for (raw, expected) in [
+            ("none", ContextPrefix::None),
+            ("vector", ContextPrefix::Vector),
+            ("both", ContextPrefix::Both),
+        ] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\ncontext_prefix = \"{raw}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.context_prefix, expected);
+            assert_eq!(config.search.to_search_options().context_prefix, expected);
+        }
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\ncontext_prefix = \"all\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("none") && error.contains("vector") && error.contains("both"));
+    }
+
+    #[test]
+    fn bigram_weight_out_of_range_rejected_by_config() {
+        for raw in ["0.0", "0.3", "1.0", "2.0"] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\nbigram_weight = {raw}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.bigram_weight, raw.parse::<f32>().unwrap());
+            assert_eq!(
+                config.search.to_search_options().bigram_weight,
+                config.search.bigram_weight
+            );
+        }
+        for raw in ["-0.1", "2.1", "100.0", "nan"] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "institution = \"cni\"\n\n[search]\nbigram_weight = {raw}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("0.0..=2.0"), "{raw}: {error}");
+        }
+        let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(default.search.bigram_weight, 0.0);
+    }
+
+    #[test]
+    fn server_config_without_search_section_parses_to_defaults() {
+        let config: ServerConfig = toml::from_str(
+            "institution = \"cni\"\n\n[pack]\npath = \"/tmp/none\"\n\n[vectors]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.search, SearchConfig::default());
+        assert!(!config.search.e5_prefix);
+        assert_eq!(config.search.to_search_options(), SearchOptions::default());
+
+        let with_flag: ServerConfig =
+            toml::from_str("institution = \"cni\"\n\n[search]\ne5_prefix = true\n").unwrap();
+        assert!(with_flag.search.e5_prefix);
     }
 
     #[test]
@@ -3806,6 +4106,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let Json(result) = server.status().await;
@@ -3936,6 +4237,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let mut params = compare_params("여비지급규칙#별표1");
@@ -4247,6 +4549,7 @@ refs: []
             })
             .collect(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let mut params = compare_params(&query);
@@ -4274,6 +4577,11 @@ refs: []
         }
     }
 
+    fn with_fusion(mut server: PublicRulesServer, fusion: MultipackFusion) -> PublicRulesServer {
+        server.multipack_fusion = fusion;
+        server
+    }
+
     async fn search_ok(
         server: &PublicRulesServer,
         query: &str,
@@ -4289,6 +4597,14 @@ refs: []
             .await
             .unwrap();
         result
+    }
+
+    async fn search_json(
+        server: &PublicRulesServer,
+        query: &str,
+        institution: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::to_value(search_ok(server, query, institution).await).unwrap()
     }
 
     #[tokio::test]
@@ -4338,6 +4654,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let result = search_ok(&server, "국내출장여비 항공", None).await;
@@ -4370,6 +4687,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let result = search_ok(&server, "국내출장여비 항공", None).await;
@@ -4456,5 +4774,102 @@ refs: []
             .map(String::from)
             .collect::<BTreeSet<_>>()
         );
+    }
+
+    #[test]
+    fn multipack_fusion_config_parses_and_rejects_unknown() {
+        let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(default.search.multipack_fusion, MultipackFusion::Rrf);
+        for (raw, expected) in [
+            ("rrf", MultipackFusion::Rrf),
+            ("score", MultipackFusion::Score),
+            ("global", MultipackFusion::Global),
+        ] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\nmultipack_fusion = \"{raw}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.multipack_fusion, expected);
+        }
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\nmultipack_fusion = \"mean\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rrf") && error.contains("score") && error.contains("global"));
+    }
+
+    #[tokio::test]
+    async fn default_fusion_search_rules_matches_legacy_merge() {
+        let server = multi_pack_fixture_server();
+        assert_eq!(server.multipack_fusion, MultipackFusion::Rrf);
+        let actual = search_json(&server, "육아휴직", None).await;
+        let reports = server
+            .packs
+            .iter()
+            .map(|pack| search_pack_report(pack, "육아휴직", 5, None, true))
+            .collect::<Vec<_>>();
+        let legacy = rules_core::merge_search_route_reports(reports, 5).hits;
+        assert_eq!(actual["hits"], serde_json::to_value(legacy).unwrap());
+    }
+
+    #[tokio::test]
+    async fn single_scope_search_identical_across_fusion_modes() {
+        let base = search_json(&multi_pack_fixture_server(), "육아휴직", Some("cni")).await;
+        assert!(!base["hits"].as_array().unwrap().is_empty());
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let other = search_json(
+                &with_fusion(multi_pack_fixture_server(), fusion),
+                "육아휴직",
+                Some("cni"),
+            )
+            .await;
+            assert_eq!(base, other, "{fusion:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_pack_search_runs_in_every_fusion_mode() {
+        for fusion in [
+            MultipackFusion::Rrf,
+            MultipackFusion::Score,
+            MultipackFusion::Global,
+        ] {
+            let server = with_fusion(multi_pack_fixture_server(), fusion);
+            let first = search_json(&server, "육아휴직", None).await;
+            let second = search_json(&server, "육아휴직", None).await;
+            assert_eq!(first, second, "{fusion:?} must be deterministic");
+            let ids = first["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["article_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                ids.contains(&"cni/인사규정#제10조".to_string()),
+                "{fusion:?} {ids:?}"
+            );
+            assert!(
+                ids.contains(&"ctp/인사규정#제10조".to_string()),
+                "{fusion:?} {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_rules_output_unchanged_by_fusion_setting() {
+        let compare = |fusion| async move {
+            let server = with_fusion(multi_pack_fixture_server(), fusion);
+            let Json(result) = server
+                .compare_rules(Parameters(compare_params("육아휴직")))
+                .await
+                .unwrap();
+            serde_json::to_value(result).unwrap()
+        };
+        let base = compare(MultipackFusion::Rrf).await;
+        assert!(!base["institutions"].as_array().unwrap().is_empty());
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            assert_eq!(base, compare(fusion).await, "{fusion:?}");
+        }
     }
 }

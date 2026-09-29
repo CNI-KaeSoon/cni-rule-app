@@ -1330,6 +1330,16 @@
             },
             "stale": {
               "type": "boolean"
+            },
+            "tokenizer": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TokenizerStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -1338,6 +1348,34 @@
             "source_commit",
             "index_built_at",
             "stale"
+          ],
+          "type": "object"
+        },
+        "TokenizerStatus": {
+          "description": "Which analyzer the BM25 index really uses; a dictionary load failure is\nreported here instead of silently changing behaviour.",
+          "properties": {
+            "degraded": {
+              "type": "boolean"
+            },
+            "filter": {
+              "description": "Filter variant actually applied (`none` when the fallback is active).",
+              "type": "string"
+            },
+            "kind": {
+              "description": "`lindera-ko-dic` or `simple-fallback`.",
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "filter",
+            "degraded"
           ],
           "type": "object"
         },
@@ -1389,6 +1427,10 @@
         "stale": {
           "type": "boolean"
         },
+        "tokenizer_degraded": {
+          "description": "True when any loaded pack fell back to the simple tokenizer.",
+          "type": "boolean"
+        },
         "vectors": {
           "$ref": "#/$defs/VectorStatus"
         }
@@ -1400,6 +1442,7 @@
         "index_built_at",
         "stale",
         "vectors",
+        "tokenizer_degraded",
         "meta"
       ],
       "type": "object"
