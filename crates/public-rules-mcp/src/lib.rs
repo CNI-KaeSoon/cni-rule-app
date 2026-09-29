@@ -17,10 +17,10 @@ use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
 };
 use rules_core::{
-    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
-    KoPosFilter, LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchOptions, SearchRouteReport, SourcePage, TantivyRulesIndex, TokenizerStatus,
-    VectorSearchOptions, VectorStatus,
+    default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article,
+    ContextPrefix, GraphNode, KoPosFilter, LegalBasis, NodeKind, PackStatus, RuleFilter,
+    RuleSummary, RulesIndex, SearchHit, SearchOptions, SearchRouteReport, SourcePage,
+    TantivyRulesIndex, TokenizerStatus, VectorSearchOptions, VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -135,6 +135,9 @@ pub struct SearchConfig {
     /// `"none"` (default) | `"v1"` | `"v2"`; other values fail config loading.
     #[serde(default)]
     pub ko_pos_filter: KoPosFilter,
+    /// `"none"` (default) | `"vector"` | `"both"`; other values fail config loading.
+    #[serde(default)]
+    pub context_prefix: ContextPrefix,
 }
 
 impl SearchConfig {
@@ -142,6 +145,7 @@ impl SearchConfig {
         SearchOptions {
             e5_prefix: self.e5_prefix,
             ko_pos_filter: self.ko_pos_filter,
+            context_prefix: self.context_prefix,
         }
     }
 }
@@ -3051,6 +3055,28 @@ table_structured: true
         .unwrap_err()
         .to_string();
         assert!(error.contains("none") && error.contains("v1") && error.contains("v2"));
+    }
+
+    #[test]
+    fn search_context_prefix_parses_and_rejects_unknown_values() {
+        for (raw, expected) in [
+            ("none", ContextPrefix::None),
+            ("vector", ContextPrefix::Vector),
+            ("both", ContextPrefix::Both),
+        ] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\ncontext_prefix = \"{raw}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.context_prefix, expected);
+            assert_eq!(config.search.to_search_options().context_prefix, expected);
+        }
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\ncontext_prefix = \"all\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("none") && error.contains("vector") && error.contains("both"));
     }
 
     #[test]

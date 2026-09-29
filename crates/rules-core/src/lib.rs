@@ -275,14 +275,39 @@ pub struct SearchOptions {
     pub e5_prefix: bool,
     /// Part-of-speech filter / normalisation of the BM25 `ko` analyzer.
     pub ko_pos_filter: KoPosFilter,
+    /// Deterministic metadata context prepended to passages (PH-07).
+    pub context_prefix: ContextPrefix,
 }
 
 impl SearchOptions {
     pub fn passage_format(&self) -> PassageFormat {
-        if self.e5_prefix {
-            PassageFormat::E5Prefix
-        } else {
-            PassageFormat::Legacy
+        match (self.e5_prefix, self.context_prefix != ContextPrefix::None) {
+            (false, false) => PassageFormat::Legacy,
+            (true, false) => PassageFormat::E5Prefix,
+            (false, true) => PassageFormat::Ctx1,
+            (true, true) => PassageFormat::E5PrefixCtx1,
+        }
+    }
+}
+
+/// Where the deterministic article/annex context string is injected (PH-07).
+/// `Vector` = embedding passages only; `Both` = passages and the BM25 `body`
+/// field. `None` is the legacy behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextPrefix {
+    #[default]
+    None,
+    Vector,
+    Both,
+}
+
+impl ContextPrefix {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextPrefix::None => "none",
+            ContextPrefix::Vector => "vector",
+            ContextPrefix::Both => "both",
         }
     }
 }
@@ -352,6 +377,10 @@ pub enum PassageFormat {
     #[default]
     Legacy,
     E5Prefix,
+    /// Metadata context line before the passage (`ctx1`).
+    Ctx1,
+    /// `passage: ` prefix plus the context line (`e5p+ctx1`).
+    E5PrefixCtx1,
 }
 
 impl PassageFormat {
@@ -360,20 +389,32 @@ impl PassageFormat {
         match self {
             PassageFormat::Legacy => None,
             PassageFormat::E5Prefix => Some("e5p"),
+            PassageFormat::Ctx1 => Some("ctx1"),
+            PassageFormat::E5PrefixCtx1 => Some("e5p+ctx1"),
         }
     }
 
+    fn has_e5_prefix(self) -> bool {
+        matches!(self, PassageFormat::E5Prefix | PassageFormat::E5PrefixCtx1)
+    }
+
+    fn has_context(self) -> bool {
+        matches!(self, PassageFormat::Ctx1 | PassageFormat::E5PrefixCtx1)
+    }
+
     fn passage_text(self, text: String) -> String {
-        match self {
-            PassageFormat::Legacy => text,
-            PassageFormat::E5Prefix => format!("passage: {text}"),
+        if self.has_e5_prefix() {
+            format!("passage: {text}")
+        } else {
+            text
         }
     }
 
     fn query_text(self, q: &str) -> std::borrow::Cow<'_, str> {
-        match self {
-            PassageFormat::Legacy => std::borrow::Cow::Borrowed(q),
-            PassageFormat::E5Prefix => std::borrow::Cow::Owned(format!("query: {q}")),
+        if self.has_e5_prefix() {
+            std::borrow::Cow::Owned(format!("query: {q}"))
+        } else {
+            std::borrow::Cow::Borrowed(q)
         }
     }
 }
@@ -570,6 +611,9 @@ pub struct TantivyRulesIndex {
     vector_weight: f32,
     search_options: SearchOptions,
     tokenizer_status: TokenizerStatus,
+    /// Deterministic article/annex context strings (empty unless
+    /// `context_prefix` is on).
+    contexts: BTreeMap<String, String>,
 }
 
 impl TantivyRulesIndex {
@@ -627,10 +671,19 @@ impl TantivyRulesIndex {
         with_page_owners: bool,
     ) -> Result<Self> {
         link_neighbors(&mut articles);
+        let (graph, node_indices) = build_ref_graph(articles.values(), nodes, edges);
+        let contexts = if search_options.context_prefix == ContextPrefix::None {
+            BTreeMap::new()
+        } else {
+            build_contexts(&articles, &annexes, &graph, &node_indices, nodes)
+        };
+        let bm25_contexts =
+            (search_options.context_prefix == ContextPrefix::Both).then_some(&contexts);
         let (index, fields, tokenizer_status) = build_search_index(
             articles.values(),
             annexes.values(),
             search_options.ko_pos_filter,
+            bm25_contexts,
         )?;
         let reader = SearchReader(
             index
@@ -639,7 +692,6 @@ impl TantivyRulesIndex {
                 .try_into()?,
         );
         let summaries = build_rule_summaries(articles.values());
-        let (graph, node_indices) = build_ref_graph(articles.values(), nodes, edges);
         let page_owners = if with_page_owners {
             build_page_owners(articles.values(), annexes.values())
         } else {
@@ -665,6 +717,7 @@ impl TantivyRulesIndex {
             vector_weight: opts.vector_weight,
             search_options,
             tokenizer_status,
+            contexts,
         })
     }
 
@@ -692,6 +745,7 @@ impl TantivyRulesIndex {
             cache_key,
             cache_dir,
             self.search_options.passage_format(),
+            &self.contexts,
         )?);
         self.vector_provider = Some(StoredEmbeddingProvider(provider));
         Ok(())
@@ -1174,6 +1228,7 @@ impl TantivyRulesIndex {
             cache_key,
             Some(cache_dir),
             self.search_options.passage_format(),
+            &self.contexts,
         )?;
         Ok((corpus, StoredEmbeddingProvider(provider)))
     }
@@ -1189,16 +1244,7 @@ impl TantivyRulesIndex {
     }
 
     fn reverse_neighbors(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
-        let Some(node) = self.node_indices.get(id).copied() else {
-            return Vec::new();
-        };
-        let mut out = BTreeSet::new();
-        for edge in self.graph.edges_directed(node, petgraph::Incoming) {
-            if accept(*edge.weight()) {
-                out.insert(self.graph[edge.source()].clone());
-            }
-        }
-        out.into_iter().collect()
+        reverse_neighbors_in(&self.graph, &self.node_indices, id, accept)
     }
 
     fn forward_traversal(&self, id: &str, accept: impl Fn(EdgeKind) -> bool) -> Vec<String> {
@@ -1780,6 +1826,7 @@ fn build_search_index<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
     ko_pos_filter: KoPosFilter,
+    body_contexts: Option<&BTreeMap<String, String>>,
 ) -> Result<(Index, SearchFields, TokenizerStatus)> {
     #[cfg(test)]
     SEARCH_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
@@ -1811,12 +1858,16 @@ fn build_search_index<'a>(
         .map(SearchEntry::from_article)
         .chain(annexes.map(SearchEntry::from_annex))
     {
+        let entry_body = match body_contexts.and_then(|contexts| contexts.get(&entry.id)) {
+            Some(context) => format!("{context}\n{}", entry.body),
+            None => entry.body,
+        };
         writer.add_document(doc!(
             id => entry.id,
             rule => entry.rule,
             title => entry.title,
             effective => entry.effective,
-            body => entry.body,
+            body => entry_body,
         ))?;
     }
     writer.commit()?;
@@ -1992,6 +2043,135 @@ fn build_rule_summaries<'a>(articles: impl Iterator<Item = &'a Article>) -> Vec<
     by_rule.into_values().collect()
 }
 
+const CONTEXT_SEPARATOR: &str = " · ";
+const ANNEX_REFS_LABEL: &str = "참조 조문:";
+const ANNEX_REFS_MAX_TITLES: usize = 5;
+const ANNEX_REFS_MAX_CHARS: usize = 200;
+
+/// Institution slug -> display label from `Institution` graph nodes.
+fn institution_labels(nodes: &[GraphNode]) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    for node in nodes.iter().filter(|n| n.kind == NodeKind::Institution) {
+        if node.label.trim().is_empty() {
+            continue;
+        }
+        labels
+            .entry(node.id.clone())
+            .or_insert_with(|| node.label.clone());
+        if let Some(slug) = node.meta.get("institution").and_then(|v| v.as_str()) {
+            labels
+                .entry(slug.to_string())
+                .or_insert_with(|| node.label.clone());
+        }
+    }
+    labels
+}
+
+/// `"{institution label} · {rule} · {article}({title})"`; the title
+/// parentheses are omitted for an empty title.
+fn article_context(institution_label: &str, article: &Article) -> String {
+    let mut out = [institution_label, &article.rule, &article.article].join(CONTEXT_SEPARATOR);
+    let title = article.title.trim();
+    if !title.is_empty() {
+        out.push('(');
+        out.push_str(title);
+        out.push(')');
+    }
+    out
+}
+
+/// `"{rule} · {annex title} · 참조 조문: {t1}, {t2}, …"`; the reference part is
+/// omitted when no article references the annex. The joined title list is
+/// cut at 200 characters (never inside a character).
+fn annex_context(annex: &Annex, referencing_titles: &[String]) -> String {
+    let mut out = [annex.rule.as_str(), annex_search_title(annex).as_str()].join(CONTEXT_SEPARATOR);
+    if !referencing_titles.is_empty() {
+        let joined = referencing_titles.join(", ");
+        let cut: String = joined.chars().take(ANNEX_REFS_MAX_CHARS).collect();
+        out.push_str(CONTEXT_SEPARATOR);
+        out.push_str(ANNEX_REFS_LABEL);
+        out.push(' ');
+        out.push_str(&cut);
+    }
+    out
+}
+
+/// Titles of the first five same-institution articles (by article number) that
+/// point at the annex through `AppliesTo` or `Cites`. An article without a
+/// title contributes its article number.
+fn annex_referencing_titles(
+    articles: &BTreeMap<String, Article>,
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    annex: &Annex,
+) -> Vec<String> {
+    let mut sources = reverse_neighbors_in(graph, node_indices, &annex.id, |kind| {
+        matches!(kind, EdgeKind::AppliesTo | EdgeKind::Cites)
+    })
+    .into_iter()
+    .filter_map(|id| articles.get(&id))
+    .filter(|article| article.institution == annex.institution)
+    .collect::<Vec<_>>();
+    sources.sort_by(|a, b| {
+        article_sort_key(&a.article)
+            .cmp(&article_sort_key(&b.article))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sources
+        .into_iter()
+        .take(ANNEX_REFS_MAX_TITLES)
+        .map(|article| {
+            let title = article.title.trim();
+            if title.is_empty() {
+                article.article.clone()
+            } else {
+                title.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Context string per article/annex id (pure function of the pack contents).
+fn build_contexts(
+    articles: &BTreeMap<String, Article>,
+    annexes: &BTreeMap<String, Annex>,
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    nodes: &[GraphNode],
+) -> BTreeMap<String, String> {
+    let labels = institution_labels(nodes);
+    let mut contexts = BTreeMap::new();
+    for article in articles.values() {
+        let label = labels
+            .get(&article.institution)
+            .unwrap_or(&article.institution);
+        contexts.insert(article.id.clone(), article_context(label, article));
+    }
+    for annex in annexes.values() {
+        let titles = annex_referencing_titles(articles, graph, node_indices, annex);
+        contexts.insert(annex.id.clone(), annex_context(annex, &titles));
+    }
+    contexts
+}
+
+fn reverse_neighbors_in(
+    graph: &DiGraph<String, EdgeKind>,
+    node_indices: &HashMap<String, NodeIndex>,
+    id: &str,
+    accept: impl Fn(EdgeKind) -> bool,
+) -> Vec<String> {
+    let Some(node) = node_indices.get(id).copied() else {
+        return Vec::new();
+    };
+    let mut out = BTreeSet::new();
+    for edge in graph.edges_directed(node, petgraph::Incoming) {
+        if accept(*edge.weight()) {
+            out.insert(graph[edge.source()].clone());
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn build_ref_graph<'a>(
     articles: impl Iterator<Item = &'a Article>,
     nodes: &[GraphNode],
@@ -2163,8 +2343,9 @@ fn build_or_load_vector_corpus<'a>(
     cache_key: &str,
     cache_dir: Option<&Path>,
     format: PassageFormat,
+    contexts: &BTreeMap<String, String>,
 ) -> anyhow::Result<VectorCorpus> {
-    let entries = vector_source_entries(articles, annexes, format);
+    let entries = vector_source_entries(articles, annexes, format, contexts);
     if let Some(cache_dir) = cache_dir {
         let path = vector_cache_path(cache_dir, cache_key);
         if let Some(corpus) = load_vector_corpus_cache(&path, cache_key, &entries)? {
@@ -2247,12 +2428,28 @@ fn vector_source_entries<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
     fmt: PassageFormat,
+    contexts: &BTreeMap<String, String>,
 ) -> Vec<(String, String, String, String)> {
+    // `ctx1` passages start with the context line; a missing entry (never in
+    // practice) degrades to the plain passage.
+    let context_line = |id: &str| -> String {
+        if fmt.has_context() {
+            contexts
+                .get(id)
+                .map(|context| format!("{context}\n"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
     let mut entries = articles
         .map(|article| {
             let text = fmt.passage_text(format!(
-                "{} {}\n{}",
-                article.rule, article.title, article.body
+                "{}{} {}\n{}",
+                context_line(&article.id),
+                article.rule,
+                article.title,
+                article.body
             ));
             (
                 article.id.clone(),
@@ -2263,7 +2460,8 @@ fn vector_source_entries<'a>(
         })
         .chain(annexes.map(|annex| {
             let text = fmt.passage_text(format!(
-                "{} {}\n{}",
+                "{}{} {}\n{}",
+                context_line(&annex.id),
                 annex.rule,
                 annex_search_title(annex),
                 annex.body
@@ -2931,6 +3129,7 @@ refs:
                 key,
                 Some(dir.path()),
                 fmt,
+                &BTreeMap::new(),
             )
             .unwrap();
         }
@@ -3230,6 +3429,7 @@ refs:
             index.articles.values(),
             index.annexes.values(),
             index.search_options.ko_pos_filter,
+            None,
         )
         .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
@@ -3701,6 +3901,7 @@ refs:
             index.articles.values(),
             index.annexes.values(),
             index.search_options.ko_pos_filter,
+            None,
         )
         .unwrap();
         index.reader = SearchReader(index.index.reader().unwrap());
@@ -4016,5 +4217,438 @@ refs:
             };
             assert_eq!(collect(&mut legacy), collect(&mut current), "{text}");
         }
+    }
+
+    // --- PH-07 deterministic context injection ---
+
+    fn ctx_node(id: &str, kind: NodeKind, label: &str) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            kind,
+            label: label.to_string(),
+            meta: BTreeMap::new(),
+        }
+    }
+
+    fn ctx_edge(src: &str, dst: &str, kind: EdgeKind) -> GraphEdge {
+        GraphEdge {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            kind,
+            meta: BTreeMap::new(),
+        }
+    }
+
+    fn ctx_options(context_prefix: ContextPrefix, e5_prefix: bool) -> SearchOptions {
+        SearchOptions {
+            context_prefix,
+            e5_prefix,
+            ..SearchOptions::default()
+        }
+    }
+
+    fn ctx_index(
+        articles: Vec<Article>,
+        annexes: Vec<Annex>,
+        nodes: &[GraphNode],
+        edges: &[GraphEdge],
+        options: SearchOptions,
+    ) -> TantivyRulesIndex {
+        TantivyRulesIndex::assemble(
+            articles.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            annexes.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            None,
+            nodes,
+            edges,
+            default_pack_status("cni", "2026-03-01"),
+            &VectorSearchOptions::default(),
+            options,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn article_context_uses_institution_label_rule_and_number() {
+        let nodes = [ctx_node("cni", NodeKind::Institution, "가상연구원")];
+        let mut untitled = article_fixture("cni", "테스트규정", "제3조", "x", "본문");
+        untitled.title = String::new();
+        let articles = [
+            article_fixture("cni", "테스트규정", "제1조", "목적", "본문"),
+            untitled,
+            // Institution without a node: the slug is the display name.
+            article_fixture("zzz", "시험규칙", "제2조", "정의", "본문"),
+        ];
+        let map = articles.iter().map(|a| (a.id.clone(), a.clone())).collect();
+        let (graph, indices) = build_ref_graph(articles.iter(), &nodes, &[]);
+        let contexts = build_contexts(&map, &BTreeMap::new(), &graph, &indices, &nodes);
+        assert_eq!(
+            contexts["테스트규정#제1조"],
+            "가상연구원 · 테스트규정 · 제1조(목적)"
+        );
+        // Empty title: no parentheses at all.
+        assert_eq!(
+            contexts["테스트규정#제3조"],
+            "가상연구원 · 테스트규정 · 제3조"
+        );
+        // No Institution node: slug fallback.
+        assert_eq!(contexts["시험규칙#제2조"], "zzz · 시험규칙 · 제2조(정의)");
+    }
+
+    #[test]
+    fn annex_context_lists_referencing_article_titles_sorted_and_capped() {
+        let rule = "테스트규정";
+        // Seven referencing articles inserted out of order; 10 sorts after 9.
+        let numbers = [10, 2, 1, 7, 3, 9, 5];
+        let mut articles = numbers
+            .iter()
+            .map(|n| {
+                article_fixture(
+                    "cni",
+                    rule,
+                    &format!("제{n}조"),
+                    &format!("제목{n}"),
+                    "본문",
+                )
+            })
+            .collect::<Vec<_>>();
+        // Same rule name but another institution must not be listed.
+        articles.push(article_fixture(
+            "ctp",
+            "외부규정",
+            "제1조",
+            "타기관",
+            "본문",
+        ));
+        let annexes = vec![annex_fixture("cni", rule, "별표1", "시험표", "| a | b |")];
+        let annex_id = annexes[0].id.clone();
+        let mut edges = numbers
+            .iter()
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::Cites))
+            .collect::<Vec<_>>();
+        edges.push(ctx_edge("외부규정#제1조", &annex_id, EdgeKind::Cites));
+        // Non-article sources and other edge kinds are ignored.
+        edges.push(ctx_edge(
+            &format!("rule:{rule}"),
+            &annex_id,
+            EdgeKind::AppliesTo,
+        ));
+        edges.push(ctx_edge(
+            &format!("{rule}#제10조"),
+            &annex_id,
+            EdgeKind::Delegates,
+        ));
+
+        let index = ctx_index(
+            articles.clone(),
+            annexes.clone(),
+            &[],
+            &edges,
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        assert_eq!(
+            index.contexts[&annex_id],
+            format!("{rule} · 별표1 시험표 · 참조 조문: 제목1, 제목2, 제목3, 제목5, 제목7")
+        );
+
+        // No referencing article: the reference part is omitted.
+        let lonely = ctx_index(
+            vec![],
+            annexes.clone(),
+            &[],
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        assert_eq!(lonely.contexts[&annex_id], format!("{rule} · 별표1 시험표"));
+
+        // 200-character cap on multibyte titles, cut on a character boundary.
+        let long_title = "가".repeat(60);
+        let long_articles = (1..=5)
+            .map(|n| article_fixture("cni", rule, &format!("제{n}조"), &long_title, "본문"))
+            .collect::<Vec<_>>();
+        let long_edges = (1..=5)
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::AppliesTo))
+            .collect::<Vec<_>>();
+        let capped = ctx_index(
+            long_articles,
+            annexes,
+            &[],
+            &long_edges,
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        let context = &capped.contexts[&annex_id];
+        let refs = context.split_once("참조 조문: ").unwrap().1;
+        assert_eq!(refs.chars().count(), 200);
+        assert!(
+            refs.len() > 200,
+            "multibyte titles: byte length exceeds 200"
+        );
+        assert!(refs.starts_with(&long_title));
+    }
+
+    fn ctx_articles() -> Vec<Article> {
+        vec![article_fixture(
+            "cni",
+            "시험규칙",
+            "제1조",
+            "목적",
+            "시험 본문",
+        )]
+    }
+
+    fn ctx_nodes() -> Vec<GraphNode> {
+        vec![ctx_node("cni", NodeKind::Institution, "구름연구소")]
+    }
+
+    #[test]
+    fn context_prefix_vector_changes_only_passages() {
+        let context = "구름연구소 · 시험규칙 · 제1조(목적)";
+        for (e5, expected) in [
+            (false, format!("{context}\n시험규칙 목적\n시험 본문\n")),
+            (
+                true,
+                format!("passage: {context}\n시험규칙 목적\n시험 본문\n"),
+            ),
+        ] {
+            let provider = RecordingProvider::default();
+            let mut index = ctx_index(
+                ctx_articles(),
+                vec![],
+                &ctx_nodes(),
+                &[],
+                ctx_options(ContextPrefix::Vector, e5),
+            );
+            index
+                .enable_vectors_for_test(provider.clone(), "k", None, 60, 1.0)
+                .unwrap();
+            index.search("시험질의", 5, None);
+            let texts = provider.texts.lock().unwrap().clone();
+            assert_eq!(texts[0], expected, "e5={e5}");
+            // The query side never carries the context.
+            let query = if e5 {
+                "query: 시험질의"
+            } else {
+                "시험질의"
+            };
+            assert_eq!(texts[1], query);
+            assert_eq!(texts.len(), 2);
+        }
+
+        // BM25 side: results and the indexed body are those of `none`.
+        let plain = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            SearchOptions::default(),
+        );
+        let vector = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        for q in ["시험 본문", "구름연구소", "목적"] {
+            assert_eq!(plain.search(q, 5, None), vector.search(q, 5, None), "{q}");
+        }
+        assert_eq!(body_field_hits(&vector, "구름연구소"), 0);
+    }
+
+    fn body_field_hits(index: &TantivyRulesIndex, term: &str) -> usize {
+        let parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
+        let (query, _) = parser.parse_query_lenient(term);
+        index
+            .reader
+            .0
+            .searcher()
+            .search(&query, &TopDocs::with_limit(10))
+            .unwrap()
+            .len()
+    }
+
+    fn title_field_hits(index: &TantivyRulesIndex, term: &str) -> usize {
+        let parser = QueryParser::for_index(&index.index, vec![index.fields.title]);
+        let (query, _) = parser.parse_query_lenient(term);
+        index
+            .reader
+            .0
+            .searcher()
+            .search(&query, &TopDocs::with_limit(10))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn context_prefix_both_prefixes_bm25_body_only() {
+        let label = "구름연구소";
+        let none = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            SearchOptions::default(),
+        );
+        let vector = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        let both = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Both, false),
+        );
+        assert_eq!(body_field_hits(&none, label), 0);
+        assert_eq!(body_field_hits(&vector, label), 0);
+        assert_eq!(body_field_hits(&both, label), 1);
+        // title and rule fields are untouched; the stored article body too.
+        assert_eq!(title_field_hits(&both, label), 0);
+        assert_eq!(
+            both.get_article("시험규칙#제1조").unwrap(),
+            none.get_article("시험규칙#제1조").unwrap()
+        );
+        assert!(both
+            .search(label, 5, None)
+            .iter()
+            .any(|h| h.article_id == "시험규칙#제1조"));
+        assert!(none.search(label, 5, None).is_empty());
+
+        // Vector passages equal the `vector` variant (same `ctx1` format).
+        let record = |index: &mut TantivyRulesIndex| {
+            let provider = RecordingProvider::default();
+            index
+                .enable_vectors_for_test(provider.clone(), "k", None, 60, 1.0)
+                .unwrap();
+            let texts = provider.texts.lock().unwrap().clone();
+            texts
+        };
+        let mut vector = vector;
+        let mut both = both;
+        assert_eq!(record(&mut vector), record(&mut both));
+    }
+
+    #[test]
+    fn context_strings_are_deterministic_across_rebuilds() {
+        let rule = "테스트규정";
+        let mut articles = (1..=6)
+            .map(|n| {
+                article_fixture(
+                    "cni",
+                    rule,
+                    &format!("제{n}조"),
+                    &format!("제목{n}"),
+                    "본문",
+                )
+            })
+            .collect::<Vec<_>>();
+        let annexes = vec![annex_fixture("cni", rule, "별표1", "시험표", "| a |")];
+        let annex_id = annexes[0].id.clone();
+        let mut edges = (1..=6)
+            .map(|n| ctx_edge(&format!("{rule}#제{n}조"), &annex_id, EdgeKind::AppliesTo))
+            .collect::<Vec<_>>();
+        let nodes = ctx_nodes();
+        let first = ctx_index(
+            articles.clone(),
+            annexes.clone(),
+            &nodes,
+            &edges,
+            ctx_options(ContextPrefix::Both, false),
+        );
+        // Rebuild with shuffled input order.
+        articles.reverse();
+        edges.reverse();
+        let second = ctx_index(
+            articles,
+            annexes,
+            &nodes,
+            &edges,
+            ctx_options(ContextPrefix::Both, false),
+        );
+        assert_eq!(first.contexts, second.contexts);
+        assert_eq!(first.contexts.len(), 7);
+        let texts = |index: &TantivyRulesIndex| {
+            vector_source_entries(
+                index.articles.values(),
+                index.annexes.values(),
+                PassageFormat::Ctx1,
+                &index.contexts,
+            )
+        };
+        assert_eq!(texts(&first), texts(&second));
+    }
+
+    #[test]
+    fn context_prefix_uses_distinct_cache_key() {
+        let manifest = test_manifest();
+        let keys = [
+            (SearchOptions::default(), None),
+            (ctx_options(ContextPrefix::None, true), Some("e5p")),
+            (ctx_options(ContextPrefix::Vector, false), Some("ctx1")),
+            (ctx_options(ContextPrefix::Both, false), Some("ctx1")),
+            (ctx_options(ContextPrefix::Vector, true), Some("e5p+ctx1")),
+            (ctx_options(ContextPrefix::Both, true), Some("e5p+ctx1")),
+        ];
+        for (options, tag) in &keys {
+            assert_eq!(options.passage_format().cache_tag(), *tag);
+        }
+        let key = |o: SearchOptions| pack_vector_cache_key(&manifest, o.passage_format());
+        let legacy = key(SearchOptions::default());
+        let e5 = key(ctx_options(ContextPrefix::None, true));
+        let ctx1 = key(ctx_options(ContextPrefix::Vector, false));
+        let both_e5 = key(ctx_options(ContextPrefix::Both, true));
+        let all = [&legacy, &e5, &ctx1, &both_e5];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // `both` embeds exactly like `vector`, so it shares the vector cache file.
+        assert_eq!(ctx1, key(ctx_options(ContextPrefix::Both, false)));
+        // The cache file structure did not change, so the version stays put.
+        assert_eq!(VECTOR_CACHE_VERSION, 1);
+
+        // Separate files per format when built through the real cache path.
+        let dir = tempfile::tempdir().unwrap();
+        let index = ctx_index(
+            ctx_articles(),
+            vec![],
+            &ctx_nodes(),
+            &[],
+            ctx_options(ContextPrefix::Vector, false),
+        );
+        for (k, fmt) in [
+            (&legacy, PassageFormat::Legacy),
+            (&ctx1, PassageFormat::Ctx1),
+        ] {
+            build_or_load_vector_corpus(
+                index.articles.values(),
+                index.annexes.values(),
+                &RecordingProvider::default(),
+                k,
+                Some(dir.path()),
+                fmt,
+                &index.contexts,
+            )
+            .unwrap();
+        }
+        assert!(vector_cache_path(dir.path(), &legacy).is_file());
+        assert!(vector_cache_path(dir.path(), &ctx1).is_file());
+        // A legacy corpus never picks up context text and vice versa.
+        let hash = |fmt| {
+            vector_source_entries(
+                index.articles.values(),
+                index.annexes.values(),
+                fmt,
+                &index.contexts,
+            )[0]
+            .2
+            .clone()
+        };
+        assert_ne!(hash(PassageFormat::Legacy), hash(PassageFormat::Ctx1));
     }
 }
