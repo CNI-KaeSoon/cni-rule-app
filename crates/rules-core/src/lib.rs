@@ -334,6 +334,82 @@ impl ContextPrefix {
     }
 }
 
+/// How per-pack search results are combined for a multi-pack query (PRD
+/// PH-09). `Rrf` (default) is the legacy rank-only fusion of the packs' final
+/// lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultipackFusion {
+    #[default]
+    Rrf,
+    /// Sort the union of the packs' in-pack fused scores (same `rrf_k` and
+    /// weights, hence one scale) globally.
+    Score,
+    /// Merge each ranker's list across packs by its raw score, then run one
+    /// weighted RRF. BM25 and lexical raw scores use per-pack IDF, so the
+    /// cross-pack ordering of those lists is an approximation.
+    Global,
+}
+
+impl MultipackFusion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MultipackFusion::Rrf => "rrf",
+            MultipackFusion::Score => "score",
+            MultipackFusion::Global => "global",
+        }
+    }
+}
+
+/// Individual rankers that feed the in-pack RRF, in fusion order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RankerKind {
+    AnnexRef,
+    Bm25,
+    Vector,
+    Rule,
+    Lexical,
+    Bigram,
+}
+
+impl RankerKind {
+    pub const ALL: [RankerKind; 6] = [
+        RankerKind::AnnexRef,
+        RankerKind::Bm25,
+        RankerKind::Vector,
+        RankerKind::Rule,
+        RankerKind::Lexical,
+        RankerKind::Bigram,
+    ];
+}
+
+/// [`SearchRouteReport`] plus the per-ranker lists it was fused from (PH-09).
+/// `report` is exactly what `search_with_routes` returns.
+#[derive(Debug, Clone, Default)]
+pub struct DetailedRouteReport {
+    pub report: SearchRouteReport,
+    /// Ranker lists with their raw scores, in fusion order.
+    pub per_ranker: Vec<(RankerKind, Vec<SearchHit>)>,
+    /// RRF weight of each ranker in this pack.
+    pub weights: Vec<(RankerKind, f32)>,
+    pub pinned: Option<SearchHit>,
+    pub rrf_k: usize,
+}
+
+impl DetailedRouteReport {
+    /// Wraps a plain report without ranker detail (`rrf`/`score` need none).
+    pub fn from_report(report: SearchRouteReport) -> Self {
+        let pinned = report.pin_hit.clone();
+        Self {
+            report,
+            per_ranker: Vec::new(),
+            weights: Vec::new(),
+            pinned,
+            rrf_k: DEFAULT_RRF_K,
+        }
+    }
+}
+
 /// BM25 analyzer variants (PRD PH-06). `None` is the legacy token stream.
 /// `V1` = NFKC + lowercase + particle/symbol stop tags; `V2` = `V1` plus
 /// verbal endings. Matching is exact on the first ko-dic feature, so compound
@@ -875,7 +951,73 @@ impl TantivyRulesIndex {
         }
     }
 
+    /// Same result as [`Self::search_with_routes`] (`report`), plus the
+    /// per-ranker lists needed by `MultipackFusion::Global`.
+    pub fn search_with_routes_detailed(
+        &self,
+        q: &str,
+        k: usize,
+        filter: Option<RuleFilter>,
+    ) -> DetailedRouteReport {
+        if q.trim().is_empty() || k == 0 {
+            return DetailedRouteReport::default();
+        }
+        let pinned = self.direct_article_hit(q, filter.as_ref());
+        let (per_ranker, retrieval_hits) = match self.retrieval_rankers(q, k, filter.as_ref()) {
+            Err(fallback) => (vec![(RankerKind::Lexical, fallback.clone())], fallback),
+            Ok(rankers) => {
+                let fused = self.fuse_rankers(rankers.clone(), k);
+                (rankers, fused)
+            }
+        };
+        let hits = merge_pinned_hits(pinned.clone(), retrieval_hits.clone(), k);
+        DetailedRouteReport {
+            report: SearchRouteReport {
+                hits,
+                pin_hit: pinned.clone(),
+                retrieval_hits,
+            },
+            per_ranker,
+            weights: RankerKind::ALL
+                .iter()
+                .map(|kind| (*kind, self.ranker_weight(*kind)))
+                .collect(),
+            pinned,
+            rrf_k: self.rrf_k,
+        }
+    }
+
     fn search_retrieval(&self, q: &str, k: usize, filter: Option<&RuleFilter>) -> Vec<SearchHit> {
+        match self.retrieval_rankers(q, k, filter) {
+            Err(fallback) => fallback,
+            Ok(rankers) => self.fuse_rankers(rankers, k),
+        }
+    }
+
+    fn ranker_weight(&self, kind: RankerKind) -> f32 {
+        match kind {
+            RankerKind::Vector => self.vector_weight,
+            RankerKind::Bigram => self.search_options.bigram_weight,
+            _ => 1.0,
+        }
+    }
+
+    fn fuse_rankers(&self, rankers: Vec<(RankerKind, Vec<SearchHit>)>, k: usize) -> Vec<SearchHit> {
+        let (rankings, weights): (Vec<_>, Vec<_>) = rankers
+            .into_iter()
+            .map(|(kind, hits)| (hits, self.ranker_weight(kind)))
+            .unzip();
+        rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
+    }
+
+    /// Runs every ranker. `Err` carries the lexical fallback used when the
+    /// BM25 query itself fails.
+    fn retrieval_rankers(
+        &self,
+        q: &str,
+        k: usize,
+        filter: Option<&RuleFilter>,
+    ) -> std::result::Result<Vec<(RankerKind, Vec<SearchHit>)>, Vec<SearchHit>> {
         let query_terms = query_terms(q);
         let normalized_query = query_terms.join(" ");
         let parser_query = if normalized_query.is_empty() {
@@ -890,7 +1032,7 @@ impl TantivyRulesIndex {
         let searcher = self.reader.0.searcher();
         let candidate_limit = k * 4;
         let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(candidate_limit)) else {
-            return lexical_fallback(self.articles.values(), q, k, filter);
+            return Err(lexical_fallback(self.articles.values(), q, k, filter));
         };
 
         let mut bm25_hits = Vec::new();
@@ -944,27 +1086,20 @@ impl TantivyRulesIndex {
         let annex_ref_hits = self.annex_reference_rank(q, candidate_limit, filter);
         let vector_hits = self.vector_rank(q, candidate_limit, filter);
         let bigram_hits = self.bigram_rank(q, candidate_limit, filter);
-        let mut rankings = Vec::new();
-        let mut weights = Vec::new();
-        rankings.push(annex_ref_hits);
-        weights.push(1.0);
+        let mut rankers = Vec::new();
+        rankers.push((RankerKind::AnnexRef, annex_ref_hits));
         if !bm25_hits.is_empty() {
-            rankings.push(bm25_hits);
-            weights.push(1.0);
+            rankers.push((RankerKind::Bm25, bm25_hits));
         }
         if !vector_hits.is_empty() {
-            rankings.push(vector_hits);
-            weights.push(self.vector_weight);
+            rankers.push((RankerKind::Vector, vector_hits));
         }
-        rankings.push(rule_hits);
-        weights.push(1.0);
-        rankings.push(lexical_hits);
-        weights.push(1.0);
+        rankers.push((RankerKind::Rule, rule_hits));
+        rankers.push((RankerKind::Lexical, lexical_hits));
         if !bigram_hits.is_empty() {
-            rankings.push(bigram_hits);
-            weights.push(self.search_options.bigram_weight);
+            rankers.push((RankerKind::Bigram, bigram_hits));
         }
-        rrf_fuse_weighted(rankings, k, self.rrf_k, &weights)
+        Ok(rankers)
     }
 
     /// BM25 ranking over the character-bigram field (PH-08). Empty unless the
@@ -1713,6 +1848,126 @@ pub fn merge_search_route_reports(reports: Vec<SearchRouteReport>, k: usize) -> 
     SearchRouteReport {
         hits,
         pin_hit,
+        retrieval_hits,
+    }
+}
+
+/// Namespaces every hit of a detailed report (see
+/// [`namespace_search_route_report`]).
+pub fn namespace_detailed_route_report(
+    mut detailed: DetailedRouteReport,
+    institution: &str,
+    prefix_article_ids: bool,
+) -> DetailedRouteReport {
+    detailed.report =
+        namespace_search_route_report(detailed.report, institution, prefix_article_ids);
+    for (_, hits) in &mut detailed.per_ranker {
+        for hit in hits {
+            namespace_search_hit(hit, institution, prefix_article_ids);
+        }
+    }
+    if let Some(hit) = &mut detailed.pinned {
+        namespace_search_hit(hit, institution, prefix_article_ids);
+    }
+    detailed
+}
+
+/// Multi-pack merge selected by `search.multipack_fusion` (PH-09). `Rrf`
+/// is exactly [`merge_search_route_reports`]. A single report is returned
+/// unchanged whatever the mode. `Global` needs `per_ranker` detail; reports
+/// without it are merged as `Score`.
+pub fn merge_search_route_reports_with(
+    reports: Vec<DetailedRouteReport>,
+    k: usize,
+    fusion: MultipackFusion,
+) -> SearchRouteReport {
+    if reports.len() <= 1 || k == 0 || fusion == MultipackFusion::Rrf {
+        return merge_search_route_reports(reports.into_iter().map(|d| d.report).collect(), k);
+    }
+    let has_detail = reports.iter().any(|d| !d.per_ranker.is_empty());
+    if fusion == MultipackFusion::Global && has_detail {
+        merge_global(&reports, k)
+    } else {
+        merge_by_score(reports.into_iter().map(|d| d.report).collect(), k)
+    }
+}
+
+/// Union by `article_id` keeping the higher-scored copy, ordered by
+/// `(score desc, article_id asc)`.
+fn union_by_score<'a>(
+    lists: impl Iterator<Item = &'a Vec<SearchHit>>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut by_id: BTreeMap<String, SearchHit> = BTreeMap::new();
+    for hit in lists.flatten() {
+        match by_id.get_mut(&hit.article_id) {
+            Some(existing) => {
+                if hit.score.total_cmp(&existing.score) == std::cmp::Ordering::Greater {
+                    *existing = hit.clone();
+                }
+            }
+            None => {
+                by_id.insert(hit.article_id.clone(), hit.clone());
+            }
+        }
+    }
+    let mut hits: Vec<SearchHit> = by_id.into_values().collect();
+    sort_hits_by_score_and_id(&mut hits);
+    hits.truncate(limit);
+    hits
+}
+
+fn merge_by_score(reports: Vec<SearchRouteReport>, k: usize) -> SearchRouteReport {
+    let hits = union_by_score(reports.iter().map(|r| &r.hits), k);
+    let retrieval_hits = union_by_score(reports.iter().map(|r| &r.retrieval_hits), k);
+    let pins: Vec<SearchHit> = reports.iter().filter_map(|r| r.pin_hit.clone()).collect();
+    let pin_hit = union_by_score(std::iter::once(&pins), 1).into_iter().next();
+    SearchRouteReport {
+        hits,
+        pin_hit,
+        retrieval_hits,
+    }
+}
+
+fn merge_global(reports: &[DetailedRouteReport], k: usize) -> SearchRouteReport {
+    let rrf_k = reports.first().map_or(DEFAULT_RRF_K, |d| d.rrf_k);
+    let limit = k.saturating_mul(4);
+    let mut rankings = Vec::new();
+    let mut weights = Vec::new();
+    for kind in RankerKind::ALL {
+        let lists: Vec<&Vec<SearchHit>> = reports
+            .iter()
+            .flat_map(|d| d.per_ranker.iter())
+            .filter(|(k2, _)| *k2 == kind)
+            .map(|(_, hits)| hits)
+            .collect();
+        let merged = union_by_score(lists.into_iter(), limit);
+        if merged.is_empty() {
+            continue;
+        }
+        let weight = reports
+            .iter()
+            .flat_map(|d| d.weights.iter())
+            .find(|(k2, _)| *k2 == kind)
+            .map_or(1.0, |(_, w)| *w);
+        rankings.push(merged);
+        weights.push(weight);
+    }
+    let retrieval_hits = rrf_fuse_weighted(rankings, k, rrf_k, &weights);
+
+    let pins_raw: Vec<SearchHit> = reports.iter().filter_map(|d| d.pinned.clone()).collect();
+    let pins = union_by_score(std::iter::once(&pins_raw), k);
+    let mut hits = pins.clone();
+    hits.extend(
+        retrieval_hits
+            .iter()
+            .filter(|hit| !pins.iter().any(|pin| pin.article_id == hit.article_id))
+            .cloned(),
+    );
+    hits.truncate(k);
+    SearchRouteReport {
+        hits,
+        pin_hit: pins.into_iter().next(),
         retrieval_hits,
     }
 }
@@ -4895,5 +5150,346 @@ refs:
             .clone()
         };
         assert_ne!(hash(PassageFormat::Legacy), hash(PassageFormat::Ctx1));
+    }
+
+    // ---- PH-09 multi-pack fusion ----
+
+    fn fusion_hit(id: &str, score: f32) -> SearchHit {
+        SearchHit {
+            article_id: id.to_string(),
+            institution: id.split('/').next().unwrap_or_default().to_string(),
+            score,
+            snippet: String::new(),
+            rule: "시험규칙".to_string(),
+            title: "시험".to_string(),
+            effective: "2026-03-01".to_string(),
+            kind: "article".to_string(),
+        }
+    }
+
+    fn fusion_report(hits: Vec<SearchHit>, pin: Option<SearchHit>) -> SearchRouteReport {
+        SearchRouteReport {
+            hits: hits.clone(),
+            pin_hit: pin,
+            retrieval_hits: hits,
+        }
+    }
+
+    fn hit_bits(hits: &[SearchHit]) -> Vec<(String, u32)> {
+        hits.iter()
+            .map(|h| (h.article_id.clone(), h.score.to_bits()))
+            .collect()
+    }
+
+    fn fusion_fixture_indices() -> (TantivyRulesIndex, TantivyRulesIndex) {
+        let make = |institution: &str, rule: &str| {
+            TantivyRulesIndex::from_articles(
+                vec![
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제1조",
+                        "시험목적",
+                        "① 시험 목적을 정한다.",
+                    ),
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제2조",
+                        "시험수당",
+                        "① 시험 수당은 별도로 정한다.",
+                    ),
+                    article_fixture(
+                        institution,
+                        rule,
+                        "제3조",
+                        "시험휴가",
+                        "① 시험 휴가를 신청할 수 있다.",
+                    ),
+                ],
+                default_pack_status(institution, "2026-03-01"),
+            )
+            .unwrap()
+        };
+        (make("cni", "테스트규정"), make("ctp", "시험규칙"))
+    }
+
+    #[test]
+    fn rrf_fusion_default_is_bit_identical() {
+        assert_eq!(MultipackFusion::default(), MultipackFusion::Rrf);
+        let (cni, ctp) = fusion_fixture_indices();
+        for q in [
+            "시험 수당",
+            "시험휴가 신청",
+            "테스트규정 제2조",
+            "없는질의어",
+        ] {
+            let plain = |index: &TantivyRulesIndex, inst: &str| {
+                namespace_search_route_report(index.search_with_routes(q, 5, None), inst, true)
+            };
+            let detailed = |index: &TantivyRulesIndex, inst: &str| {
+                namespace_detailed_route_report(
+                    index.search_with_routes_detailed(q, 5, None),
+                    inst,
+                    true,
+                )
+            };
+            // the detailed API carries exactly the legacy report
+            let d_cni = detailed(&cni, "cni");
+            let p_cni = plain(&cni, "cni");
+            assert_eq!(hit_bits(&d_cni.report.hits), hit_bits(&p_cni.hits));
+            assert_eq!(
+                hit_bits(&d_cni.report.retrieval_hits),
+                hit_bits(&p_cni.retrieval_hits)
+            );
+            assert_eq!(d_cni.report.pin_hit, p_cni.pin_hit);
+
+            let legacy =
+                merge_search_route_reports(vec![plain(&cni, "cni"), plain(&ctp, "ctp")], 5);
+            let with = merge_search_route_reports_with(
+                vec![detailed(&cni, "cni"), detailed(&ctp, "ctp")],
+                5,
+                MultipackFusion::Rrf,
+            );
+            assert_eq!(hit_bits(&legacy.hits), hit_bits(&with.hits));
+            assert_eq!(
+                hit_bits(&legacy.retrieval_hits),
+                hit_bits(&with.retrieval_hits)
+            );
+            assert_eq!(legacy.pin_hit, with.pin_hit);
+
+            // one report: every mode is a pass-through
+            for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+                let single =
+                    merge_search_route_reports_with(vec![detailed(&cni, "cni")], 5, fusion);
+                assert_eq!(hit_bits(&single.hits), hit_bits(&p_cni.hits));
+            }
+        }
+    }
+
+    #[test]
+    fn score_fusion_orders_by_in_pack_fused_score() {
+        let a = fusion_report(
+            vec![fusion_hit("a/x#1", 0.030), fusion_hit("a/x#2", 0.010)],
+            None,
+        );
+        let b = fusion_report(
+            vec![fusion_hit("b/y#1", 0.020), fusion_hit("b/y#2", 0.005)],
+            None,
+        );
+        let reports = || {
+            vec![
+                DetailedRouteReport::from_report(a.clone()),
+                DetailedRouteReport::from_report(b.clone()),
+            ]
+        };
+        let merged = merge_search_route_reports_with(reports(), 4, MultipackFusion::Score);
+        let ids: Vec<_> = merged.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["a/x#1", "b/y#1", "a/x#2", "b/y#2"]);
+        // in-pack scores are kept as-is
+        assert_eq!(merged.hits[1].score, 0.020);
+        // rrf would alternate by rank regardless of scores
+        let rrf = merge_search_route_reports_with(reports(), 4, MultipackFusion::Rrf);
+        assert_eq!(rrf.hits[0].article_id, "a/x#1");
+        assert_eq!(rrf.hits[1].article_id, "b/y#1");
+        // top_k truncation
+        let top2 = merge_search_route_reports_with(reports(), 2, MultipackFusion::Score);
+        assert_eq!(top2.hits.len(), 2);
+        // a strong pack is not diluted by a weak one
+        let weak = fusion_report(
+            vec![fusion_hit("b/y#1", 0.001), fusion_hit("b/y#2", 0.0005)],
+            None,
+        );
+        let skew = merge_search_route_reports_with(
+            vec![
+                DetailedRouteReport::from_report(a.clone()),
+                DetailedRouteReport::from_report(weak),
+            ],
+            4,
+            MultipackFusion::Score,
+        );
+        assert_eq!(
+            skew.hits
+                .iter()
+                .map(|h| h.article_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a/x#1", "a/x#2", "b/y#1", "b/y#2"]
+        );
+    }
+
+    #[test]
+    fn score_fusion_keeps_pins_first() {
+        let pin = fusion_hit("b/y#9", f32::MAX);
+        let a = fusion_report(vec![fusion_hit("a/x#1", 0.5)], None);
+        let b = fusion_report(
+            vec![pin.clone(), fusion_hit("b/y#1", 0.001)],
+            Some(pin.clone()),
+        );
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let detailed_b = DetailedRouteReport {
+                report: b.clone(),
+                per_ranker: vec![(RankerKind::Bm25, vec![fusion_hit("b/y#1", 3.0)])],
+                weights: vec![(RankerKind::Bm25, 1.0)],
+                pinned: Some(pin.clone()),
+                rrf_k: 60,
+            };
+            let detailed_a = DetailedRouteReport {
+                report: a.clone(),
+                per_ranker: vec![(RankerKind::Bm25, vec![fusion_hit("a/x#1", 9.0)])],
+                weights: vec![(RankerKind::Bm25, 1.0)],
+                pinned: None,
+                rrf_k: 60,
+            };
+            let merged = merge_search_route_reports_with(vec![detailed_a, detailed_b], 3, fusion);
+            assert_eq!(merged.hits[0].article_id, "b/y#9", "{fusion:?}");
+            assert_eq!(
+                merged.pin_hit.as_ref().map(|h| h.article_id.as_str()),
+                Some("b/y#9")
+            );
+            assert_eq!(
+                merged
+                    .hits
+                    .iter()
+                    .filter(|h| h.article_id == "b/y#9")
+                    .count(),
+                1
+            );
+            assert_eq!(merged.hits[1].article_id, "a/x#1");
+        }
+    }
+
+    #[test]
+    fn global_fusion_merges_rankers_before_rrf() {
+        // Hand calculation, rrf_k = 60, bm25 weight 1, vector weight 1.
+        // bm25: A [a1 5.0, a2 1.0], B [b1 3.0, b2 2.0] -> merged a1, b1, b2, a2
+        // vector: A [a2 0.9], B [b1 0.8]              -> merged a2, b1
+        //   a1 = 1/61           b1 = 1/62 + 1/62 = 2/62
+        //   b2 = 1/63           a2 = 1/64 + 1/61
+        // order: b1 (0.03226) > a2 (0.03202) > a1 (0.01639) > b2 (0.01587)
+        let detailed = |ranks: Vec<(RankerKind, Vec<SearchHit>)>| DetailedRouteReport {
+            report: SearchRouteReport::default(),
+            per_ranker: ranks,
+            weights: vec![(RankerKind::Bm25, 1.0), (RankerKind::Vector, 1.0)],
+            pinned: None,
+            rrf_k: 60,
+        };
+        let pack_a = detailed(vec![
+            (
+                RankerKind::Bm25,
+                vec![fusion_hit("a/x#1", 5.0), fusion_hit("a/x#2", 1.0)],
+            ),
+            (RankerKind::Vector, vec![fusion_hit("a/x#2", 0.9)]),
+        ]);
+        let pack_b = detailed(vec![
+            (
+                RankerKind::Bm25,
+                vec![fusion_hit("b/y#1", 3.0), fusion_hit("b/y#2", 2.0)],
+            ),
+            (RankerKind::Vector, vec![fusion_hit("b/y#1", 0.8)]),
+        ]);
+        let merged = merge_search_route_reports_with(
+            vec![pack_a.clone(), pack_b.clone()],
+            4,
+            MultipackFusion::Global,
+        );
+        let ids: Vec<_> = merged.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["b/y#1", "a/x#2", "a/x#1", "b/y#2"]);
+        let expected = [
+            2.0f32 / 62.0,
+            1.0 / 64.0 + 1.0 / 61.0,
+            1.0 / 61.0,
+            1.0 / 63.0,
+        ];
+        for (hit, want) in merged.hits.iter().zip(expected) {
+            assert!(
+                (hit.score - want).abs() < 1e-6,
+                "{} {} vs {}",
+                hit.article_id,
+                hit.score,
+                want
+            );
+        }
+        assert_eq!(hit_bits(&merged.hits), hit_bits(&merged.retrieval_hits));
+
+        // a heavier vector weight (3.0) changes the order
+        let reweigh = |mut d: DetailedRouteReport| {
+            d.weights = vec![(RankerKind::Bm25, 1.0), (RankerKind::Vector, 3.0)];
+            d
+        };
+        let heavy = merge_search_route_reports_with(
+            vec![reweigh(pack_a), reweigh(pack_b)],
+            4,
+            MultipackFusion::Global,
+        );
+        // a2 = 1/64 + 3/61 = 0.06478, b1 = 1/62 + 3/62 = 0.06452
+        assert_eq!(heavy.hits[0].article_id, "a/x#2");
+        assert_eq!(heavy.hits[1].article_id, "b/y#1");
+    }
+
+    #[test]
+    fn global_fusion_over_real_indices_is_deterministic_and_bounded() {
+        let (cni, ctp) = fusion_fixture_indices();
+        let run = |swap: bool| {
+            let mut reports = vec![
+                namespace_detailed_route_report(
+                    cni.search_with_routes_detailed("시험 수당", 4, None),
+                    "cni",
+                    true,
+                ),
+                namespace_detailed_route_report(
+                    ctp.search_with_routes_detailed("시험 수당", 4, None),
+                    "ctp",
+                    true,
+                ),
+            ];
+            if swap {
+                reports.reverse();
+            }
+            merge_search_route_reports_with(reports, 4, MultipackFusion::Global)
+        };
+        let first = run(false);
+        assert_eq!(hit_bits(&first.hits), hit_bits(&run(true).hits));
+        assert!(first.hits.len() <= 4 && !first.hits.is_empty());
+        assert!(first
+            .hits
+            .iter()
+            .all(|h| h.article_id.starts_with("cni/") || h.article_id.starts_with("ctp/")));
+    }
+
+    #[test]
+    fn fusion_tie_break_is_deterministic() {
+        let a = fusion_report(
+            vec![fusion_hit("b/y#1", 0.02), fusion_hit("b/y#2", 0.02)],
+            None,
+        );
+        let b = fusion_report(vec![fusion_hit("a/x#1", 0.02)], None);
+        let to_global = |report: &SearchRouteReport| DetailedRouteReport {
+            report: report.clone(),
+            per_ranker: vec![(RankerKind::Bm25, report.hits.clone())],
+            weights: vec![(RankerKind::Bm25, 1.0)],
+            pinned: None,
+            rrf_k: 60,
+        };
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let forward =
+                merge_search_route_reports_with(vec![to_global(&a), to_global(&b)], 3, fusion);
+            let backward =
+                merge_search_route_reports_with(vec![to_global(&b), to_global(&a)], 3, fusion);
+            assert_eq!(
+                hit_bits(&forward.hits),
+                hit_bits(&backward.hits),
+                "{fusion:?}"
+            );
+        }
+        let score = merge_search_route_reports_with(
+            vec![
+                DetailedRouteReport::from_report(a),
+                DetailedRouteReport::from_report(b),
+            ],
+            3,
+            MultipackFusion::Score,
+        );
+        let ids: Vec<_> = score.hits.iter().map(|h| h.article_id.as_str()).collect();
+        assert_eq!(ids, ["a/x#1", "b/y#1", "b/y#2"]);
     }
 }

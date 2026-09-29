@@ -18,9 +18,10 @@ use rmcp::{
 };
 use rules_core::{
     default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article,
-    ContextPrefix, GraphNode, KoPosFilter, LegalBasis, NodeKind, PackStatus, RuleFilter,
-    RuleSummary, RulesIndex, SearchHit, SearchOptions, SearchRouteReport, SourcePage,
-    TantivyRulesIndex, TokenizerStatus, VectorSearchOptions, VectorStatus,
+    ContextPrefix, DetailedRouteReport, GraphNode, KoPosFilter, LegalBasis, MultipackFusion,
+    NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit, SearchOptions,
+    SearchRouteReport, SourcePage, TantivyRulesIndex, TokenizerStatus, VectorSearchOptions,
+    VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,10 @@ pub struct SearchConfig {
     /// off); values outside the range fail config loading.
     #[serde(default, deserialize_with = "deserialize_bigram_weight")]
     pub bigram_weight: f32,
+    /// Multi-pack merge of `search_rules`: `"rrf"` (default) | `"score"` |
+    /// `"global"`; other values fail config loading.
+    #[serde(default)]
+    pub multipack_fusion: MultipackFusion,
 }
 
 fn deserialize_bigram_weight<'de, D>(deserializer: D) -> Result<f32, D::Error>
@@ -431,6 +436,7 @@ pub struct PublicRulesServer {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     search_semaphore: Arc<Semaphore>,
+    multipack_fusion: MultipackFusion,
     query_logger: Option<QueryLogger>,
 }
 
@@ -455,6 +461,7 @@ impl PublicRulesServer {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
             query_logger: None,
         }
     }
@@ -470,6 +477,7 @@ impl PublicRulesServer {
         seen.insert(default_institution.clone(), ());
         let vector_options = config.vectors.to_search_options();
         let search_options = config.search.to_search_options();
+        let multipack_fusion = config.search.multipack_fusion;
         let default_pack_path = config.pack.path.clone();
         let default_index = load_pack(
             default_institution.clone(),
@@ -518,6 +526,7 @@ impl PublicRulesServer {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion,
             query_logger: None,
         })
     }
@@ -878,6 +887,89 @@ fn search_pack_report(
         }),
     );
     rules_core::namespace_search_route_report(report, &pack.institution, multi_pack)
+}
+
+fn search_pack_detailed_report(
+    pack: &LoadedPack,
+    query: &str,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+) -> DetailedRouteReport {
+    let report = pack.index.search_with_routes_detailed(
+        query,
+        limit,
+        Some(RuleFilter {
+            institution: None,
+            rule,
+            ..RuleFilter::default()
+        }),
+    );
+    rules_core::namespace_detailed_route_report(report, &pack.institution, multi_pack)
+}
+
+/// Per-pack reports for `search_rules`, ready for
+/// `merge_search_route_reports_with`. Only `global` pays for the per-ranker
+/// detail; other modes use the legacy single-report path.
+async fn search_rules_pack_reports(
+    packs: Vec<LoadedPack>,
+    query: &str,
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+    fusion: MultipackFusion,
+    semaphore: Arc<Semaphore>,
+) -> Vec<DetailedRouteReport> {
+    let detailed = fusion == MultipackFusion::Global;
+    if packs.len() <= 1 {
+        return packs
+            .iter()
+            .map(|pack| {
+                if detailed {
+                    search_pack_detailed_report(pack, query, limit, rule.clone(), multi_pack)
+                } else {
+                    DetailedRouteReport::from_report(search_pack_report(
+                        pack,
+                        query,
+                        limit,
+                        rule.clone(),
+                        multi_pack,
+                    ))
+                }
+            })
+            .collect();
+    }
+    if !detailed {
+        let jobs = packs
+            .into_iter()
+            .map(|pack| (pack, query.to_string()))
+            .collect();
+        return search_pack_reports_blocking(jobs, limit, rule, multi_pack, semaphore)
+            .await
+            .into_iter()
+            .filter_map(|result| result.result.ok())
+            .map(DetailedRouteReport::from_report)
+            .collect();
+    }
+    let mut handles = Vec::with_capacity(packs.len());
+    for pack in packs {
+        let permit = semaphore.clone().acquire_owned().await;
+        let query = query.to_string();
+        let rule = rule.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit.map_err(|error| error.to_string())?;
+            Ok::<_, String>(search_pack_detailed_report(
+                &pack, &query, limit, rule, multi_pack,
+            ))
+        }));
+    }
+    let mut reports = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok(Ok(report)) = handle.await {
+            reports.push(report);
+        }
+    }
+    reports
 }
 
 #[derive(Debug)]
@@ -1423,30 +1515,23 @@ impl PublicRulesServer {
         let rule = params.rule.clone();
         let institution = params.institution.clone();
         let limit = top_k.unwrap_or(5);
-        let selected_packs = self.selected_packs_for_query(institution.as_deref(), &query);
-        let reports = if selected_packs.len() <= 1 {
-            selected_packs
-                .into_iter()
-                .map(|pack| search_pack_report(pack, &query, limit, rule.clone(), self.multi_pack))
-                .collect::<Vec<_>>()
-        } else {
-            let jobs = selected_packs
-                .into_iter()
-                .map(|pack| (pack.clone(), query.clone()))
-                .collect();
-            search_pack_reports_blocking(
-                jobs,
-                limit,
-                rule.clone(),
-                self.multi_pack,
-                self.search_semaphore.clone(),
-            )
-            .await
+        let selected_packs = self
+            .selected_packs_for_query(institution.as_deref(), &query)
             .into_iter()
-            .filter_map(|result| result.result.ok())
-            .collect()
-        };
-        let hits = rules_core::merge_search_route_reports(reports, limit).hits;
+            .cloned()
+            .collect::<Vec<_>>();
+        let reports = search_rules_pack_reports(
+            selected_packs,
+            &query,
+            limit,
+            rule.clone(),
+            self.multi_pack,
+            self.multipack_fusion,
+            self.search_semaphore.clone(),
+        )
+        .await;
+        let hits =
+            rules_core::merge_search_route_reports_with(reports, limit, self.multipack_fusion).hits;
         let hit_meta = if self.multi_pack {
             self.hit_meta(&hits)
         } else {
@@ -2524,6 +2609,7 @@ refs: []
             tool_router: PublicRulesServer::tool_router(),
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
             query_logger: None,
         }
     }
@@ -3018,6 +3104,7 @@ table_structured: true
             tool_router: PublicRulesServer::tool_router(),
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
             query_logger: None,
         }
     }
@@ -3903,6 +3990,124 @@ refs: []
                 actual.contains(id.as_str()),
                 "missing golden provision {id}"
             );
+        }
+    }
+
+    fn with_fusion(mut server: PublicRulesServer, fusion: MultipackFusion) -> PublicRulesServer {
+        server.multipack_fusion = fusion;
+        server
+    }
+
+    async fn search_json(
+        server: &PublicRulesServer,
+        query: &str,
+        institution: Option<&str>,
+    ) -> serde_json::Value {
+        let Json(result) = server
+            .search_rules(Parameters(SearchRulesParams {
+                query: query.to_string(),
+                top_k: Some(5),
+                rule: None,
+                institution: institution.map(str::to_string),
+            }))
+            .await;
+        serde_json::to_value(result).unwrap()
+    }
+
+    #[test]
+    fn multipack_fusion_config_parses_and_rejects_unknown() {
+        let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(default.search.multipack_fusion, MultipackFusion::Rrf);
+        for (raw, expected) in [
+            ("rrf", MultipackFusion::Rrf),
+            ("score", MultipackFusion::Score),
+            ("global", MultipackFusion::Global),
+        ] {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\nmultipack_fusion = \"{raw}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.multipack_fusion, expected);
+        }
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\nmultipack_fusion = \"mean\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rrf") && error.contains("score") && error.contains("global"));
+    }
+
+    #[tokio::test]
+    async fn default_fusion_search_rules_matches_legacy_merge() {
+        let server = multi_pack_fixture_server();
+        assert_eq!(server.multipack_fusion, MultipackFusion::Rrf);
+        let actual = search_json(&server, "육아휴직", None).await;
+        let reports = server
+            .packs
+            .iter()
+            .map(|pack| search_pack_report(pack, "육아휴직", 5, None, true))
+            .collect::<Vec<_>>();
+        let legacy = rules_core::merge_search_route_reports(reports, 5).hits;
+        assert_eq!(actual["hits"], serde_json::to_value(legacy).unwrap());
+    }
+
+    #[tokio::test]
+    async fn single_scope_search_identical_across_fusion_modes() {
+        let base = search_json(&multi_pack_fixture_server(), "육아휴직", Some("cni")).await;
+        assert!(!base["hits"].as_array().unwrap().is_empty());
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            let other = search_json(
+                &with_fusion(multi_pack_fixture_server(), fusion),
+                "육아휴직",
+                Some("cni"),
+            )
+            .await;
+            assert_eq!(base, other, "{fusion:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_pack_search_runs_in_every_fusion_mode() {
+        for fusion in [
+            MultipackFusion::Rrf,
+            MultipackFusion::Score,
+            MultipackFusion::Global,
+        ] {
+            let server = with_fusion(multi_pack_fixture_server(), fusion);
+            let first = search_json(&server, "육아휴직", None).await;
+            let second = search_json(&server, "육아휴직", None).await;
+            assert_eq!(first, second, "{fusion:?} must be deterministic");
+            let ids = first["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["article_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                ids.contains(&"cni/인사규정#제10조".to_string()),
+                "{fusion:?} {ids:?}"
+            );
+            assert!(
+                ids.contains(&"ctp/인사규정#제10조".to_string()),
+                "{fusion:?} {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_rules_output_unchanged_by_fusion_setting() {
+        let compare = |fusion| async move {
+            let server = with_fusion(multi_pack_fixture_server(), fusion);
+            let Json(result) = server
+                .compare_rules(Parameters(compare_params("육아휴직")))
+                .await
+                .unwrap();
+            serde_json::to_value(result).unwrap()
+        };
+        let base = compare(MultipackFusion::Rrf).await;
+        assert!(!base["institutions"].as_array().unwrap().is_empty());
+        for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
+            assert_eq!(base, compare(fusion).await, "{fusion:?}");
         }
     }
 }
