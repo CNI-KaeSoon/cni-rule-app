@@ -14,7 +14,7 @@ use tantivy::schema::{
     Field, IndexRecordOption, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value,
     STORED, STRING,
 };
-use tantivy::{Index, TantivyError};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError};
 use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -387,9 +387,31 @@ struct SearchFields {
     body: Field,
 }
 
+#[derive(Clone)]
+struct SearchReader(IndexReader);
+
+impl std::fmt::Debug for SearchReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SearchReader")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct VectorCorpus {
     entries: Vec<VectorEntry>,
+    /// `sqrt(sum(e*e))` per entry, precomputed with the same accumulation order as
+    /// `cosine_similarity` so scores stay bit-identical.
+    norms: Vec<f32>,
+}
+
+impl VectorCorpus {
+    fn new(entries: Vec<VectorEntry>) -> Self {
+        let norms = entries
+            .iter()
+            .map(|entry| squared_norm(&entry.embedding).sqrt())
+            .collect();
+        Self { entries, norms }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +450,7 @@ pub struct TantivyRulesIndex {
     graph: DiGraph<String, EdgeKind>,
     node_indices: HashMap<String, NodeIndex>,
     index: Index,
+    reader: SearchReader,
     fields: SearchFields,
     vector_corpus: Option<VectorCorpus>,
     vector_provider: Option<StoredEmbeddingProvider>,
@@ -441,28 +464,64 @@ impl TantivyRulesIndex {
     where
         I: IntoIterator<Item = Article>,
     {
-        let mut articles = articles.into_iter().map(|a| (a.id.clone(), a)).collect();
+        let articles = articles.into_iter().map(|a| (a.id.clone(), a)).collect();
+        Self::assemble(
+            articles,
+            BTreeMap::new(),
+            None,
+            &[],
+            &[],
+            status,
+            &VectorSearchOptions::default(),
+            false,
+        )
+    }
+
+    /// Builds the search index, summaries and graph exactly once.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        mut articles: BTreeMap<String, Article>,
+        annexes: BTreeMap<String, Annex>,
+        pages: Option<BTreeMap<u32, String>>,
+        nodes: &[GraphNode],
+        edges: &[GraphEdge],
+        status: PackStatus,
+        opts: &VectorSearchOptions,
+        with_page_owners: bool,
+    ) -> Result<Self> {
         link_neighbors(&mut articles);
-        let (index, fields) = build_search_index(articles.values(), [].iter())?;
+        let (index, fields) = build_search_index(articles.values(), annexes.values())?;
+        let reader = SearchReader(
+            index
+                .reader_builder()
+                .reload_policy(ReloadPolicy::Manual)
+                .try_into()?,
+        );
         let summaries = build_rule_summaries(articles.values());
-        let (graph, node_indices) = build_ref_graph(articles.values(), &[], &[]);
+        let (graph, node_indices) = build_ref_graph(articles.values(), nodes, edges);
+        let page_owners = if with_page_owners {
+            build_page_owners(articles.values(), annexes.values())
+        } else {
+            BTreeMap::new()
+        };
 
         Ok(Self {
             articles,
-            annexes: BTreeMap::new(),
-            pages: None,
-            page_owners: BTreeMap::new(),
+            annexes,
+            pages,
+            page_owners,
             summaries,
             status,
             graph,
             node_indices,
             index,
+            reader,
             fields,
             vector_corpus: None,
             vector_provider: None,
-            vector_enabled_requested: false,
-            rrf_k: DEFAULT_RRF_K,
-            vector_weight: 1.0,
+            vector_enabled_requested: opts.enabled,
+            rrf_k: opts.rrf_k,
+            vector_weight: opts.vector_weight,
         })
     }
 
@@ -523,18 +582,16 @@ impl TantivyRulesIndex {
             source_url: manifest.source_url,
         };
 
-        let mut index = Self::from_articles(articles, status)?;
-        index.annexes = annexes.into_iter().map(|a| (a.id.clone(), a)).collect();
-        index.page_owners = build_page_owners(index.articles.values(), index.annexes.values());
-        index.pages = pages;
-        (index.index, index.fields) =
-            build_search_index(index.articles.values(), index.annexes.values())?;
-        let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
-        index.graph = graph;
-        index.node_indices = node_indices;
-        index.rrf_k = vector_options.rrf_k;
-        index.vector_weight = vector_options.vector_weight;
-        index.vector_enabled_requested = vector_options.enabled;
+        let mut index = Self::assemble(
+            articles.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            annexes.into_iter().map(|a| (a.id.clone(), a)).collect(),
+            pages,
+            &nodes,
+            &edges,
+            status,
+            &vector_options,
+            true,
+        )?;
         if let Some((corpus, provider)) =
             index.try_build_vector_corpus_from_options(&cache_key, &vector_options)
         {
@@ -590,11 +647,7 @@ impl TantivyRulesIndex {
             QueryParser::for_index(&self.index, vec![self.fields.title, self.fields.body]);
         parser.set_field_boost(self.fields.title, 2.0);
         let (query, _errors) = parser.parse_query_lenient(parser_query);
-        let Ok(reader) = self.index.reader() else {
-            return lexical_fallback(self.articles.values(), q, k, filter);
-        };
-
-        let searcher = reader.searcher();
+        let searcher = self.reader.0.searcher();
         let candidate_limit = k * 4;
         let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(candidate_limit)) else {
             return lexical_fallback(self.articles.values(), q, k, filter);
@@ -881,8 +934,9 @@ impl TantivyRulesIndex {
         let mut hits = corpus
             .entries
             .iter()
-            .filter_map(|entry| {
-                let score = cosine_similarity(&query, &entry.embedding)?;
+            .zip(corpus.norms.iter())
+            .filter_map(|(entry, &norm)| {
+                let score = cosine_similarity_with_norm(&query, &entry.embedding, norm)?;
                 self.vector_hit_for_id(&entry.id, score, q, filter)
             })
             .collect::<Vec<_>>();
@@ -1554,10 +1608,17 @@ pub fn default_pack_status(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SEARCH_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn build_search_index<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
 ) -> Result<(Index, SearchFields)> {
+    #[cfg(test)]
+    SEARCH_INDEX_BUILDS.with(|c| c.set(c.get() + 1));
     let mut schema_builder = Schema::builder();
     let ko_text = TextOptions::default()
         .set_indexing_options(
@@ -1912,9 +1973,7 @@ fn load_vector_corpus_cache(
             return Ok(None);
         }
     }
-    Ok(Some(VectorCorpus {
-        entries: cache.entries,
-    }))
+    Ok(Some(VectorCorpus::new(cache.entries)))
 }
 
 fn write_vector_corpus_cache(
@@ -1956,7 +2015,7 @@ fn compute_vector_corpus(
             embedding,
         });
     }
-    Ok(VectorCorpus { entries })
+    Ok(VectorCorpus::new(entries))
 }
 
 fn vector_source_entries<'a>(
@@ -1992,6 +2051,33 @@ fn vector_source_entries<'a>(
     entries
 }
 
+fn squared_norm(v: &[f32]) -> f32 {
+    let mut norm = 0.0_f32;
+    for x in v {
+        norm += x * x;
+    }
+    norm
+}
+
+/// Same arithmetic as the legacy `cosine_similarity`, with the corpus-side
+/// `sqrt(norm)` supplied by the caller.
+fn cosine_similarity_with_norm(left: &[f32], right: &[f32], right_norm_sqrt: f32) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_norm += l * l;
+    }
+    if left_norm == 0.0 || right_norm_sqrt == 0.0 {
+        return None;
+    }
+    Some(dot / (left_norm.sqrt() * right_norm_sqrt))
+}
+
+#[cfg(test)]
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
     if left.len() != right.len() || left.is_empty() {
         return None;
@@ -2763,6 +2849,7 @@ refs:
             .collect();
         (index.index, index.fields) =
             build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        index.reader = SearchReader(index.index.reader().unwrap());
         index
     }
 
@@ -3145,6 +3232,195 @@ refs:
                 .map(|hit| hit.article_id)
                 .collect::<Vec<_>>();
             assert_eq!(left_ids, right_ids, "query: {query}");
+        }
+    }
+
+    /// Writes a synthetic pack (articles + annex + manifest) and returns its root.
+    fn write_synthetic_pack(root: &Path) {
+        let articles_dir = root.join("articles");
+        let annexes_dir = root.join("annexes");
+        fs::create_dir_all(&articles_dir).unwrap();
+        fs::create_dir_all(&annexes_dir).unwrap();
+        let mut files = BTreeMap::new();
+        for (rule, no, title, body) in [
+            (
+                "시험규칙",
+                "제1조",
+                "목적",
+                "① 이 규칙은 시험 운영에 필요한 사항을 정한다.",
+            ),
+            (
+                "시험규칙",
+                "제2조",
+                "수당",
+                "① 시험 위원에게 수당을 지급한다. 별표 1을 따른다.",
+            ),
+            (
+                "가상법",
+                "제3조",
+                "위임",
+                "① 시험 수당의 기준은 시험규칙으로 정한다.",
+            ),
+            (
+                "가상법",
+                "제4조",
+                "보고",
+                "① 시험 결과는 매년 보고한다. 시험규칙 제2조를 준용한다.",
+            ),
+        ] {
+            let name = format!("{rule}_{no}.md");
+            fs::write(articles_dir.join(&name), article_md(rule, no, title, body)).unwrap();
+            files.insert(
+                format!("articles/{name}"),
+                sha256_file(&articles_dir.join(&name)).unwrap(),
+            );
+        }
+        let annex = "---\ntype: annex\ninstitution: cni\nrule: 시험규칙\nannex: 별표1\ntitle: 시험 수당 기준\neffective: 2026-02-27\nstatus: active\ntable_structured: false\n---\n시험 위원 수당 기준표\n";
+        fs::write(annexes_dir.join("시험규칙_별표1.md"), annex).unwrap();
+        files.insert(
+            "annexes/시험규칙_별표1.md".to_string(),
+            sha256_file(&annexes_dir.join("시험규칙_별표1.md")).unwrap(),
+        );
+        let manifest = PackManifest {
+            schema_version: 1,
+            institution: "cni".to_string(),
+            effective_date: "2026-02-27".to_string(),
+            source_commit: "abc123".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
+            files,
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Test-only reproduction of the pre-PH-04 loader: build once from articles,
+    /// then rebuild the index with annexes.
+    fn legacy_build(root: &Path) -> TantivyRulesIndex {
+        let mut manifest: PackManifest =
+            serde_json::from_reader(File::open(root.join("manifest.json")).unwrap()).unwrap();
+        manifest.normalize_hashes();
+        let articles = load_articles_dir(root.join("articles")).unwrap();
+        let annexes = load_annexes_dir(root.join("annexes")).unwrap();
+        let pages = load_pages_dir(root.join("pages")).unwrap();
+        let nodes = load_jsonl::<GraphNode>(&root.join("graph/nodes.jsonl")).unwrap();
+        let edges = load_jsonl::<GraphEdge>(&root.join("graph/edges.jsonl")).unwrap();
+        let status = default_pack_status("cni", "2026-02-27");
+        let mut index = TantivyRulesIndex::from_articles(articles, status).unwrap();
+        index.annexes = annexes.into_iter().map(|a| (a.id.clone(), a)).collect();
+        index.page_owners = build_page_owners(index.articles.values(), index.annexes.values());
+        index.pages = pages;
+        (index.index, index.fields) =
+            build_search_index(index.articles.values(), index.annexes.values()).unwrap();
+        index.reader = SearchReader(index.index.reader().unwrap());
+        let (graph, node_indices) = build_ref_graph(index.articles.values(), &nodes, &edges);
+        index.graph = graph;
+        index.node_indices = node_indices;
+        index
+    }
+
+    #[test]
+    fn pack_dir_load_builds_search_index_once() {
+        let temp = tempfile::tempdir().unwrap();
+        write_synthetic_pack(temp.path());
+        SEARCH_INDEX_BUILDS.with(|c| c.set(0));
+        let index = TantivyRulesIndex::from_pack_dir(temp.path()).unwrap();
+        assert_eq!(SEARCH_INDEX_BUILDS.with(|c| c.get()), 1);
+        assert!(!index.annexes.is_empty());
+    }
+
+    #[test]
+    fn reader_is_reused_across_queries() {
+        let index = TantivyRulesIndex::from_articles(
+            fixture_articles(),
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let before = index.reader.0.searcher().generation().generation_id();
+        for q in ["교통비", "연차휴가", "숙박비"] {
+            let _ = index.search(q, 5, None);
+            assert_eq!(
+                index.reader.0.searcher().generation().generation_id(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_norm_cosine_is_bit_identical() {
+        // Deterministic LCG so the test needs no rand dependency.
+        let mut state: u64 = 0x2026_0929;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        for _ in 0..1000 {
+            let left: Vec<f32> = (0..384).map(|_| next()).collect();
+            let right: Vec<f32> = (0..384).map(|_| next()).collect();
+            let norm = squared_norm(&right).sqrt();
+            let legacy = cosine_similarity(&left, &right).unwrap();
+            let fast = cosine_similarity_with_norm(&left, &right, norm).unwrap();
+            assert_eq!(legacy.to_bits(), fast.to_bits());
+        }
+        assert_eq!(cosine_similarity_with_norm(&[1.0], &[0.0], 0.0), None);
+        assert_eq!(cosine_similarity_with_norm(&[1.0], &[1.0, 2.0], 1.0), None);
+    }
+
+    #[test]
+    fn pack_dir_search_orders_identical_to_legacy_builder() {
+        let temp = tempfile::tempdir().unwrap();
+        write_synthetic_pack(temp.path());
+        let new = TantivyRulesIndex::from_pack_dir(temp.path()).unwrap();
+        let old = legacy_build(temp.path());
+        let words = [
+            "시험",
+            "수당",
+            "보고",
+            "위원",
+            "규칙",
+            "별표 1",
+            "시험규칙 제2조",
+            "가상법",
+            "목적",
+            "위임",
+            "기준표",
+            "준용",
+            "지급",
+            "운영",
+            "결과",
+            "매년",
+            "제3조",
+            "시험규칙 별표 1",
+            "수당 기준",
+            "시험 위원",
+            "보고 결과",
+            "정한다",
+            "따른다",
+            "시험 운영",
+            "위임 기준",
+            "가상법 제4조",
+            "수당 지급",
+            "없는단어",
+            "표",
+            "사항",
+        ];
+        assert_eq!(words.len(), 30);
+        for q in words {
+            let a = new.search_with_routes(q, 20, None);
+            let b = old.search_with_routes(q, 20, None);
+            let key = |r: &SearchRouteReport| {
+                r.hits
+                    .iter()
+                    .map(|h| (h.article_id.clone(), h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(key(&a), key(&b), "query: {q}");
         }
     }
 }
