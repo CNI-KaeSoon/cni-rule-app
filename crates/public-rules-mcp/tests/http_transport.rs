@@ -692,6 +692,45 @@ async fn tools_list_matches_snapshot() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn tools_list_snapshot_updated_for_variants() -> anyhow::Result<()> {
+    let (client, server_handle) = snapshot_client().await?;
+    let tools = client.list_all_tools().await?;
+    let search = tools
+        .iter()
+        .find(|tool| tool.name == "search_rules")
+        .expect("search_rules is listed");
+    let input = serde_json::to_value(&search.input_schema)?;
+    let variants = &input["properties"]["query_variants"];
+    assert!(variants.is_object(), "query_variants missing: {input}");
+    assert!(
+        !input["required"]
+            .as_array()
+            .map(|items| items.iter().any(|item| item == "query_variants"))
+            .unwrap_or(false),
+        "query_variants must stay optional"
+    );
+    let output = serde_json::to_value(search.output_schema.as_deref())?;
+    assert!(output["properties"]["variants_dropped"].is_object());
+    assert!(
+        !output["required"]
+            .as_array()
+            .map(|items| items.iter().any(|item| item == "variants_dropped"))
+            .unwrap_or(false),
+        "variants_dropped must stay optional"
+    );
+    // The committed snapshot carries the same additive fields.
+    let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/tools_list.json"),
+    )?)?;
+    let text = snapshot.to_string();
+    assert!(text.contains("query_variants") && text.contains("variants_dropped"));
+    client.cancel().await?;
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn prompts_list_matches_snapshot() -> anyhow::Result<()> {
     let (client, server_handle) = snapshot_client().await?;
     let mut prompts = client.list_all_prompts().await?;

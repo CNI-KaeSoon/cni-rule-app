@@ -1083,7 +1083,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "로드된 기관 규정 팩에서 질의어와 관련된 조문·별표를 검색한다. 규정 질문의 첫 단계로 쓰고, 결과의 article_id로 get_article(조문) 또는 get_annex(별표)를 호출해 전문을 확인한 뒤 답하라. citations에 각 결과의 인용 정보(기관·규정·조·페이지·팩 기준일·소스 커밋)가 들어 있으니 답변에 그대로 인용하라. 검색 결과가 없다는 것은 규정이 없다는 뜻이 아니다. 질의어를 바꿔 다시 검색하고, 그래도 없으면 없다고 단정하지 말고 확인하지 못했다고 답하라. effective는 팩 기준일이며 조문의 개정·적용 시점이 아니다. 기관을 지정하려면 institution, 규정을 좁히려면 rule을 쓴다. 여러 기관을 나란히 비교할 때는 compare_rules를 쓴다.",
+    "description": "로드된 기관 규정 팩에서 질의어와 관련된 조문·별표를 검색한다. 규정 질문의 첫 단계로 쓰고, 결과의 article_id로 get_article(조문) 또는 get_annex(별표)를 호출해 전문을 확인한 뒤 답하라. citations에 각 결과의 인용 정보(기관·규정·조·페이지·팩 기준일·소스 커밋)가 들어 있으니 답변에 그대로 인용하라. 검색 결과가 없다는 것은 규정이 없다는 뜻이 아니다. 질의어를 바꿔 다시 검색하고, 그래도 없으면 없다고 단정하지 말고 확인하지 못했다고 답하라. effective는 팩 기준일이며 조문의 개정·적용 시점이 아니다. 기관을 지정하려면 institution, 규정을 좁히려면 rule을 쓴다. 여러 기관을 나란히 비교할 때는 compare_rules를 쓴다. 다른 표현으로도 찾고 싶으면 query_variants에 동의어·바꿔 쓴 질의를 최대 3개까지 넘길 수 있다(서버는 변형을 만들지 않고 합성만 하며, 기관이 많으면 뒤쪽 변형이 버려지고 variants_dropped로 알려 준다).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1096,6 +1096,17 @@
         },
         "query": {
           "type": "string"
+        },
+        "query_variants": {
+          "default": null,
+          "description": "클라이언트가 만든 질의 변형(동의어·다른 표현) 최대 3개. 서버는 변형을\n만들지 않고, 원 질의 결과와 합성만 한다. 기관 수가 많으면 뒤쪽 변형이\n버려지고 variants_dropped에 개수가 표시된다.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "rule": {
           "default": null,
@@ -1263,6 +1274,12 @@
         },
         "meta": {
           "$ref": "#/$defs/FreshnessMeta"
+        },
+        "variants_dropped": {
+          "description": "작업 수 상한 때문에 실행하지 않고 버린 질의 변형 수. 0이면 생략된다.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [

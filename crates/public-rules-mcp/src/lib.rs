@@ -51,6 +51,10 @@ pub const GET_ANNEX_TOOL: &str = "get_annex";
 pub const GET_SOURCE_PAGE_TOOL: &str = "get_source_page";
 pub const DEFAULT_HTTP_BIND_ADDR: &str = "127.0.0.1:8787";
 const SEARCH_FANOUT_LIMIT: usize = 4;
+/// Upper bound of `(1 + variants) x packs` search jobs per `search_rules` call.
+const MAX_SEARCH_JOBS: usize = 8;
+/// Hard ceiling of `search.query_variants_max` and of variants per request.
+const DEFAULT_QUERY_VARIANTS_MAX: usize = 3;
 const DEFAULT_COMPARE_TOP_K: usize = 3;
 const MAX_COMPARE_INSTITUTIONS: usize = 12;
 const MAX_QUERY_VARIANTS: usize = 5;
@@ -129,7 +133,7 @@ pub struct ServerConfig {
 
 /// `[search]` section of the server config (PRD 2.3). Absent keys mean the
 /// legacy behaviour.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct SearchConfig {
     #[serde(default)]
     pub e5_prefix: bool,
@@ -147,6 +151,43 @@ pub struct SearchConfig {
     /// `"global"`; other values fail config loading.
     #[serde(default)]
     pub multipack_fusion: MultipackFusion,
+    /// Most `query_variants` one `search_rules` call may carry, `0..=3`
+    /// (default 3); larger values fail config loading.
+    #[serde(
+        default = "default_query_variants_max",
+        deserialize_with = "deserialize_query_variants_max"
+    )]
+    pub query_variants_max: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            e5_prefix: false,
+            ko_pos_filter: KoPosFilter::default(),
+            context_prefix: ContextPrefix::default(),
+            bigram_weight: 0.0,
+            multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
+        }
+    }
+}
+
+fn default_query_variants_max() -> usize {
+    DEFAULT_QUERY_VARIANTS_MAX
+}
+
+fn deserialize_query_variants_max<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value > DEFAULT_QUERY_VARIANTS_MAX {
+        return Err(serde::de::Error::custom(format!(
+            "search.query_variants_max는 0..={DEFAULT_QUERY_VARIANTS_MAX} 범위여야 합니다: {value}"
+        )));
+    }
+    Ok(value)
 }
 
 fn deserialize_bigram_weight<'de, D>(deserializer: D) -> Result<f32, D::Error>
@@ -218,6 +259,11 @@ pub struct SearchRulesParams {
     pub rule: Option<String>,
     #[serde(default)]
     pub institution: Option<String>,
+    /// 클라이언트가 만든 질의 변형(동의어·다른 표현) 최대 3개. 서버는 변형을
+    /// 만들지 않고, 원 질의 결과와 합성만 한다. 기관 수가 많으면 뒤쪽 변형이
+    /// 버려지고 variants_dropped에 개수가 표시된다.
+    #[serde(default)]
+    pub query_variants: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -229,6 +275,13 @@ pub struct SearchRulesResult {
     /// article_id별 인용 정보. 답변에서 출처를 밝힐 때 그대로 쓴다.
     #[serde(default)]
     pub citations: BTreeMap<String, Citation>,
+    /// 작업 수 상한 때문에 실행하지 않고 버린 질의 변형 수. 0이면 생략된다.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub variants_dropped: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 /// 검색 결과 하나의 인용 묶음. 값은 모두 팩에서 읽은 것이다.
@@ -512,6 +565,7 @@ pub struct PublicRulesServer {
     prompt_router: PromptRouter<Self>,
     search_semaphore: Arc<Semaphore>,
     multipack_fusion: MultipackFusion,
+    query_variants_max: usize,
     query_logger: Option<QueryLogger>,
 }
 
@@ -537,6 +591,7 @@ impl PublicRulesServer {
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
         }
     }
@@ -553,6 +608,7 @@ impl PublicRulesServer {
         let vector_options = config.vectors.to_search_options();
         let search_options = config.search.to_search_options();
         let multipack_fusion = config.search.multipack_fusion;
+        let query_variants_max = config.search.query_variants_max;
         let default_pack_path = config.pack.path.clone();
         let default_index = load_pack(
             default_institution.clone(),
@@ -602,6 +658,7 @@ impl PublicRulesServer {
             prompt_router: Self::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             multipack_fusion,
+            query_variants_max,
             query_logger: None,
         })
     }
@@ -1197,6 +1254,108 @@ async fn search_rules_pack_reports(
     reports
 }
 
+/// Trim + NFC; drops empty strings, copies of the original query and
+/// duplicates while keeping the client's order.
+fn normalize_search_variants(query: &str, variants: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = BTreeSet::from([query.trim().nfc().collect::<String>()]);
+    let mut normalized = Vec::new();
+    for variant in variants.unwrap_or_default() {
+        let variant = variant.trim().nfc().collect::<String>();
+        if !variant.is_empty() && seen.insert(variant.clone()) {
+            normalized.push(variant);
+        }
+    }
+    normalized
+}
+
+/// Fan-out cap (D-6): `(1 + variants) x packs <= MAX_SEARCH_JOBS`. Trailing
+/// variants are the ones dropped.
+fn allowed_variant_count(pack_count: usize, requested: usize) -> usize {
+    if pack_count == 0 {
+        return 0;
+    }
+    (MAX_SEARCH_JOBS / pack_count)
+        .saturating_sub(1)
+        .min(requested)
+}
+
+/// Fuses one pack's original-query report with its variant reports. Only the
+/// original query's pin is used; variant pins are ignored.
+fn fuse_variant_reports(
+    reports: Vec<Option<SearchRouteReport>>,
+    limit: usize,
+) -> Option<SearchRouteReport> {
+    if reports.iter().all(Option::is_none) {
+        return None;
+    }
+    let pin_hit = reports
+        .first()
+        .and_then(|report| report.as_ref())
+        .and_then(|report| report.pin_hit.clone());
+    let lists = reports
+        .into_iter()
+        .flatten()
+        .map(|report| report.retrieval_hits)
+        .collect::<Vec<_>>();
+    let weights = vec![1.0_f32; lists.len()];
+    let retrieval_hits =
+        rules_core::rrf_fuse_weighted(lists, limit, rules_core::DEFAULT_RRF_K, &weights);
+    let mut hits = Vec::with_capacity(retrieval_hits.len() + 1);
+    if let Some(pin) = &pin_hit {
+        hits.push(pin.clone());
+    }
+    hits.extend(
+        retrieval_hits
+            .iter()
+            .filter(|hit| {
+                pin_hit
+                    .as_ref()
+                    .is_none_or(|pin| pin.article_id != hit.article_id)
+            })
+            .cloned(),
+    );
+    hits.truncate(limit);
+    Some(SearchRouteReport {
+        hits,
+        pin_hit,
+        retrieval_hits,
+    })
+}
+
+/// Per-pack reports of the original query and its (already capped) variants,
+/// fused per pack. Every job goes through `search_pack_reports_blocking`, so
+/// the shared search semaphore bounds the concurrency.
+async fn search_rules_pack_reports_with_variants(
+    packs: Vec<LoadedPack>,
+    query: &str,
+    variants: &[String],
+    limit: usize,
+    rule: Option<String>,
+    multi_pack: bool,
+    semaphore: Arc<Semaphore>,
+) -> Vec<DetailedRouteReport> {
+    let group = 1 + variants.len();
+    let mut jobs = Vec::with_capacity(packs.len() * group);
+    for pack in packs {
+        jobs.push((pack.clone(), query.to_string()));
+        for variant in variants {
+            jobs.push((pack.clone(), variant.clone()));
+        }
+    }
+    let results = search_pack_reports_blocking(jobs, limit, rule, multi_pack, semaphore).await;
+    results
+        .chunks(group)
+        .filter_map(|chunk| {
+            let reports = chunk
+                .iter()
+                .map(|result| result.result.as_ref().ok().cloned())
+                .collect::<Vec<_>>();
+            fuse_variant_reports(reports, limit)
+        })
+        .map(DetailedRouteReport::from_report)
+        .collect()
+}
+
 #[derive(Debug)]
 struct PackSearchResult {
     institution: String,
@@ -1744,7 +1903,7 @@ impl PublicRulesServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "로드된 기관 규정 팩에서 질의어와 관련된 조문·별표를 검색한다. 규정 질문의 첫 단계로 쓰고, 결과의 article_id로 get_article(조문) 또는 get_annex(별표)를 호출해 전문을 확인한 뒤 답하라. citations에 각 결과의 인용 정보(기관·규정·조·페이지·팩 기준일·소스 커밋)가 들어 있으니 답변에 그대로 인용하라. 검색 결과가 없다는 것은 규정이 없다는 뜻이 아니다. 질의어를 바꿔 다시 검색하고, 그래도 없으면 없다고 단정하지 말고 확인하지 못했다고 답하라. effective는 팩 기준일이며 조문의 개정·적용 시점이 아니다. 기관을 지정하려면 institution, 규정을 좁히려면 rule을 쓴다. 여러 기관을 나란히 비교할 때는 compare_rules를 쓴다."
+        description = "로드된 기관 규정 팩에서 질의어와 관련된 조문·별표를 검색한다. 규정 질문의 첫 단계로 쓰고, 결과의 article_id로 get_article(조문) 또는 get_annex(별표)를 호출해 전문을 확인한 뒤 답하라. citations에 각 결과의 인용 정보(기관·규정·조·페이지·팩 기준일·소스 커밋)가 들어 있으니 답변에 그대로 인용하라. 검색 결과가 없다는 것은 규정이 없다는 뜻이 아니다. 질의어를 바꿔 다시 검색하고, 그래도 없으면 없다고 단정하지 말고 확인하지 못했다고 답하라. effective는 팩 기준일이며 조문의 개정·적용 시점이 아니다. 기관을 지정하려면 institution, 규정을 좁히려면 rule을 쓴다. 여러 기관을 나란히 비교할 때는 compare_rules를 쓴다. 다른 표현으로도 찾고 싶으면 query_variants에 동의어·바꿔 쓴 질의를 최대 3개까지 넘길 수 있다(서버는 변형을 만들지 않고 합성만 하며, 기관이 많으면 뒤쪽 변형이 버려지고 variants_dropped로 알려 준다)."
     )]
     pub async fn search_rules(
         &self,
@@ -1759,21 +1918,44 @@ impl PublicRulesServer {
         let rule = params.rule.clone();
         let institution = params.institution.clone();
         let limit = top_k.unwrap_or(5);
+        let mut variants = normalize_search_variants(&query, params.query_variants.clone());
+        let variants_max = self.query_variants_max.min(DEFAULT_QUERY_VARIANTS_MAX);
+        if variants.len() > variants_max {
+            return Err(format!(
+                "query_variants는 최대 {variants_max}개까지 지정할 수 있습니다"
+            ));
+        }
         let selected_packs = self
             .selected_packs_for_query(institution.as_deref(), &query)
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let reports = search_rules_pack_reports(
-            selected_packs,
-            &query,
-            limit,
-            rule.clone(),
-            self.multi_pack,
-            self.multipack_fusion,
-            self.search_semaphore.clone(),
-        )
-        .await;
+        let allowed = allowed_variant_count(selected_packs.len(), variants.len());
+        let variants_dropped = variants.len() - allowed;
+        variants.truncate(allowed);
+        let reports = if variants.is_empty() {
+            search_rules_pack_reports(
+                selected_packs,
+                &query,
+                limit,
+                rule.clone(),
+                self.multi_pack,
+                self.multipack_fusion,
+                self.search_semaphore.clone(),
+            )
+            .await
+        } else {
+            search_rules_pack_reports_with_variants(
+                selected_packs,
+                &query,
+                &variants,
+                limit,
+                rule.clone(),
+                self.multi_pack,
+                self.search_semaphore.clone(),
+            )
+            .await
+        };
         let hits =
             rules_core::merge_search_route_reports_with(reports, limit, self.multipack_fusion).hits;
         let hit_meta = if self.multi_pack {
@@ -1781,17 +1963,22 @@ impl PublicRulesServer {
         } else {
             BTreeMap::new()
         };
+        let mut logged_params = serde_json::json!({
+            "query": query.clone(),
+            "top_k": top_k,
+            "rule": rule,
+            "institution": institution,
+        });
+        if !variants.is_empty() || variants_dropped > 0 {
+            // Only the number of variants is logged, never their text.
+            logged_params["query_variants"] = serde_json::json!(variants.len());
+        }
         self.log_query(
             started_at,
             serde_json::json!({
                 "tool": SEARCH_RULES_TOOL,
                 "query": query.clone(),
-                "params": {
-                    "query": query.clone(),
-                    "top_k": top_k,
-                    "rule": rule,
-                    "institution": institution,
-                },
+                "params": logged_params,
                 "result": {
                     "article_ids": hits.iter().map(|hit| hit.article_id.as_str()).collect::<Vec<_>>(),
                     "hit_count": hits.len(),
@@ -1804,6 +1991,7 @@ impl PublicRulesServer {
             meta: self.status_meta(None),
             hit_meta,
             citations,
+            variants_dropped,
         }))
     }
 
@@ -2919,6 +3107,7 @@ refs: []
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
         }
     }
@@ -3054,6 +3243,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3073,6 +3263,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3098,6 +3289,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: Some("ctp".to_string()),
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3116,6 +3308,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3128,6 +3321,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3195,6 +3389,7 @@ table_structured: true
                 top_k: Some(5),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3266,6 +3461,7 @@ table_structured: true
                 top_k: Some(10),
                 rule: None,
                 institution: None,
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -3528,6 +3724,7 @@ table_structured: true
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             query_logger: None,
             multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
         };
         let cni_result = legal_links_of(&server, "cni/시험규칙#제1조").await;
         assert_eq!(cni_result.links[0].resolution, "local_bundled");
@@ -3689,6 +3886,7 @@ table_structured: true
             prompt_router: PublicRulesServer::prompt_router(),
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
         }
     }
@@ -4593,6 +4791,7 @@ refs: []
                 top_k: Some(5),
                 rule: None,
                 institution: institution.map(ToString::to_string),
+                query_variants: None,
             }))
             .await
             .unwrap();
@@ -4730,6 +4929,7 @@ refs: []
                     top_k: None,
                     rule: None,
                     institution: None,
+                    query_variants: None,
                 }))
                 .await;
             match outcome {
@@ -4871,5 +5071,392 @@ refs: []
         for fusion in [MultipackFusion::Score, MultipackFusion::Global] {
             assert_eq!(base, compare(fusion).await, "{fusion:?}");
         }
+    }
+    // ---- PH-13 query_variants ------------------------------------------------
+
+    /// `count` synthetic packs, each with one article per marker word.
+    fn variant_fixture_server(count: usize) -> PublicRulesServer {
+        let slugs = ["pa", "pb", "pc", "pd", "pe"];
+        let mut packs = Vec::new();
+        for slug in slugs.iter().take(count) {
+            let articles = [
+                ("제1조", "zzorig", "① zzorig 관련 내용이다."),
+                ("제2조", "zzalpha", "① zzalpha 관련 내용이다."),
+                ("제3조", "zzbeta", "① zzbeta 관련 내용이다."),
+                ("제5조", "무관항목", "① 관계없는 내용이다."),
+            ]
+            .into_iter()
+            .map(|(article, title, body)| {
+                fixture_article(slug, "시험규칙", article, title, "2026-02-27", body)
+            })
+            .collect::<Vec<_>>();
+            let index = TantivyRulesIndex::from_articles(
+                articles,
+                default_pack_status(*slug, "2026-02-27"),
+            )
+            .unwrap();
+            packs.push(LoadedPack {
+                institution: slug.to_string(),
+                aliases: vec![slug.to_string()],
+                index: Arc::new(index),
+            });
+        }
+        PublicRulesServer {
+            multi_pack: packs.len() > 1,
+            default_institution: slugs[0].to_string(),
+            packs: Arc::new(packs),
+            tool_router: PublicRulesServer::tool_router(),
+            prompt_router: PublicRulesServer::prompt_router(),
+            search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            multipack_fusion: MultipackFusion::default(),
+            query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
+            query_logger: None,
+        }
+    }
+
+    async fn search_with_variants(
+        server: &PublicRulesServer,
+        query: &str,
+        variants: Option<Vec<&str>>,
+    ) -> Result<SearchRulesResult, String> {
+        server
+            .search_rules(Parameters(SearchRulesParams {
+                query: query.to_string(),
+                top_k: Some(10),
+                rule: None,
+                institution: None,
+                query_variants: variants
+                    .map(|items| items.into_iter().map(ToString::to_string).collect()),
+            }))
+            .await
+            .map(|Json(result)| result)
+    }
+
+    fn hit_titles(result: &SearchRulesResult) -> Vec<String> {
+        result.hits.iter().map(|hit| hit.title.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn no_variants_is_bit_identical() {
+        for count in [1, 4] {
+            let server = variant_fixture_server(count);
+            let base = search_with_variants(&server, "zzorig", None).await.unwrap();
+            assert!(!base.hits.is_empty());
+            // Absent, empty, blank, duplicate-of-original variants are all "no variants".
+            for variants in [
+                Some(vec![]),
+                Some(vec!["", "  "]),
+                Some(vec!["zzorig", " zzorig "]),
+            ] {
+                let other = search_with_variants(&server, "zzorig", variants)
+                    .await
+                    .unwrap();
+                assert_eq!(base, other);
+                assert_eq!(
+                    serde_json::to_string(&base).unwrap(),
+                    serde_json::to_string(&other).unwrap()
+                );
+            }
+            assert!(serde_json::to_value(&base)
+                .unwrap()
+                .get("variants_dropped")
+                .is_none());
+        }
+        // Multi-pack result equals the direct rrf merge of the per-pack reports.
+        let server = variant_fixture_server(4);
+        let expected = rules_core::merge_search_route_reports(
+            server
+                .packs
+                .iter()
+                .map(|pack| search_pack_report(pack, "zzorig", 10, None, true))
+                .collect(),
+            10,
+        )
+        .hits;
+        let actual = search_with_variants(&server, "zzorig", None).await.unwrap();
+        assert_eq!(actual.hits, expected);
+    }
+
+    #[tokio::test]
+    async fn variants_are_normalized_and_deduplicated() {
+        let nfd = "한글".nfd().collect::<String>();
+        let nfc = "한글".to_string();
+        assert_ne!(nfd, nfc);
+        let normalized = normalize_search_variants(
+            " zzorig ",
+            Some(vec![
+                "  zzalpha ".to_string(),
+                "zzalpha".to_string(),
+                String::new(),
+                "   ".to_string(),
+                "zzorig".to_string(),
+                "\tzzorig\n".to_string(),
+                "zzbeta".to_string(),
+                nfd,
+                nfc.clone(),
+            ]),
+        );
+        assert_eq!(normalized, vec!["zzalpha", "zzbeta", nfc.as_str()]);
+
+        // Noise that normalizes away does not count against the per-call maximum.
+        let mut server = variant_fixture_server(1);
+        server.query_variants_max = 1;
+        let result = search_with_variants(
+            &server,
+            "zzorig",
+            Some(vec!["", "zzalpha", " zzalpha", "zzorig"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.variants_dropped, 0);
+        assert!(hit_titles(&result).contains(&"zzalpha".to_string()));
+    }
+
+    #[tokio::test]
+    async fn too_many_variants_is_tool_error() {
+        let server = variant_fixture_server(1);
+        let error = search_with_variants(
+            &server,
+            "zzorig",
+            Some(vec!["zzalpha", "zzbeta", "zzc", "zzd"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("query_variants는 최대 3개"), "{error}");
+        // Exactly the maximum is fine.
+        assert!(
+            search_with_variants(&server, "zzorig", Some(vec!["zzalpha", "zzbeta", "zzc"]))
+                .await
+                .is_ok()
+        );
+
+        let mut limited = variant_fixture_server(1);
+        limited.query_variants_max = 1;
+        let error = search_with_variants(&limited, "zzorig", Some(vec!["zzalpha", "zzbeta"]))
+            .await
+            .unwrap_err();
+        assert!(error.contains("query_variants는 최대 1개"), "{error}");
+        limited.query_variants_max = 0;
+        let error = search_with_variants(&limited, "zzorig", Some(vec!["zzalpha"]))
+            .await
+            .unwrap_err();
+        assert!(error.contains("query_variants는 최대 0개"), "{error}");
+
+        // Config: default 3, 0..=3 accepted, above 3 rejected while loading.
+        let default: ServerConfig = toml::from_str("institution = \"cni\"\n").unwrap();
+        assert_eq!(default.search.query_variants_max, 3);
+        assert_eq!(SearchConfig::default().query_variants_max, 3);
+        for value in 0..=3 {
+            let config: ServerConfig = toml::from_str(&format!(
+                "institution = \"cni\"\n\n[search]\nquery_variants_max = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.search.query_variants_max, value);
+        }
+        let error = toml::from_str::<ServerConfig>(
+            "institution = \"cni\"\n\n[search]\nquery_variants_max = 4\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("0..=3"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fanout_cap_drops_trailing_variants_and_reports_count() {
+        // Pure cap: (1 + variants) x packs <= 8.
+        for (packs, requested, allowed) in [
+            (1, 3, 3),
+            (2, 3, 3),
+            (3, 3, 1),
+            (4, 3, 1),
+            (4, 1, 1),
+            (5, 3, 0),
+            (9, 3, 0),
+            (0, 3, 0),
+        ] {
+            assert_eq!(
+                allowed_variant_count(packs, requested),
+                allowed,
+                "packs={packs} requested={requested}"
+            );
+            if packs > 0 && packs <= MAX_SEARCH_JOBS {
+                assert!((1 + allowed) * packs <= MAX_SEARCH_JOBS);
+            }
+        }
+
+        // 4 packs: 2 variants requested -> only the first runs, 1 is dropped.
+        let server = variant_fixture_server(4);
+        let result = search_with_variants(&server, "zzorig", Some(vec!["zzalpha", "zzbeta"]))
+            .await
+            .unwrap();
+        assert_eq!(result.variants_dropped, 1);
+        let titles = hit_titles(&result);
+        assert!(titles.contains(&"zzorig".to_string()));
+        assert!(titles.contains(&"zzalpha".to_string()), "{titles:?}");
+        assert!(!titles.contains(&"zzbeta".to_string()), "{titles:?}");
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["variants_dropped"], 1);
+
+        // One variant on 4 packs fits: nothing dropped, field omitted.
+        let result = search_with_variants(&server, "zzorig", Some(vec!["zzalpha"]))
+            .await
+            .unwrap();
+        assert_eq!(result.variants_dropped, 0);
+        assert!(serde_json::to_value(&result)
+            .unwrap()
+            .get("variants_dropped")
+            .is_none());
+
+        // Single pack keeps all three variants.
+        let single = variant_fixture_server(1);
+        let result = search_with_variants(
+            &single,
+            "zzorig",
+            Some(vec!["zzalpha", "zzbeta", "무관항목"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.variants_dropped, 0);
+        let titles = hit_titles(&result);
+        assert!(titles.contains(&"zzalpha".to_string()));
+        assert!(titles.contains(&"zzbeta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn variant_pins_are_ignored() {
+        let server = variant_fixture_server(1);
+        // Sanity: this query pins the direct article reference.
+        let pinned = search_with_variants(&server, "시험규칙 제5조", None)
+            .await
+            .unwrap();
+        assert_eq!(pinned.hits[0].title, "무관항목");
+
+        let base = search_with_variants(&server, "zzorig", None).await.unwrap();
+        assert_eq!(base.hits[0].title, "zzorig");
+        let with_variant = search_with_variants(&server, "zzorig", Some(vec!["시험규칙 제5조"]))
+            .await
+            .unwrap();
+        assert_eq!(with_variant.hits[0].title, "zzorig");
+        assert_eq!(with_variant.hits[0].article_id, base.hits[0].article_id);
+
+        // Original query pins are kept, variants cannot displace them.
+        let original_pin = search_with_variants(&server, "시험규칙 제5조", Some(vec!["zzalpha"]))
+            .await
+            .unwrap();
+        assert_eq!(original_pin.hits[0].title, "무관항목");
+        assert!(hit_titles(&original_pin).contains(&"zzalpha".to_string()));
+
+        // Pure fusion: only the original report's pin survives.
+        let hit = |id: &str, score: f32| SearchHit {
+            article_id: id.to_string(),
+            institution: "x".to_string(),
+            score,
+            snippet: String::new(),
+            rule: "r".to_string(),
+            title: id.to_string(),
+            effective: "2026-01-01".to_string(),
+            kind: "article".to_string(),
+        };
+        let original = SearchRouteReport {
+            hits: vec![hit("a", 0.5)],
+            pin_hit: None,
+            retrieval_hits: vec![hit("a", 0.5)],
+        };
+        let variant = SearchRouteReport {
+            hits: vec![hit("p", f32::MAX), hit("b", 0.4)],
+            pin_hit: Some(hit("p", f32::MAX)),
+            retrieval_hits: vec![hit("b", 0.4)],
+        };
+        let fused = fuse_variant_reports(vec![Some(original), Some(variant)], 5).unwrap();
+        assert!(fused.pin_hit.is_none());
+        assert!(fused.hits.iter().all(|h| h.article_id != "p"));
+        assert_eq!(fused.hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn variants_share_search_semaphore() {
+        // All permits held elsewhere: variant jobs must wait for the same semaphore.
+        let mut server = variant_fixture_server(2);
+        server.search_semaphore = Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT));
+        let held = server
+            .search_semaphore
+            .clone()
+            .acquire_many_owned(SEARCH_FANOUT_LIMIT as u32)
+            .await
+            .unwrap();
+        let worker = server.clone();
+        let mut handle = tokio::spawn(async move {
+            search_with_variants(&worker, "zzorig", Some(vec!["zzalpha", "zzbeta"])).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut handle)
+                .await
+                .is_err(),
+            "search finished although every search permit was held"
+        );
+        drop(held);
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.variants_dropped, 0);
+        assert_eq!(
+            server.search_semaphore.available_permits(),
+            SEARCH_FANOUT_LIMIT
+        );
+
+        // Observed concurrency under load never exceeds SEARCH_FANOUT_LIMIT.
+        let server = variant_fixture_server(4);
+        let semaphore = server.search_semaphore.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let done = done.clone();
+            tokio::spawn(async move {
+                let mut max_in_flight = 0;
+                while !done.load(Ordering::Relaxed) {
+                    max_in_flight =
+                        max_in_flight.max(SEARCH_FANOUT_LIMIT - semaphore.available_permits());
+                    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                }
+                max_in_flight
+            })
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let worker = server.clone();
+            handles.push(tokio::spawn(async move {
+                search_with_variants(&worker, "zzorig", Some(vec!["zzalpha"])).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let max_in_flight = sampler.await.unwrap();
+        assert!(max_in_flight <= SEARCH_FANOUT_LIMIT, "{max_in_flight}");
+        assert_eq!(
+            server.search_semaphore.available_permits(),
+            SEARCH_FANOUT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn query_log_records_variant_count_only() {
+        let root = unique_temp_root("variant-log");
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("queries.jsonl");
+        let server = variant_fixture_server(1)
+            .with_query_logger(QueryLogger::new(&log_path).expect("query logger must open"));
+        search_with_variants(&server, "zzorig", Some(vec!["secretvariantone", "zzalpha"]))
+            .await
+            .unwrap();
+        search_with_variants(&server, "zzorig", None).await.unwrap();
+        let text = fs::read_to_string(&log_path).unwrap();
+        assert!(!text.contains("secretvariantone"));
+        assert!(!text.contains("zzalpha"));
+        let events = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["params"]["query_variants"], 2);
+        assert!(events[1]["params"].get("query_variants").is_none());
     }
 }

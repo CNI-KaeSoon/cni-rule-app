@@ -259,6 +259,7 @@ async fn search_once(server: &PublicRulesServer, item: &Item, k: usize) -> PassI
         top_k: Some(k),
         rule: None,
         institution: institution_for(item),
+        query_variants: None,
     };
     let started = Instant::now();
     let Json(result) = server
