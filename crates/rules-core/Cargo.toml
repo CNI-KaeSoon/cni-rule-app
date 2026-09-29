@@ -50,3 +50,7 @@ optional = true
 default = ["korean-tokenizer"]
 korean-tokenizer = ["dep:lindera", "dep:lindera-tantivy"]
 vectors = ["dep:fastembed", "dep:rusqlite", "dep:sqlite-vec"]
+
+[[example]]
+name = "rerank_bench"
+required-features = ["vectors"]
