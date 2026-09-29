@@ -1,6 +1,6 @@
 use public_rules_mcp::{
-    AuthToken, CompareRulesResult, FreshnessMeta, PackConfig, SearchRulesResult, ServerConfig,
-    ServerTransport, TransportArgs, VectorConfig, COMPARE_RULES_TOOL, GET_ANNEX_TOOL,
+    AuthToken, CompareRulesResult, FreshnessMeta, PackConfig, SearchConfig, SearchRulesResult,
+    ServerConfig, ServerTransport, TransportArgs, VectorConfig, COMPARE_RULES_TOOL, GET_ANNEX_TOOL,
     GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LABOR_COMPARE_PROMPT,
     LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
 };
@@ -632,6 +632,7 @@ fn fixture_config(fixture_root: std::path::PathBuf) -> ServerConfig {
         },
         extra_packs: Vec::new(),
         vectors: VectorConfig::default(),
+        search: SearchConfig::default(),
     }
 }
 

@@ -19,7 +19,8 @@ use rmcp::{
 use rules_core::{
     default_pack_status, parse_article_markdown, prefixed_article_id, Annex, Article, GraphNode,
     LegalBasis, NodeKind, PackStatus, RuleFilter, RuleSummary, RulesIndex, SearchHit,
-    SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions, VectorStatus,
+    SearchOptions, SearchRouteReport, SourcePage, TantivyRulesIndex, VectorSearchOptions,
+    VectorStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,24 @@ pub struct ServerConfig {
     pub extra_packs: Vec<ExtraPackConfig>,
     #[serde(default)]
     pub vectors: VectorConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+/// `[search]` section of the server config (PRD 2.3). Absent keys mean the
+/// legacy behaviour.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct SearchConfig {
+    #[serde(default)]
+    pub e5_prefix: bool,
+}
+
+impl SearchConfig {
+    fn to_search_options(&self) -> SearchOptions {
+        SearchOptions {
+            e5_prefix: self.e5_prefix,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -425,11 +444,13 @@ impl PublicRulesServer {
         let mut seen = BTreeMap::new();
         seen.insert(default_institution.clone(), ());
         let vector_options = config.vectors.to_search_options();
+        let search_options = config.search.to_search_options();
         let default_pack_path = config.pack.path.clone();
         let default_index = load_pack(
             default_institution.clone(),
             config.pack,
             vector_options.clone(),
+            search_options,
         )?;
         let mut packs = vec![LoadedPack {
             institution: default_institution.clone(),
@@ -452,6 +473,7 @@ impl PublicRulesServer {
                 extra.institution.clone(),
                 extra.pack,
                 vector_options.clone(),
+                search_options,
             )?;
             packs.push(LoadedPack {
                 institution: extra.institution.clone(),
@@ -705,14 +727,15 @@ fn load_pack(
     institution: String,
     pack: PackConfig,
     vector_options: VectorSearchOptions,
+    search_options: SearchOptions,
 ) -> anyhow::Result<TantivyRulesIndex> {
     let path = pack
         .path
         .ok_or_else(|| anyhow::anyhow!("pack.path is required for M0 local stdio server"))?;
     let index = if path.is_file() {
-        TantivyRulesIndex::from_pack_archive_with_vector_options(path, vector_options)?
+        TantivyRulesIndex::from_pack_archive_with_options(path, vector_options, search_options)?
     } else if path.join("manifest.json").is_file() {
-        TantivyRulesIndex::from_pack_dir_with_vector_options(path, vector_options)?
+        TantivyRulesIndex::from_pack_dir_with_options(path, vector_options, search_options)?
     } else {
         if vector_options.enabled {
             eprintln!("vector search disabled for bare articles dir: pack manifest is required for a stable cache key");
@@ -2725,6 +2748,7 @@ table_structured: true
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
 
@@ -2787,6 +2811,7 @@ table_structured: true
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         };
         config.extra_packs.push(ExtraPackConfig {
             institution: "ctp".to_string(),
@@ -2911,6 +2936,7 @@ table_structured: true
                 model_dir: Some(bogus_model),
                 ..VectorConfig::default()
             },
+            search: SearchConfig::default(),
         })
         .unwrap();
 
@@ -2918,6 +2944,21 @@ table_structured: true
 
         assert!(result.vectors.enabled);
         assert!(!result.vectors.model_ready);
+    }
+
+    #[test]
+    fn server_config_without_search_section_parses_to_defaults() {
+        let config: ServerConfig = toml::from_str(
+            "institution = \"cni\"\n\n[pack]\npath = \"/tmp/none\"\n\n[vectors]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.search, SearchConfig::default());
+        assert!(!config.search.e5_prefix);
+        assert_eq!(config.search.to_search_options(), SearchOptions::default());
+
+        let with_flag: ServerConfig =
+            toml::from_str("institution = \"cni\"\n\n[search]\ne5_prefix = true\n").unwrap();
+        assert!(with_flag.search.e5_prefix);
     }
 
     #[test]
@@ -3223,6 +3264,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let Json(result) = server.status().await;
@@ -3353,6 +3395,7 @@ refs: []
             },
             extra_packs: Vec::new(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let mut params = compare_params("여비지급규칙#별표1");
@@ -3664,6 +3707,7 @@ refs: []
             })
             .collect(),
             vectors: VectorConfig::default(),
+            search: SearchConfig::default(),
         })
         .unwrap();
         let mut params = compare_params(&query);

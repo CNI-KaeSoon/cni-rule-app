@@ -267,6 +267,57 @@ pub struct VectorSearchOptions {
     pub vector_weight: f32,
 }
 
+/// Search-time behaviour flags shared by all packs (PRD 2.3). Every field
+/// defaults to the legacy behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Apply the e5 model-card `passage:` / `query:` prefixes to both sides.
+    pub e5_prefix: bool,
+}
+
+impl SearchOptions {
+    pub fn passage_format(&self) -> PassageFormat {
+        if self.e5_prefix {
+            PassageFormat::E5Prefix
+        } else {
+            PassageFormat::Legacy
+        }
+    }
+}
+
+/// How passage text is rendered before embedding. `Legacy` keeps the original
+/// text and the original cache key bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PassageFormat {
+    #[default]
+    Legacy,
+    E5Prefix,
+}
+
+impl PassageFormat {
+    /// Value stored in the cache key; `None` for legacy so the key is unchanged.
+    fn cache_tag(self) -> Option<&'static str> {
+        match self {
+            PassageFormat::Legacy => None,
+            PassageFormat::E5Prefix => Some("e5p"),
+        }
+    }
+
+    fn passage_text(self, text: String) -> String {
+        match self {
+            PassageFormat::Legacy => text,
+            PassageFormat::E5Prefix => format!("passage: {text}"),
+        }
+    }
+
+    fn query_text(self, q: &str) -> std::borrow::Cow<'_, str> {
+        match self {
+            PassageFormat::Legacy => std::borrow::Cow::Borrowed(q),
+            PassageFormat::E5Prefix => std::borrow::Cow::Owned(format!("query: {q}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VectorStatus {
     pub enabled: bool,
@@ -457,6 +508,7 @@ pub struct TantivyRulesIndex {
     vector_enabled_requested: bool,
     rrf_k: usize,
     vector_weight: f32,
+    search_options: SearchOptions,
 }
 
 impl TantivyRulesIndex {
@@ -522,6 +574,7 @@ impl TantivyRulesIndex {
             vector_enabled_requested: opts.enabled,
             rrf_k: opts.rrf_k,
             vector_weight: opts.vector_weight,
+            search_options: SearchOptions::default(),
         })
     }
 
@@ -548,6 +601,7 @@ impl TantivyRulesIndex {
             provider.as_ref(),
             cache_key,
             cache_dir,
+            self.search_options.passage_format(),
         )?);
         self.vector_provider = Some(StoredEmbeddingProvider(provider));
         Ok(())
@@ -561,12 +615,20 @@ impl TantivyRulesIndex {
         path: impl AsRef<Path>,
         vector_options: VectorSearchOptions,
     ) -> Result<Self> {
+        Self::from_pack_dir_with_options(path, vector_options, SearchOptions::default())
+    }
+
+    pub fn from_pack_dir_with_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+        search_options: SearchOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let mut manifest: PackManifest =
             serde_json::from_reader(File::open(path.join("manifest.json"))?)?;
         manifest.normalize_hashes();
         verify_manifest(path, &manifest)?;
-        let cache_key = pack_vector_cache_key(&manifest);
+        let cache_key = pack_vector_cache_key(&manifest, search_options.passage_format());
 
         let articles = load_articles_dir(path.join("articles"))?;
         let annexes = load_annexes_dir(path.join("annexes"))?;
@@ -592,6 +654,7 @@ impl TantivyRulesIndex {
             &vector_options,
             true,
         )?;
+        index.search_options = search_options;
         if let Some((corpus, provider)) =
             index.try_build_vector_corpus_from_options(&cache_key, &vector_options)
         {
@@ -611,9 +674,17 @@ impl TantivyRulesIndex {
         path: impl AsRef<Path>,
         vector_options: VectorSearchOptions,
     ) -> Result<Self> {
+        Self::from_pack_archive_with_options(path, vector_options, SearchOptions::default())
+    }
+
+    pub fn from_pack_archive_with_options(
+        path: impl AsRef<Path>,
+        vector_options: VectorSearchOptions,
+        search_options: SearchOptions,
+    ) -> Result<Self> {
         let tmp = tempfile::tempdir()?;
         unpack_pack_archive(path, tmp.path())?;
-        Self::from_pack_dir_with_vector_options(tmp.path(), vector_options)
+        Self::from_pack_dir_with_options(tmp.path(), vector_options, search_options)
     }
 
     pub fn search_with_routes(
@@ -924,7 +995,8 @@ impl TantivyRulesIndex {
         let Some(provider) = &self.vector_provider else {
             return Vec::new();
         };
-        let Ok(query) = provider.0.embed(q) else {
+        let query_text = self.search_options.passage_format().query_text(q);
+        let Ok(query) = provider.0.embed(&query_text) else {
             eprintln!("vector search query embedding failed; falling back for this query");
             return Vec::new();
         };
@@ -1011,6 +1083,7 @@ impl TantivyRulesIndex {
             provider.as_ref(),
             cache_key,
             Some(cache_dir),
+            self.search_options.passage_format(),
         )?;
         Ok((corpus, StoredEmbeddingProvider(provider)))
     }
@@ -1914,8 +1987,8 @@ fn sha256_text(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn pack_vector_cache_key(manifest: &PackManifest) -> String {
-    let value = serde_json::json!({
+fn pack_vector_cache_key(manifest: &PackManifest, format: PassageFormat) -> String {
+    let mut value = serde_json::json!({
         "cache_version": VECTOR_CACHE_VERSION,
         "model_id": VECTOR_MODEL_ID,
         "model_revision": VECTOR_MODEL_REVISION,
@@ -1925,6 +1998,10 @@ fn pack_vector_cache_key(manifest: &PackManifest) -> String {
         "source_commit": manifest.source_commit,
         "files": manifest.files,
     });
+    // Inserted only for non-legacy formats so legacy keys stay byte-identical.
+    if let (Some(tag), Some(map)) = (format.cache_tag(), value.as_object_mut()) {
+        map.insert("passage_format".to_string(), serde_json::json!(tag));
+    }
     sha256_text(&serde_json::to_string(&value).unwrap_or_default())
 }
 
@@ -1938,8 +2015,9 @@ fn build_or_load_vector_corpus<'a>(
     provider: &dyn EmbeddingProvider,
     cache_key: &str,
     cache_dir: Option<&Path>,
+    format: PassageFormat,
 ) -> anyhow::Result<VectorCorpus> {
-    let entries = vector_source_entries(articles, annexes);
+    let entries = vector_source_entries(articles, annexes, format);
     if let Some(cache_dir) = cache_dir {
         let path = vector_cache_path(cache_dir, cache_key);
         if let Some(corpus) = load_vector_corpus_cache(&path, cache_key, &entries)? {
@@ -2021,10 +2099,14 @@ fn compute_vector_corpus(
 fn vector_source_entries<'a>(
     articles: impl Iterator<Item = &'a Article>,
     annexes: impl Iterator<Item = &'a Annex>,
+    fmt: PassageFormat,
 ) -> Vec<(String, String, String, String)> {
     let mut entries = articles
         .map(|article| {
-            let text = format!("{} {}\n{}", article.rule, article.title, article.body);
+            let text = fmt.passage_text(format!(
+                "{} {}\n{}",
+                article.rule, article.title, article.body
+            ));
             (
                 article.id.clone(),
                 "article".to_string(),
@@ -2033,12 +2115,12 @@ fn vector_source_entries<'a>(
             )
         })
         .chain(annexes.map(|annex| {
-            let text = format!(
+            let text = fmt.passage_text(format!(
                 "{} {}\n{}",
                 annex.rule,
                 annex_search_title(annex),
                 annex.body
-            );
+            ));
             (
                 annex.id.clone(),
                 "annex".to_string(),
@@ -2561,6 +2643,153 @@ refs:
                 Ok(vec![0.0, 1.0])
             }
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingProvider {
+        texts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl EmbeddingProvider for RecordingProvider {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.texts.lock().unwrap().push(text.to_string());
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    fn e5_test_index(e5_prefix: bool, provider: RecordingProvider) -> TantivyRulesIndex {
+        let mut index = TantivyRulesIndex::from_articles(
+            vec![article_fixture(
+                "cni",
+                "시험규칙",
+                "제1조",
+                "목적",
+                "시험 본문",
+            )],
+            default_pack_status("cni", "2026-03-01"),
+        )
+        .unwrap();
+        index.search_options = SearchOptions { e5_prefix };
+        index
+            .enable_vectors_for_test(provider, "test-key", None, 60, 1.0)
+            .unwrap();
+        index
+    }
+
+    fn test_manifest() -> PackManifest {
+        PackManifest {
+            schema_version: 1,
+            institution: "cni".to_string(),
+            effective_date: "2026-03-01".to_string(),
+            source_commit: "abc123".to_string(),
+            created_at: "2026-03-01T00:00:00Z".to_string(),
+            source_url: None,
+            quality: None,
+            files: BTreeMap::from([
+                ("articles/a.md".to_string(), "aa11".to_string()),
+                ("manifest.json".to_string(), "bb22".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn e5_prefix_applies_to_both_passage_and_query() {
+        let provider = RecordingProvider::default();
+        let index = e5_test_index(true, provider.clone());
+        index.search("시험질의", 5, None);
+
+        let texts = provider.texts.lock().unwrap().clone();
+        let passage = "passage: 시험규칙 목적\n시험 본문\n";
+        assert!(
+            texts.iter().any(|t| t.starts_with("passage: ")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == passage), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "query: 시험질의"), "{texts:?}");
+        // Neither side may be embedded without its prefix.
+        assert!(!texts.iter().any(|t| t == "시험질의"), "{texts:?}");
+        assert!(texts
+            .iter()
+            .all(|t| t.starts_with("passage: ") || t.starts_with("query: ")));
+    }
+
+    #[test]
+    fn e5_prefix_off_keeps_legacy_texts() {
+        let provider = RecordingProvider::default();
+        let index = e5_test_index(false, provider.clone());
+        index.search("시험질의", 5, None);
+
+        let texts = provider.texts.lock().unwrap().clone();
+        assert_eq!(
+            texts,
+            vec![
+                "시험규칙 목적\n시험 본문\n".to_string(),
+                "시험질의".to_string()
+            ]
+        );
+        assert_eq!(texts[0].as_bytes(), "시험규칙 목적\n시험 본문\n".as_bytes());
+    }
+
+    #[test]
+    fn legacy_passage_format_keeps_cache_key_bytes() {
+        let manifest = test_manifest();
+        // Replica of the 2f259192 key formula.
+        let old_value = serde_json::json!({
+            "cache_version": VECTOR_CACHE_VERSION,
+            "model_id": VECTOR_MODEL_ID,
+            "model_revision": VECTOR_MODEL_REVISION,
+            "schema_version": manifest.schema_version,
+            "institution": manifest.institution,
+            "effective_date": manifest.effective_date,
+            "source_commit": manifest.source_commit,
+            "files": manifest.files,
+        });
+        let old_key = sha256_text(&serde_json::to_string(&old_value).unwrap());
+        let new_key = pack_vector_cache_key(&manifest, PassageFormat::Legacy);
+        println!("old cache key: {old_key}");
+        println!("new cache key: {new_key}");
+        assert_eq!(old_key, new_key);
+        assert_eq!(
+            SearchOptions::default().passage_format(),
+            PassageFormat::Legacy
+        );
+    }
+
+    #[test]
+    fn prefixed_format_uses_distinct_cache_file() {
+        let manifest = test_manifest();
+        let legacy_key = pack_vector_cache_key(&manifest, PassageFormat::Legacy);
+        let e5_key = pack_vector_cache_key(&manifest, PassageFormat::E5Prefix);
+        assert_ne!(legacy_key, e5_key);
+
+        let dir = tempfile::tempdir().unwrap();
+        let articles = [article_fixture(
+            "cni",
+            "시험규칙",
+            "제1조",
+            "목적",
+            "시험 본문",
+        )];
+        for (key, fmt) in [
+            (&legacy_key, PassageFormat::Legacy),
+            (&e5_key, PassageFormat::E5Prefix),
+        ] {
+            build_or_load_vector_corpus(
+                articles.iter(),
+                std::iter::empty(),
+                &RecordingProvider::default(),
+                key,
+                Some(dir.path()),
+                fmt,
+            )
+            .unwrap();
+        }
+        assert!(vector_cache_path(dir.path(), &legacy_key).is_file());
+        assert!(vector_cache_path(dir.path(), &e5_key).is_file());
+        assert_ne!(
+            vector_cache_path(dir.path(), &legacy_key),
+            vector_cache_path(dir.path(), &e5_key)
+        );
     }
 
     #[test]
