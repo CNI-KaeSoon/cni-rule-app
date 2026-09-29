@@ -19,6 +19,8 @@ use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+pub mod eval_metrics;
+
 pub const ARTICLE_ID_SEPARATOR: &str = "#";
 pub const DEFAULT_RRF_K: usize = 60;
 const VECTOR_CACHE_VERSION: u32 = 1;
