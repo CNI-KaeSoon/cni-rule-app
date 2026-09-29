@@ -341,7 +341,58 @@ pub struct GetLegalBasisParams {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct GetLegalBasisResult {
     pub basis: Vec<LegalBasis>,
+    /// 상위법 연결(frontmatter legal_basis + refs 법령 인용). 필드 추가만이며 `basis`는 그대로다.
+    pub links: Vec<LegalLink>,
+    /// "found" | "none_in_pack" | "article_not_found"
+    pub link_status: String,
+    pub note: String,
     pub meta: FreshnessMeta,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct LegalLink {
+    pub law: String,
+    pub article: Option<String>,
+    /// "legal_basis" | "citation"
+    pub source: String,
+    pub ref_type: Option<String>,
+    /// "local_bundled" | "external_unverified" | "none"
+    pub resolution: String,
+    pub bundled_id: Option<String>,
+    pub as_of: Option<String>,
+    pub mst: Option<String>,
+}
+
+const LEGAL_LINKS_NOTE: &str = "수록 법령은 팩 기준일 사본이며 현행 여부는 확인하지 않았다. 연결이 없다는 것은 이 팩에서 찾지 못했다는 뜻이다.";
+
+/// refs 대상의 규정명이 법령인지 결정적으로 판별한다(내부 규정은 제외).
+fn is_law_name(rule: &str) -> bool {
+    let slug = rules_core::slugify_rule(rule);
+    ["시행규칙", "시행령", "법률", "법"]
+        .iter()
+        .any(|suffix| slug.ends_with(suffix))
+        || slug.starts_with("민법")
+}
+
+/// `제N조` 또는 `제N조의M` 형태만 조문으로 인정한다.
+fn is_parsable_article(article: &str) -> bool {
+    let Some(rest) = article.strip_prefix('제') else {
+        return false;
+    };
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let Some(rest) = rest[digits..].strip_prefix('조') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    match rest.strip_prefix('의') {
+        Some(sub) => !sub.is_empty() && sub.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -593,6 +644,96 @@ impl PublicRulesServer {
                 .collect();
         }
         page
+    }
+
+    fn legal_links(&self, pack: &LoadedPack, article: &Article) -> Vec<LegalLink> {
+        let as_of = pack.index.status().effective_date;
+        let resolve = |law: &str, art: Option<&str>| -> (String, Option<String>, Option<String>) {
+            let Some(art) = art.filter(|a| is_parsable_article(a)) else {
+                return ("none".to_string(), None, None);
+            };
+            let local_id = format!(
+                "{}{}{}",
+                rules_core::slugify_rule(law),
+                rules_core::ARTICLE_ID_SEPARATOR,
+                art
+            );
+            if pack.index.get_article(&local_id).is_some() {
+                let bundled = if self.multi_pack {
+                    format!("{}/{}", pack.institution, local_id)
+                } else {
+                    local_id
+                };
+                (
+                    "local_bundled".to_string(),
+                    Some(bundled),
+                    Some(as_of.clone()),
+                )
+            } else {
+                ("external_unverified".to_string(), None, None)
+            }
+        };
+        let mut links: Vec<LegalLink> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, String)> = Default::default();
+        for basis in &article.legal_basis {
+            let key = (rules_core::slugify_rule(&basis.law), basis.article.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let (resolution, bundled_id, as_of) = resolve(&basis.law, Some(&basis.article));
+            links.push(LegalLink {
+                law: basis.law.clone(),
+                article: Some(basis.article.clone()).filter(|a| !a.is_empty()),
+                source: "legal_basis".to_string(),
+                ref_type: None,
+                resolution,
+                bundled_id,
+                as_of,
+                mst: basis.mst.clone(),
+            });
+        }
+        for reference in &article.refs {
+            let (law, art) = match reference
+                .target
+                .split_once(rules_core::ARTICLE_ID_SEPARATOR)
+            {
+                Some((law, art)) => (law, Some(art)),
+                None => (reference.target.as_str(), None),
+            };
+            if !is_law_name(law) {
+                continue;
+            }
+            let key = (
+                rules_core::slugify_rule(law),
+                art.unwrap_or_default().to_string(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let (resolution, bundled_id, as_of) = resolve(law, art);
+            links.push(LegalLink {
+                law: law.to_string(),
+                article: art.map(str::to_string).filter(|a| !a.is_empty()),
+                source: "citation".to_string(),
+                ref_type: Some(reference.kind.clone()).filter(|k| !k.is_empty()),
+                resolution,
+                bundled_id,
+                as_of,
+                mst: None,
+            });
+        }
+        links.sort_by(|a, b| {
+            let rank = |l: &LegalLink| u8::from(l.source != "legal_basis");
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.law.cmp(&b.law))
+                .then_with(|| {
+                    rules_core::article_sort_key(a.article.as_deref().unwrap_or_default()).cmp(
+                        &rules_core::article_sort_key(b.article.as_deref().unwrap_or_default()),
+                    )
+                })
+        });
+        links
     }
 
     fn resolve_article_id<'a>(&'a self, id: &'a str) -> Option<(&'a LoadedPack, &'a str)> {
@@ -1646,8 +1787,23 @@ impl PublicRulesServer {
                 },
             }),
         );
+        let (links, link_status) = match (resolved, article.as_ref()) {
+            (Some((pack, _)), Some(article)) => {
+                let links = self.legal_links(pack, article);
+                let status = if links.is_empty() {
+                    "none_in_pack"
+                } else {
+                    "found"
+                };
+                (links, status)
+            }
+            _ => (Vec::new(), "article_not_found"),
+        };
         Json(GetLegalBasisResult {
             basis,
+            links,
+            link_status: link_status.to_string(),
+            note: LEGAL_LINKS_NOTE.to_string(),
             meta: self.status_meta(article.as_ref()),
         })
     }
@@ -2876,6 +3032,241 @@ table_structured: true
         assert_eq!(result.basis.len(), 1);
         assert_eq!(result.basis[0].law, "근로기준법");
         assert_eq!(result.basis[0].article, "제60조");
+    }
+
+    fn link_article(
+        institution: &str,
+        rule: &str,
+        article: &str,
+        basis: &[(&str, &str)],
+        refs: &[(&str, &str)],
+    ) -> Article {
+        let basis_yaml = if basis.is_empty() {
+            "legal_basis: []\n".to_string()
+        } else {
+            let items: String = basis
+                .iter()
+                .map(|(law, art)| format!("  - law: {law}\n    article: {art}\n    mst: \"111\"\n"))
+                .collect();
+            format!("legal_basis:\n{items}")
+        };
+        let refs_yaml = if refs.is_empty() {
+            "refs: []\n".to_string()
+        } else {
+            let items: String = refs
+                .iter()
+                .map(|(target, kind)| format!("  - target: {target}\n    type: {kind}\n"))
+                .collect();
+            format!("refs:\n{items}")
+        };
+        rules_core::parse_article_markdown_str(&format!(
+            "---\ninstitution: {institution}\nrule: {rule}\narticle: {article}\ntitle: 시험\neffective: 2026-02-27\namended: 2026-02-27\nstatus: active\nsupersedes: null\n{basis_yaml}{refs_yaml}---\n본문\n"
+        ))
+        .unwrap()
+    }
+
+    fn legal_links_server() -> PublicRulesServer {
+        let index = TantivyRulesIndex::from_articles(
+            vec![
+                link_article("cni", "시험법", "제3조", &[], &[]),
+                link_article("cni", "시험법", "제10조", &[], &[]),
+                link_article("cni", "시험법시행령", "제2조", &[], &[]),
+                link_article(
+                    "cni",
+                    "시험규칙",
+                    "제1조",
+                    &[("시험법", "제3조")],
+                    &[
+                        ("시험법#제10조", "인용"),
+                        ("시험법#제3조", "인용"),
+                        ("시험법시행령#제2조", "위임"),
+                        ("가상법#제7조", "인용"),
+                        ("가상법", "인용"),
+                        ("시험법#부칙", "인용"),
+                        ("복무시험규정#제5조", "인용"),
+                    ],
+                ),
+                link_article("cni", "시험규칙", "제2조", &[], &[]),
+            ],
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        PublicRulesServer::new(index)
+    }
+
+    async fn legal_links_of(server: &PublicRulesServer, id: &str) -> GetLegalBasisResult {
+        let Json(result) = server
+            .get_legal_basis(Parameters(GetLegalBasisParams { id: id.to_string() }))
+            .await;
+        result
+    }
+
+    #[tokio::test]
+    async fn legal_links_include_bundled_law_citations_with_as_of() {
+        let result = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        assert_eq!(result.link_status, "found");
+        let link = result
+            .links
+            .iter()
+            .find(|l| l.source == "citation" && l.law == "시험법시행령")
+            .unwrap();
+        assert_eq!(link.resolution, "local_bundled");
+        assert_eq!(link.bundled_id.as_deref(), Some("시험법시행령#제2조"));
+        assert_eq!(link.as_of.as_deref(), Some("2026-02-27"));
+        assert_eq!(link.ref_type.as_deref(), Some("위임"));
+        assert!(result.note.contains("현행 여부는 확인하지 않았다"));
+    }
+
+    #[tokio::test]
+    async fn external_law_citation_is_unverified() {
+        let result = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        let link = result
+            .links
+            .iter()
+            .find(|l| l.law == "가상법" && l.article.is_some())
+            .unwrap();
+        assert_eq!(link.resolution, "external_unverified");
+        assert!(link.bundled_id.is_none());
+        assert!(link.as_of.is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_rule_citations_are_excluded() {
+        let result = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        assert!(result.links.iter().all(|l| l.law != "복무시험규정"));
+    }
+
+    #[tokio::test]
+    async fn unparseable_law_reference_resolution_none() {
+        let result = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        let no_article = result
+            .links
+            .iter()
+            .find(|l| l.law == "가상법" && l.article.is_none())
+            .unwrap();
+        assert_eq!(no_article.resolution, "none");
+        let bad_article = result
+            .links
+            .iter()
+            .find(|l| l.article.as_deref() == Some("부칙"))
+            .unwrap();
+        assert_eq!(bad_article.resolution, "none");
+        assert!(bad_article.bundled_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_basis_field_unchanged() {
+        let server = fixture_server();
+        let result = legal_links_of(&server, "여비지급규칙#제12조").await;
+        assert_eq!(result.basis.len(), 1);
+        assert_eq!(result.basis[0].law, "근로기준법");
+        assert_eq!(result.basis[0].article, "제60조");
+        assert_eq!(result.basis[0].mst.as_deref(), Some("265959"));
+        // legal_basis 항목도 링크로 노출된다(미수록 법령 -> external_unverified).
+        assert_eq!(result.links.len(), 1);
+        assert_eq!(result.links[0].source, "legal_basis");
+        assert_eq!(result.links[0].resolution, "external_unverified");
+    }
+
+    #[tokio::test]
+    async fn unknown_article_reports_article_not_found() {
+        let server = legal_links_server();
+        let missing = legal_links_of(&server, "시험규칙#제99조").await;
+        assert_eq!(missing.link_status, "article_not_found");
+        assert!(missing.links.is_empty());
+        let none = legal_links_of(&server, "시험규칙#제2조").await;
+        assert_eq!(none.link_status, "none_in_pack");
+        assert!(none.links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_pack_bundled_id_is_prefixed() {
+        let cni = TantivyRulesIndex::from_articles(
+            vec![
+                link_article("cni", "시험법", "제3조", &[], &[]),
+                link_article("cni", "시험규칙", "제1조", &[], &[("시험법#제3조", "인용")]),
+            ],
+            default_pack_status("cni", "2026-02-27"),
+        )
+        .unwrap();
+        let ctp = TantivyRulesIndex::from_articles(
+            vec![link_article(
+                "ctp",
+                "시험규칙",
+                "제1조",
+                &[],
+                &[("시험법#제3조", "인용")],
+            )],
+            default_pack_status("ctp", "2026-03-01"),
+        )
+        .unwrap();
+        let server = PublicRulesServer {
+            packs: Arc::new(vec![
+                LoadedPack {
+                    institution: "cni".to_string(),
+                    aliases: vec!["cni".to_string()],
+                    index: Arc::new(cni),
+                },
+                LoadedPack {
+                    institution: "ctp".to_string(),
+                    aliases: vec!["ctp".to_string()],
+                    index: Arc::new(ctp),
+                },
+            ]),
+            default_institution: "cni".to_string(),
+            multi_pack: true,
+            tool_router: PublicRulesServer::tool_router(),
+            prompt_router: PublicRulesServer::prompt_router(),
+            search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
+            query_logger: None,
+        };
+        let cni_result = legal_links_of(&server, "cni/시험규칙#제1조").await;
+        assert_eq!(cni_result.links[0].resolution, "local_bundled");
+        assert_eq!(
+            cni_result.links[0].bundled_id.as_deref(),
+            Some("cni/시험법#제3조")
+        );
+        // 다른 팩에는 시험법이 없으므로 그 팩 기준으로 미확인이다.
+        let ctp_result = legal_links_of(&server, "ctp/시험규칙#제1조").await;
+        assert_eq!(ctp_result.links[0].resolution, "external_unverified");
+    }
+
+    #[tokio::test]
+    async fn legal_links_are_sorted_deterministically() {
+        let result = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        let keys: Vec<(String, String, String)> = result
+            .links
+            .iter()
+            .map(|l| {
+                (
+                    l.source.clone(),
+                    l.law.clone(),
+                    l.article.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(keys[0].0, "legal_basis");
+        assert_eq!(
+            keys[0],
+            ("legal_basis".into(), "시험법".into(), "제3조".into())
+        );
+        // legal_basis 우선 중복 제거: citation 시험법#제3조는 남지 않는다.
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.1 == "시험법" && k.2 == "제3조")
+                .count(),
+            1
+        );
+        let again = legal_links_of(&legal_links_server(), "시험규칙#제1조").await;
+        assert_eq!(result.links, again.links);
+        // article_sort_key 순: 파싱 불가(0)가 먼저, 그다음 제10조
+        let arts: Vec<&str> = result
+            .links
+            .iter()
+            .filter(|l| l.source == "citation" && l.law == "시험법")
+            .filter_map(|l| l.article.as_deref())
+            .collect();
+        assert_eq!(arts, vec!["부칙", "제10조"]);
     }
 
     #[tokio::test]

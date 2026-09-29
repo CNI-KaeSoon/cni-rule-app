@@ -1845,7 +1845,7 @@ fn link_neighbors(articles: &mut BTreeMap<String, Article>) {
     }
 }
 
-fn article_sort_key(article: &str) -> (u32, u32, String) {
+pub fn article_sort_key(article: &str) -> (u32, u32, String) {
     let before_sub = article.split('의').next().unwrap_or(article);
     let main = before_sub
         .split('조')
