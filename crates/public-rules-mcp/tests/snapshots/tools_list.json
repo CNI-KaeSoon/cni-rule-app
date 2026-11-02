@@ -1079,6 +1079,83 @@
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "사용자가 방금 답이 틀렸다·엉뚱하다·그 조항이 아니라고 명시적으로 지적했을 때만 호출한다. 지적이 없으면 호출하지 않는다. 질문·답변·문제를 간결히 요약하고 이름·연락처 등 개인 식별정보는 넣지 않는다. cited_ids에는 답에서 인용한 조문 ID만 넣고, expected에는 사용자가 제시한 정답이나 단서를 넣는다.",
+    "inputSchema": {
+      "$defs": {
+        "IssueCategory": {
+          "enum": [
+            "wrong_article",
+            "missing_info",
+            "outdated",
+            "misinterpretation",
+            "other"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "answer_summary": {
+          "type": "string"
+        },
+        "category": {
+          "$ref": "#/$defs/IssueCategory",
+          "default": "other"
+        },
+        "cited_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expected": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "problem": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "question",
+        "answer_summary",
+        "problem"
+      ],
+      "type": "object"
+    },
+    "name": "report_answer_issue",
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "issue_id": {
+          "type": "string"
+        },
+        "recorded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "issue_id",
+        "recorded"
+      ],
+      "type": "object"
+    },
+    "title": "잘못된 답변 신고"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": true

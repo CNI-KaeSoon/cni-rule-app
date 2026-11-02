@@ -2,7 +2,7 @@ use public_rules_mcp::{
     AuthToken, CompareRulesResult, FreshnessMeta, PackConfig, SearchConfig, SearchRulesResult,
     ServerConfig, ServerTransport, TransportArgs, VectorConfig, COMPARE_RULES_TOOL, GET_ANNEX_TOOL,
     GET_ARTICLE_TOOL, GET_LEGAL_BASIS_TOOL, GET_SOURCE_PAGE_TOOL, LABOR_COMPARE_PROMPT,
-    LIST_RULES_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
+    LIST_RULES_TOOL, REPORT_ANSWER_ISSUE_TOOL, SEARCH_RULES_TOOL, STATUS_TOOL,
 };
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo, ContentBlock, GetPromptRequestParams},
@@ -21,6 +21,223 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn feedback_log_records_truncation_permissions_and_test_header() -> anyhow::Result<()> {
+    let root = make_fixture_pack()?;
+    let feedback_path = root.join("feedback.jsonl");
+    let query_path = root.join("query.jsonl");
+    let addr = unused_loopback_addr().await?;
+    let server = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        fixture_config(root),
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: vec!["fixture.example".to_string()],
+            query_log_path: Some(query_path.clone()),
+            feedback_log_path: Some(feedback_path.clone()),
+            auth_token: None,
+        },
+    ));
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-cni-test".parse()?, "1".parse()?);
+    let url = format!("http://{addr}/mcp");
+    let mut client = None;
+    for _ in 0..20 {
+        let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+            .custom_headers(headers.clone());
+        match ClientInfo::default()
+            .serve(StreamableHttpClientTransport::from_config(config))
+            .await
+        {
+            Ok(connected) => {
+                client = Some(connected);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    let client = client.ok_or_else(|| anyhow::anyhow!("test HTTP client did not connect"))?;
+    let search_args = serde_json::json!({"query": "항공운임"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let search = client
+        .call_tool(CallToolRequestParams::new(SEARCH_RULES_TOOL).with_arguments(search_args))
+        .await?;
+    assert_ne!(search.is_error, Some(true));
+    let arguments = serde_json::json!({
+        "question": "가".repeat(2001),
+        "answer_summary": "답변",
+        "problem": "지적",
+        "cited_ids": vec!["나".repeat(201); 21],
+        "expected": "다".repeat(1001),
+        "category": "wrong_article"
+    })
+    .as_object()
+    .expect("arguments")
+    .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(arguments))
+        .await?;
+    assert_ne!(result.is_error, Some(true));
+    let response = tool_result_json(result)?;
+    let id = response["issue_id"].as_str().expect("issue id");
+    assert!(id.starts_with("fb-"));
+    assert_eq!(id.len(), 18);
+    assert_eq!(response["recorded"], true);
+    let feedback: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&feedback_path)?.trim())?;
+    assert_eq!(feedback["issue_id"], id);
+    assert_eq!(feedback["host"], "fixture.example");
+    assert_eq!(feedback["test"], true);
+    assert_eq!(feedback["category"], "wrong_article");
+    assert_eq!(feedback["question"].as_str().unwrap().chars().count(), 2000);
+    assert_eq!(feedback["expected"].as_str().unwrap().chars().count(), 1000);
+    assert_eq!(feedback["cited_ids"].as_array().unwrap().len(), 20);
+    assert_eq!(
+        feedback["cited_ids"][0].as_str().unwrap().chars().count(),
+        200
+    );
+    assert_eq!(
+        feedback["truncated"],
+        serde_json::json!(["cited_ids", "expected", "question"])
+    );
+    assert_eq!(feedback["packs"]["cni"]["effective"], "2026-02-27");
+    assert_eq!(feedback["packs"]["cni"]["source_commit"], "http-fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&feedback_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let events = fs::read_to_string(&query_path)?;
+    let event: serde_json::Value = serde_json::from_str(
+        events
+            .lines()
+            .find(|line| line.contains(REPORT_ANSWER_ISSUE_TOOL))
+            .expect("linked event"),
+    )?;
+    assert_eq!(
+        event["params"],
+        serde_json::json!({"issue_id": id, "category": "wrong_article"})
+    );
+    assert_eq!(event["test"], true);
+    let search_event: serde_json::Value = serde_json::from_str(
+        events
+            .lines()
+            .find(|line| line.contains(SEARCH_RULES_TOOL))
+            .expect("search event"),
+    )?;
+    assert_eq!(search_event["test"], true);
+    assert!(!events.contains("지적"));
+    client.cancel().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarded_for_ignores_test_header_in_both_logs() -> anyhow::Result<()> {
+    forwarded_header_ignores_test("x-forwarded-for", "203.0.113.10").await
+}
+
+#[tokio::test]
+async fn forwarded_prefix_ignores_test_header_in_both_logs() -> anyhow::Result<()> {
+    forwarded_header_ignores_test("x-forwarded-prefix", "/cni").await
+}
+
+async fn forwarded_header_ignores_test(name: &str, value: &str) -> anyhow::Result<()> {
+    let root = make_fixture_pack()?;
+    let feedback_path = root.join("feedback.jsonl");
+    let query_path = root.join("query.jsonl");
+    let addr = unused_loopback_addr().await?;
+    let server = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
+        fixture_config(root),
+        TransportArgs {
+            transport: ServerTransport::Http,
+            bind_addr: addr,
+            allowed_hosts: vec!["fixture.example".to_string()],
+            query_log_path: Some(query_path.clone()),
+            feedback_log_path: Some(feedback_path.clone()),
+            auth_token: None,
+        },
+    ));
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-cni-test".parse()?, "1".parse()?);
+    headers.insert(name.parse()?, value.parse()?);
+    let url = format!("http://{addr}/mcp");
+    let mut client = None;
+    for _ in 0..20 {
+        let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+            .custom_headers(headers.clone());
+        match ClientInfo::default()
+            .serve(StreamableHttpClientTransport::from_config(config))
+            .await
+        {
+            Ok(connected) => {
+                client = Some(connected);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    let client = client.ok_or_else(|| anyhow::anyhow!("test HTTP client did not connect"))?;
+    let search_args = serde_json::json!({"query": "항공운임"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let search = client
+        .call_tool(CallToolRequestParams::new(SEARCH_RULES_TOOL).with_arguments(search_args))
+        .await?;
+    assert_ne!(search.is_error, Some(true));
+    let feedback_args = serde_json::json!({
+        "question": "질문", "answer_summary": "답변", "problem": "지적"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let feedback = client
+        .call_tool(
+            CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(feedback_args),
+        )
+        .await?;
+    assert_ne!(feedback.is_error, Some(true));
+    let recorded: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&feedback_path)?.trim())?;
+    assert!(recorded.get("test").is_none());
+    let events = fs::read_to_string(&query_path)?;
+    for tool in [SEARCH_RULES_TOOL, REPORT_ANSWER_ISSUE_TOOL] {
+        let event: serde_json::Value = serde_json::from_str(
+            events
+                .lines()
+                .find(|line| line.contains(tool))
+                .expect("query event"),
+        )?;
+        assert!(event.get("test").is_none(), "{tool} was marked test");
+    }
+    client.cancel().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn feedback_disabled_returns_tool_error() -> anyhow::Result<()> {
+    let (client, server) = snapshot_client_disabled().await?;
+    let args = serde_json::json!({"question":"질문", "answer_summary":"답변", "problem":"지적"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(args))
+        .await?;
+    assert_eq!(result.is_error, Some(true));
+    assert!(format!("{:?}", result.content).contains("피드백 기록이 꺼져 있다"));
+    client.cancel().await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Result<()> {
     let fixture_root = make_fixture_pack()?;
     let config = fixture_config(fixture_root.clone());
@@ -34,6 +251,7 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: Some(query_log_path.clone()),
+            feedback_log_path: None,
             auth_token: None,
         },
     ));
@@ -63,6 +281,7 @@ async fn streamable_http_round_trips_tools_and_search_results() -> anyhow::Resul
             STATUS_TOOL.to_string(),
             GET_ANNEX_TOOL.to_string(),
             GET_SOURCE_PAGE_TOOL.to_string(),
+            REPORT_ANSWER_ISSUE_TOOL.to_string(),
         ])
     );
 
@@ -208,6 +427,7 @@ async fn streamable_http_searches_multiple_packs_with_institution_labels() -> an
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            feedback_log_path: None,
             auth_token: None,
         },
     ));
@@ -244,7 +464,7 @@ async fn streamable_http_rejects_untrusted_host_header() -> anyhow::Result<()> {
     let fixture_root = make_fixture_pack()?;
     let addr = unused_loopback_addr().await?;
     let server_handle = tokio::spawn(public_rules_mcp::run_http_server(
-        fixture_config(fixture_root),
+        fixture_config(fixture_root.clone()),
         addr,
     ));
 
@@ -370,6 +590,7 @@ async fn streamable_http_enforces_bearer_auth_and_preserves_host_validation() ->
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: Some(query_log_path.clone()),
+            feedback_log_path: None,
             auth_token: Some(AuthToken::new(token.clone())?),
         },
     ));
@@ -428,6 +649,7 @@ async fn streamable_http_rejects_non_loopback_bind_without_auth() -> anyhow::Res
             bind_addr: "0.0.0.0:0".parse()?,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            feedback_log_path: None,
             auth_token: None,
         },
     )
@@ -444,7 +666,10 @@ async fn streamable_http_rejects_non_loopback_bind_without_auth() -> anyhow::Res
 async fn every_tool_has_title_and_readonly_annotations() -> anyhow::Result<()> {
     let (client, server_handle) = snapshot_client().await?;
     let tools = client.list_all_tools().await?;
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == REPORT_ANSWER_ISSUE_TOOL));
     for tool in &tools {
         let title = tool.title.as_deref().unwrap_or_default();
         assert!(!title.trim().is_empty(), "{} has no title", tool.name);
@@ -452,9 +677,19 @@ async fn every_tool_has_title_and_readonly_annotations() -> anyhow::Result<()> {
             .annotations
             .as_ref()
             .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
-        assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(tool.name != REPORT_ANSWER_ISSUE_TOOL),
+            "{}",
+            tool.name
+        );
         assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
-        assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name);
+        assert_eq!(
+            annotations.idempotent_hint,
+            Some(tool.name != REPORT_ANSWER_ISSUE_TOOL),
+            "{}",
+            tool.name
+        );
         assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
     }
     client.cancel().await?;
@@ -471,6 +706,9 @@ fn call_arguments_for(tool: &str) -> serde_json::Value {
         "get_source_page" => serde_json::json!({"page": 1}),
         "get_article" => serde_json::json!({"id": "여비지급규칙#제12조"}),
         "get_legal_basis" => serde_json::json!({"id": "여비지급규칙#제12조"}),
+        "report_answer_issue" => {
+            serde_json::json!({"question": "질문", "answer_summary": "답변", "problem": "틀림"})
+        }
         _ => serde_json::json!({}),
     }
 }
@@ -663,15 +901,32 @@ async fn snapshot_client() -> anyhow::Result<(
     rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 )> {
+    snapshot_client_with_feedback(true).await
+}
+
+async fn snapshot_client_disabled() -> anyhow::Result<(
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
+    snapshot_client_with_feedback(false).await
+}
+
+async fn snapshot_client_with_feedback(
+    enabled: bool,
+) -> anyhow::Result<(
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::InitializeRequestParams>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+)> {
     let fixture_root = make_fixture_pack()?;
     let addr = unused_loopback_addr().await?;
     let server_handle = tokio::spawn(public_rules_mcp::run_server_with_transport_args(
-        fixture_config(fixture_root),
+        fixture_config(fixture_root.clone()),
         TransportArgs {
             transport: ServerTransport::Http,
             bind_addr: addr,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            feedback_log_path: enabled.then(|| fixture_root.join("feedback.jsonl")),
             auth_token: None,
         },
     ));

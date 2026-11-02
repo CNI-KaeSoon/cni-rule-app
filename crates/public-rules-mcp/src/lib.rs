@@ -1,16 +1,18 @@
 use rmcp::{
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
+        tool::ToolCallContext,
         wrapper::Json,
         wrapper::Parameters,
     },
     model::{
-        Implementation, InitializeRequestParams, InitializeResult, PromptMessage, ProtocolVersion,
-        Role, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, PromptMessage, ProtocolVersion,
+        Role, ServerCapabilities, ServerInfo, Tool,
     },
     prompt, prompt_handler, prompt_router,
     service::{RequestContext, RoleServer},
-    tool, tool_handler, tool_router,
+    tool, tool_router,
     transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
@@ -28,11 +30,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +52,7 @@ pub const GET_LEGAL_BASIS_TOOL: &str = "get_legal_basis";
 pub const STATUS_TOOL: &str = "status";
 pub const GET_ANNEX_TOOL: &str = "get_annex";
 pub const GET_SOURCE_PAGE_TOOL: &str = "get_source_page";
+pub const REPORT_ANSWER_ISSUE_TOOL: &str = "report_answer_issue";
 pub const DEFAULT_HTTP_BIND_ADDR: &str = "127.0.0.1:8787";
 const SEARCH_FANOUT_LIMIT: usize = 4;
 /// Upper bound of `(1 + variants) x packs` search jobs per `search_rules` call.
@@ -105,6 +109,7 @@ pub struct CliArgs {
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub query_log_path: Option<PathBuf>,
+    pub feedback_log_path: Option<PathBuf>,
     pub auth_token: Option<AuthToken>,
     pub extra_packs: Vec<ExtraPackConfig>,
 }
@@ -115,6 +120,7 @@ pub struct TransportArgs {
     pub bind_addr: SocketAddr,
     pub allowed_hosts: Vec<String>,
     pub query_log_path: Option<PathBuf>,
+    pub feedback_log_path: Option<PathBuf>,
     pub auth_token: Option<AuthToken>,
 }
 
@@ -539,6 +545,36 @@ fn is_parsable_article(article: &str) -> bool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct StatusParams {}
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueCategory {
+    WrongArticle,
+    MissingInfo,
+    Outdated,
+    Misinterpretation,
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ReportAnswerIssueParams {
+    pub question: String,
+    pub answer_summary: String,
+    pub problem: String,
+    #[serde(default)]
+    pub cited_ids: Vec<String>,
+    #[serde(default)]
+    pub expected: Option<String>,
+    #[serde(default)]
+    pub category: IssueCategory,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ReportAnswerIssueResult {
+    pub issue_id: String,
+    pub recorded: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct StatusResult {
     pub institution: String,
@@ -586,6 +622,8 @@ pub struct PublicRulesServer {
     multipack_fusion: MultipackFusion,
     query_variants_max: usize,
     query_logger: Option<QueryLogger>,
+    feedback_logger: Option<FeedbackLogger>,
+    feedback_host: String,
 }
 
 #[derive(Debug, Clone)]
@@ -612,11 +650,19 @@ impl PublicRulesServer {
             multipack_fusion: MultipackFusion::default(),
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
+            feedback_logger: None,
+            feedback_host: hostname(),
         }
     }
 
     pub fn with_query_logger(mut self, query_logger: QueryLogger) -> Self {
         self.query_logger = Some(query_logger);
+        self
+    }
+
+    pub fn with_feedback_logger(mut self, feedback_logger: FeedbackLogger, host: String) -> Self {
+        self.feedback_logger = Some(feedback_logger);
+        self.feedback_host = host;
         self
     }
 
@@ -679,6 +725,8 @@ impl PublicRulesServer {
             multipack_fusion,
             query_variants_max,
             query_logger: None,
+            feedback_logger: None,
+            feedback_host: hostname(),
         })
     }
 
@@ -983,10 +1031,102 @@ impl PublicRulesServer {
             .collect()
     }
 
-    fn log_query(&self, started_at: Instant, event: serde_json::Value) {
+    fn log_query(&self, started_at: Instant, mut event: serde_json::Value, test: bool) {
+        if test {
+            event["test"] = serde_json::json!(true);
+        }
         if let Some(query_logger) = &self.query_logger {
             query_logger.log(started_at, event);
         }
+    }
+}
+
+tokio::task_local! { static TEST_REQUEST: bool; }
+
+fn is_test_request(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .is_some_and(|parts| {
+            !parts.headers.contains_key("x-forwarded-for")
+                && !parts.headers.contains_key("x-forwarded-prefix")
+                && parts
+                    .headers
+                    .get("x-cni-test")
+                    .is_some_and(|value| value == "1")
+        })
+}
+
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedbackLogger {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl FeedbackLogger {
+    pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn log(&self, event: &serde_json::Value) -> std::io::Result<()> {
+        let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+        line.push('\n');
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("feedback log mutex poisoned"))?;
+        file.write_all(line.as_bytes())
+    }
+}
+
+static NEXT_ISSUE_ID: AtomicU32 = AtomicU32::new(0);
+
+fn issue_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let days = (now.as_secs() / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(m <= 2);
+    let counter = NEXT_ISSUE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(now.as_nanos());
+    hasher.write_u32(std::process::id());
+    hasher.write_u32(counter);
+    let suffix = (hasher.finish() & 0xff_ffff) as u32;
+    format!("fb-{year:04}{m:02}{d:02}-{suffix:06x}")
+}
+
+fn truncate_chars(value: &mut String, cap: usize, field: &str, truncated: &mut Vec<String>) {
+    if let Some((byte_index, _)) = value.char_indices().nth(cap) {
+        value.truncate(byte_index);
+        truncated.push(field.to_string());
     }
 }
 
@@ -1013,18 +1153,19 @@ impl QueryLogger {
                 serde_json::json!(started_at.elapsed().as_millis() as u64),
             );
         }
-        let line = match serde_json::to_string(&event) {
+        let mut line = match serde_json::to_string(&event) {
             Ok(line) => line,
             Err(error) => {
                 self.warn_once(format!("query log serialization failed: {error}"));
                 return;
             }
         };
+        line.push('\n');
         let result = self
             .file
             .lock()
             .map_err(|_| std::io::Error::other("query log mutex poisoned"))
-            .and_then(|mut file| writeln!(file, "{line}"));
+            .and_then(|mut file| file.write_all(line.as_bytes()));
         if let Err(error) = result {
             self.warn_once(format!("query log write failed: {error}"));
         }
@@ -1051,6 +1192,20 @@ fn optional_query_logger(path: Option<PathBuf>) -> Option<QueryLogger> {
         Err(error) => {
             eprintln!(
                 "query log disabled: failed to open {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn optional_feedback_logger(path: Option<PathBuf>) -> Option<FeedbackLogger> {
+    let path = path?;
+    match FeedbackLogger::new(&path) {
+        Ok(logger) => Some(logger),
+        Err(error) => {
+            eprintln!(
+                "feedback log disabled: failed to open {}: {error}",
                 path.display()
             );
             None
@@ -1766,6 +1921,98 @@ fn collect_effective_counts(
 #[tool_router(router = tool_router)]
 impl PublicRulesServer {
     #[tool(
+        name = "report_answer_issue",
+        title = "잘못된 답변 신고",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        description = "사용자가 방금 답이 틀렸다·엉뚱하다·그 조항이 아니라고 명시적으로 지적했을 때만 호출한다. 지적이 없으면 호출하지 않는다. 질문·답변·문제를 간결히 요약하고 이름·연락처 등 개인 식별정보는 넣지 않는다. cited_ids에는 답에서 인용한 조문 ID만 넣고, expected에는 사용자가 제시한 정답이나 단서를 넣는다."
+    )]
+    pub async fn report_answer_issue(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(mut params): Parameters<ReportAnswerIssueParams>,
+    ) -> Result<Json<ReportAnswerIssueResult>, String> {
+        let started_at = Instant::now();
+        let logger = self
+            .feedback_logger
+            .as_ref()
+            .ok_or("피드백 기록이 꺼져 있다")?;
+        let mut truncated = Vec::new();
+        truncate_chars(&mut params.question, 2_000, "question", &mut truncated);
+        truncate_chars(
+            &mut params.answer_summary,
+            2_000,
+            "answer_summary",
+            &mut truncated,
+        );
+        truncate_chars(&mut params.problem, 1_000, "problem", &mut truncated);
+        if let Some(expected) = params.expected.as_mut() {
+            truncate_chars(expected, 1_000, "expected", &mut truncated);
+        }
+        if params.cited_ids.len() > 20 {
+            params.cited_ids.truncate(20);
+            truncated.push("cited_ids".to_string());
+        }
+        for id in &mut params.cited_ids {
+            truncate_chars(id, 200, "cited_ids", &mut truncated);
+        }
+        truncated.sort();
+        truncated.dedup();
+        let issue_id = issue_id();
+        let packs = self
+            .packs
+            .iter()
+            .map(|pack| {
+                let status = pack.index.status();
+                (
+                    pack.institution.clone(),
+                    serde_json::json!({
+                        "effective": status.effective_date,
+                        "source_commit": status.source_commit,
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let test = is_test_request(&context);
+        let mut event = serde_json::json!({
+            "ts_ms": unix_epoch_ms(),
+            "issue_id": issue_id,
+            "question": params.question,
+            "answer_summary": params.answer_summary,
+            "problem": params.problem,
+            "cited_ids": params.cited_ids,
+            "expected": params.expected,
+            "category": params.category,
+            "truncated": truncated,
+            "packs": packs,
+            "host": self.feedback_host,
+        });
+        if test {
+            event["test"] = serde_json::json!(true);
+        }
+        logger
+            .log(&event)
+            .map_err(|error| format!("피드백 기록 실패: {error}"))?;
+        self.log_query(
+            started_at,
+            serde_json::json!({
+                "tool": REPORT_ANSWER_ISSUE_TOOL,
+                "params": {"issue_id": issue_id, "category": params.category},
+                "result": {"recorded": true},
+            }),
+            test,
+        );
+        Ok(Json(ReportAnswerIssueResult {
+            issue_id,
+            recorded: true,
+        }))
+    }
+
+    #[tool(
         name = "compare_rules",
         title = "기관 간 규정 대조",
         annotations(
@@ -1909,6 +2156,7 @@ impl PublicRulesServer {
                     "hit_count": ids.len(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Ok(Json(result))
     }
@@ -2003,6 +2251,7 @@ impl PublicRulesServer {
                     "hit_count": hits.len(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         let citations = self.citations(&hits);
         Ok(Json(SearchRulesResult {
@@ -2056,6 +2305,7 @@ impl PublicRulesServer {
                     "found": annex.is_some(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Json(GetAnnexResult {
             text: annex.as_ref().map(|annex| annex.body.clone()),
@@ -2139,6 +2389,7 @@ impl PublicRulesServer {
                     "error": error,
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Json(GetSourcePageResult {
             page: params.page,
@@ -2186,6 +2437,7 @@ impl PublicRulesServer {
                     "found": article.is_some(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Json(GetArticleResult {
             prev_id: article.as_ref().and_then(|article| article.prev_id.clone()),
@@ -2226,6 +2478,7 @@ impl PublicRulesServer {
                     "count": rules.len(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Json(ListRulesResult {
             rules,
@@ -2269,6 +2522,7 @@ impl PublicRulesServer {
                     "count": basis.len(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         let (links, link_status) = match (resolved, article.as_ref()) {
             (Some((pack, _)), Some(article)) => {
@@ -2314,6 +2568,7 @@ impl PublicRulesServer {
                     "count": self.packs.len(),
                 },
             }),
+            TEST_REQUEST.try_with(|value| *value).unwrap_or(false),
         );
         Json(status)
     }
@@ -2419,9 +2674,38 @@ impl PublicRulesServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for PublicRulesServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let test = is_test_request(&context);
+        TEST_REQUEST
+            .scope(test, async {
+                self.tool_router
+                    .call(ToolCallContext::new(self, request, context))
+                    .await
+            })
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            ..Default::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -2501,9 +2785,23 @@ pub async fn run_stdio_server_with_query_log(
     config: ServerConfig,
     query_log_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    run_stdio_server_with_logs(config, query_log_path, None, None).await
+}
+
+async fn run_stdio_server_with_logs(
+    config: ServerConfig,
+    query_log_path: Option<PathBuf>,
+    feedback_log_path: Option<PathBuf>,
+    allowed_host: Option<String>,
+) -> anyhow::Result<()> {
     let server = PublicRulesServer::from_config(config)?;
     let server = if let Some(logger) = optional_query_logger(query_log_path) {
         server.with_query_logger(logger)
+    } else {
+        server
+    };
+    let server = if let Some(logger) = optional_feedback_logger(feedback_log_path) {
+        server.with_feedback_logger(logger, allowed_host.unwrap_or_else(hostname))
     } else {
         server
     };
@@ -2541,10 +2839,40 @@ pub async fn run_http_server_with_auth_options(
     query_log_path: Option<PathBuf>,
     auth_token: Option<AuthToken>,
 ) -> anyhow::Result<()> {
+    run_http_server_with_logs(
+        config,
+        bind_addr,
+        extra_allowed_hosts,
+        query_log_path,
+        None,
+        auth_token,
+    )
+    .await
+}
+
+async fn run_http_server_with_logs(
+    config: ServerConfig,
+    bind_addr: SocketAddr,
+    extra_allowed_hosts: Vec<String>,
+    query_log_path: Option<PathBuf>,
+    feedback_log_path: Option<PathBuf>,
+    auth_token: Option<AuthToken>,
+) -> anyhow::Result<()> {
     validate_http_auth_configuration(bind_addr, auth_token.as_ref())?;
     let server = PublicRulesServer::from_config(config)?;
     let server = if let Some(logger) = optional_query_logger(query_log_path) {
         server.with_query_logger(logger)
+    } else {
+        server
+    };
+    let server = if let Some(logger) = optional_feedback_logger(feedback_log_path) {
+        server.with_feedback_logger(
+            logger,
+            extra_allowed_hosts
+                .first()
+                .cloned()
+                .unwrap_or_else(hostname),
+        )
     } else {
         server
     };
@@ -2599,6 +2927,7 @@ pub async fn run_server(
             bind_addr,
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            feedback_log_path: None,
             auth_token: None,
         },
     )
@@ -2611,14 +2940,21 @@ pub async fn run_server_with_transport_args(
 ) -> anyhow::Result<()> {
     match args.transport {
         ServerTransport::Stdio => {
-            run_stdio_server_with_query_log(config, args.query_log_path).await
+            run_stdio_server_with_logs(
+                config,
+                args.query_log_path,
+                args.feedback_log_path,
+                args.allowed_hosts.first().cloned(),
+            )
+            .await
         }
         ServerTransport::Http => {
-            run_http_server_with_auth_options(
+            run_http_server_with_logs(
                 config,
                 args.bind_addr,
                 args.allowed_hosts,
                 args.query_log_path,
+                args.feedback_log_path,
                 args.auth_token,
             )
             .await
@@ -2820,6 +3156,7 @@ where
         bind_addr: transport_args.bind_addr,
         allowed_hosts: transport_args.allowed_hosts,
         query_log_path: transport_args.query_log_path,
+        feedback_log_path: transport_args.feedback_log_path,
         auth_token: transport_args.auth_token,
         extra_packs,
     })
@@ -2876,6 +3213,13 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--query-log requires <path>"))?,
             );
         }
+        "--feedback-log" => {
+            transport_args.feedback_log_path = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("--feedback-log requires <path>"))?,
+            );
+        }
         "--auth-token" => {
             reject_duplicate_auth_configuration(transport_args)?;
             let value = args
@@ -2905,6 +3249,7 @@ impl Default for TransportArgs {
                 .expect("default HTTP bind address must be valid"),
             allowed_hosts: Vec::new(),
             query_log_path: None,
+            feedback_log_path: None,
             auth_token: None,
         }
     }
@@ -3011,6 +3356,236 @@ async fn wait_for_shutdown_signal() {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn tool_list_snapshot_without_http() {
+        fn sorted(value: serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => serde_json::Value::Object(
+                    map.into_iter()
+                        .map(|(key, value)| (key, sorted(value)))
+                        .collect(),
+                ),
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.into_iter().map(sorted).collect())
+                }
+                other => other,
+            }
+        }
+        let mut tools = fixture_server().tool_router.list_all();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        let actual = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&sorted(serde_json::to_value(tools).unwrap())).unwrap()
+        );
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/tools_list.json");
+        if std::env::var("UPDATE_SNAPSHOTS").as_deref() == Ok("1") {
+            fs::write(&path, &actual).unwrap();
+        } else {
+            assert_eq!(actual, fs::read_to_string(path).unwrap());
+        }
+    }
+
+    #[test]
+    fn feedback_log_is_private_jsonl_and_truncation_is_by_character() {
+        let path = std::env::temp_dir().join(format!(
+            "public-rules-feedback-{}-{}.jsonl",
+            std::process::id(),
+            unix_epoch_ms()
+        ));
+        let logger = FeedbackLogger::new(&path).unwrap();
+        let mut value = "가나😀".to_string();
+        let mut truncated = Vec::new();
+        truncate_chars(&mut value, 2, "question", &mut truncated);
+        assert_eq!(value, "가나");
+        assert_eq!(truncated, ["question"]);
+        logger.log(&serde_json::json!({"question": value})).unwrap();
+        logger
+            .log(&serde_json::json!({"question": "두 번째"}))
+            .unwrap();
+        let lines = fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // The fixture lives in the task's temporary directory and has no user data.
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn feedback_log_cli_path_parses() {
+        let args = parse_transport_args(["--feedback-log", "/tmp/feedback.jsonl"]).unwrap();
+        assert_eq!(
+            args.feedback_log_path.as_deref(),
+            Some(Path::new("/tmp/feedback.jsonl"))
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_tool_records_and_links_query_log_over_stdio_transport() {
+        let root = std::env::temp_dir().join(format!(
+            "public-rules-feedback-tool-{}-{}",
+            std::process::id(),
+            unix_epoch_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let feedback_path = root.join("feedback.jsonl");
+        let query_path = root.join("query.jsonl");
+        let server = fixture_server()
+            .with_query_logger(QueryLogger::new(&query_path).unwrap())
+            .with_feedback_logger(
+                FeedbackLogger::new(&feedback_path).unwrap(),
+                "fixture-host".to_string(),
+            );
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        let handle =
+            tokio::spawn(async move { server.serve(server_io).await.unwrap().waiting().await });
+        let client = rmcp::model::ClientInfo::default()
+            .serve(client_io)
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({
+            "question": "가".repeat(2001),
+            "answer_summary": "답변",
+            "problem": "지적",
+            "cited_ids": vec!["나".repeat(201); 21],
+            "category": "wrong_article"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(arguments),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let response = result.structured_content.unwrap();
+        assert_eq!(response["recorded"], true);
+        let feedback: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&feedback_path).unwrap().trim()).unwrap();
+        assert_eq!(feedback["issue_id"], response["issue_id"]);
+        assert_eq!(feedback["host"], "fixture-host");
+        assert_eq!(feedback["question"].as_str().unwrap().chars().count(), 2000);
+        assert_eq!(feedback["cited_ids"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            feedback["cited_ids"][0].as_str().unwrap().chars().count(),
+            200
+        );
+        assert_eq!(
+            feedback["truncated"],
+            serde_json::json!(["cited_ids", "question"])
+        );
+        assert_eq!(feedback["packs"]["cni"]["effective"], "2026-02-27");
+        assert!(feedback.get("test").is_none());
+        let query: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&query_path).unwrap().trim()).unwrap();
+        assert_eq!(query["tool"], REPORT_ANSWER_ISSUE_TOOL);
+        assert_eq!(
+            query["params"],
+            serde_json::json!({"issue_id": response["issue_id"], "category": "wrong_article"})
+        );
+        assert!(query.get("question").is_none());
+        client.cancel().await.unwrap();
+        handle.abort();
+        fs::remove_file(feedback_path).unwrap();
+        fs::remove_file(query_path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn feedback_tool_disabled_is_error_over_stdio_transport() {
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(async move {
+            fixture_server()
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+        });
+        let client = rmcp::model::ClientInfo::default()
+            .serve(client_io)
+            .await
+            .unwrap();
+        let arguments =
+            serde_json::json!({"question":"질문", "answer_summary":"답변", "problem":"지적"})
+                .as_object()
+                .unwrap()
+                .clone();
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(arguments),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(format!("{:?}", result.content).contains("피드백 기록이 꺼져 있다"));
+        client.cancel().await.unwrap();
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn unopened_feedback_log_disables_feedback_without_stopping_other_tools() {
+        let root = std::env::temp_dir().join(format!(
+            "public-rules-unopened-feedback-{}-{}",
+            std::process::id(),
+            unix_epoch_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let query_path = root.join("query.jsonl");
+        let feedback_path = root.join("missing").join("feedback.jsonl");
+        let feedback_logger = optional_feedback_logger(Some(feedback_path.clone()));
+        assert!(feedback_logger.is_none());
+        let server = fixture_server().with_query_logger(QueryLogger::new(&query_path).unwrap());
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        let handle =
+            tokio::spawn(async move { server.serve(server_io).await.unwrap().waiting().await });
+        let client = rmcp::model::ClientInfo::default()
+            .serve(client_io)
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({
+            "question": "질문", "answer_summary": "답변", "problem": "지적"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let feedback = client
+            .call_tool(
+                CallToolRequestParams::new(REPORT_ANSWER_ISSUE_TOOL).with_arguments(arguments),
+            )
+            .await
+            .unwrap();
+        assert_eq!(feedback.is_error, Some(true));
+        assert!(format!("{:?}", feedback.content).contains("피드백 기록이 꺼져 있다"));
+        let search = client
+            .call_tool(
+                CallToolRequestParams::new(SEARCH_RULES_TOOL).with_arguments(
+                    serde_json::json!({"query": "항공운임"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(search.is_error, Some(true));
+        assert!(fs::read_to_string(&query_path)
+            .unwrap()
+            .contains(SEARCH_RULES_TOOL));
+        assert!(!feedback_path.exists());
+        client.cancel().await.unwrap();
+        handle.abort();
+        fs::remove_file(query_path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     fn fixture_server() -> PublicRulesServer {
         let articles = [r#"---
@@ -3128,6 +3703,8 @@ refs: []
             multipack_fusion: MultipackFusion::default(),
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
+            feedback_logger: None,
+            feedback_host: hostname(),
         }
     }
 
@@ -3743,6 +4320,8 @@ table_structured: true
             search_semaphore: Arc::new(Semaphore::new(SEARCH_FANOUT_LIMIT)),
             query_logger: None,
             multipack_fusion: MultipackFusion::default(),
+            feedback_logger: None,
+            feedback_host: hostname(),
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
         };
         let cni_result = legal_links_of(&server, "cni/시험규칙#제1조").await;
@@ -3907,6 +4486,8 @@ table_structured: true
             multipack_fusion: MultipackFusion::default(),
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
+            feedback_logger: None,
+            feedback_host: hostname(),
         }
     }
 
@@ -5155,6 +5736,8 @@ refs: []
             multipack_fusion: MultipackFusion::default(),
             query_variants_max: DEFAULT_QUERY_VARIANTS_MAX,
             query_logger: None,
+            feedback_logger: None,
+            feedback_host: hostname(),
         }
     }
 
