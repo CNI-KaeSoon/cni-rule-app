@@ -1,9 +1,15 @@
 import dataclasses
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import cni_rule_pipeline.pipeline as pipeline
 
 from cni_rule_pipeline.pipeline import (
     PageSpan,
     TocEntry,
     calculate_page_coverage,
+    clean_page_text,
+    extract_printed_page_number,
     extract_refs,
     find_suspicious_rules,
     parse_annexes,
@@ -11,10 +17,70 @@ from cni_rule_pipeline.pipeline import (
     parse_toc,
     parse_toc_with_profile,
     render_markdown,
+    read_pages,
     rule_text_with_page_spans,
     split_annex_text,
     slugify,
 )
+
+
+def test_read_pages_replaces_only_spaceless_page_and_keeps_page_cleanup(monkeypatch):
+    spaceless = "- 37 -\n제1조(목적)이지침에의한단기교육은연간총6개월이내의교육을말한다.\n충남연구원\n"
+    spaced = "- 37 -\n제1조(목적) 이 지침에 의한 단기교육은 연간 총 6개월 이내의 교육을 말한다.\n충남연구원\n"
+    normal = "제2조(대상) 이 지침은 모든 직원에게 적용한다.\n"
+    source = [spaceless, normal]
+    doc = SimpleNamespace(
+        name="sample.pdf",
+        page_count=2,
+        load_page=lambda index: SimpleNamespace(get_text=lambda mode: source[index]),
+    )
+    opened = []
+
+    @contextmanager
+    def open_fallback(path):
+        opened.append(path)
+        yield SimpleNamespace(pages=[SimpleNamespace(extract_text=lambda: spaced)])
+
+    monkeypatch.setattr(pipeline.pdfplumber, "open", open_fallback)
+    pages = read_pages(doc)
+
+    assert opened == ["sample.pdf"]
+    assert pages == {1: spaced, 2: normal}
+    assert extract_printed_page_number(pages[1]) == 37
+    assert clean_page_text(pages[1]) == "제1조(목적) 이 지침에 의한 단기교육은 연간 총 6개월 이내의 교육을 말한다."
+
+
+def test_read_pages_keeps_original_when_fallback_has_no_clear_spacing_gain(monkeypatch):
+    source = "제1조(목적)이지침에의한단기교육은연간총6개월이내의교육을말한다."
+    doc = SimpleNamespace(
+        name="sample.pdf",
+        page_count=1,
+        load_page=lambda index: SimpleNamespace(get_text=lambda mode: source),
+    )
+
+    @contextmanager
+    def open_fallback(path):
+        yield SimpleNamespace(pages=[SimpleNamespace(extract_text=lambda: source)])
+
+    monkeypatch.setattr(pipeline.pdfplumber, "open", open_fallback)
+    assert read_pages(doc) == {1: source}
+
+
+def test_read_pages_skips_isolated_low_space_form(monkeypatch):
+    form = "성명주소생년월일연락처소속직책서명확인제출일자담당자" * 2
+    normal = "이 문서는 정상적인 띄어쓰기가 포함된 본문입니다. " * 3
+    source = [form, *([normal] * 20)]
+    doc = SimpleNamespace(
+        name="sample.pdf",
+        page_count=len(source),
+        load_page=lambda index: SimpleNamespace(get_text=lambda mode: source[index]),
+    )
+
+    def unexpected_open(path):
+        raise AssertionError("isolated form should not open pdfplumber")
+
+    monkeypatch.setattr(pipeline.pdfplumber, "open", unexpected_open)
+    assert read_pages(doc)[1] == form
 
 
 def test_parse_toc_entries_from_pdf_text_page():
@@ -94,6 +160,49 @@ def test_toc_pages_remap_printed_numbers_to_physical_pages():
     assert result.entries[0].start_page == 152
     assert result.entries[0].end_page == 190
     assert result.entries[1].start_page == 191
+
+
+def test_toc_printed_number_does_not_shadow_body_page():
+    pages = {
+        3: "- 1 -\n첫째 지침 …………… 1\n둘째 지침 …………… 2\n",
+        4: "- 2 -\n",
+        6: "- 1 -\n첫째 지침\n제1조(목적) 본문\n",
+        7: "- 2 -\n둘째 지침\n제1조(목적) 본문\n",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(3, 4))
+
+    assert [entry.start_page for entry in result.entries] == [6, 7]
+
+
+def test_toc_unprinted_cover_page_uses_neighboring_printed_number_and_title():
+    pages = {
+        3: "첫째 지침 …………… 1\n둘째 지침 …………… 5\n",
+        6: "첫째 지침\n",
+        7: "",
+        8: "- 3 -\n첫째 지침\n제1조(목적) 본문\n",
+        10: "둘째 지침\n",
+        11: "- 6 -\n둘째 지침\n제1조(목적) 본문\n",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(3,))
+
+    assert [entry.start_page for entry in result.entries] == [6, 10]
+    assert result.entries[0].end_page == 9
+
+
+def test_toc_unprinted_cover_page_accepts_a_changed_cover_title():
+    pages = {
+        3: "재택근무지침 …………… 5\n다음 지침 …………… 8\n",
+        10: "재택근무운영지침\n",
+        11: "- 6 -\n제1조(목적) 본문\n",
+        13: "다음 지침\n",
+        14: "- 9 -\n제1조(목적) 본문\n",
+    }
+
+    result = parse_toc_with_profile(pages, toc_pages=(3,))
+
+    assert [entry.start_page for entry in result.entries] == [10, 13]
 
 
 def test_rule_text_trims_previous_rule_tail_before_heading():

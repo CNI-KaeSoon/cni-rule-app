@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -14,10 +15,16 @@ from pathlib import Path
 from typing import Iterable
 
 import fitz
+import pdfplumber
 
 SOURCE_EFFECTIVE_DATE = "2026-02-27"
 INSTITUTION = "cni"
 INSTITUTION_NAME = "충남연구원"
+MIN_HANGUL_FOR_SPACING_CHECK = 30
+SPACELESS_PAGE_RATIO = 0.08
+FALLBACK_MIN_SPACE_RATIO = 0.12
+FALLBACK_MIN_RATIO_GAIN = 0.05
+SPACELESS_DOCUMENT_RATIO = 0.05
 
 TOC_CNI_RE = re.compile(
     r"^(?P<code>[IVX]+\s*-\s*\d+)\s+"
@@ -228,11 +235,37 @@ def article_key(num: str, sub: str | None) -> str:
     return key
 
 
+def hangul_space_ratio(text: str) -> tuple[int, float]:
+    hangul_count = sum("가" <= char <= "힣" for char in text)
+    return hangul_count, text.count(" ") / hangul_count if hangul_count else 0.0
+
+
 def read_pages(doc: fitz.Document) -> dict[int, str]:
-    return {
+    pages = {
         page_no: normalize_spaces(doc.load_page(page_no - 1).get_text("text"))
         for page_no in range(1, doc.page_count + 1)
     }
+    if not pages:
+        return pages
+    candidates = []
+    for page_no, text in pages.items():
+        hangul_count, ratio = hangul_space_ratio(text)
+        if hangul_count >= MIN_HANGUL_FOR_SPACING_CHECK and ratio < SPACELESS_PAGE_RATIO:
+            candidates.append((page_no, ratio))
+    # Isolated low-space pages are often forms or tables; require a document-wide pattern.
+    if len(candidates) / doc.page_count < SPACELESS_DOCUMENT_RATIO:
+        return pages
+    with contextlib.ExitStack() as stack:
+        plumber_doc = stack.enter_context(pdfplumber.open(doc.name))
+        for page_no, ratio in candidates:
+            fallback = normalize_spaces(plumber_doc.pages[page_no - 1].extract_text() or "")
+            _, fallback_ratio = hangul_space_ratio(fallback)
+            if (
+                fallback_ratio >= FALLBACK_MIN_SPACE_RATIO
+                and fallback_ratio - ratio >= FALLBACK_MIN_RATIO_GAIN
+            ):
+                pages[page_no] = fallback
+    return pages
 
 
 def write_page_sidecars(pages: dict[int, str], output_dir: Path) -> None:
@@ -264,7 +297,14 @@ def parse_toc(pages: dict[int, str], toc_pages: Iterable[int] = (3, 4, 5)) -> li
 def parse_toc_with_profile(pages: dict[int, str], toc_pages: Iterable[int] | None = None) -> TocParseResult:
     selected_pages = tuple(toc_pages) if toc_pages is not None else auto_detect_toc_pages(pages)
     profile, raw = best_toc_profile(pages, selected_pages)
-    entries = toc_entries_from_candidates(raw, profile.name, max(pages), printed_page_map(pages))
+    page_map = printed_page_map(pages, excluded_pages=selected_pages)
+    for candidate in raw:
+        if candidate.start_page in page_map:
+            continue
+        physical_page = infer_unprinted_start_page(candidate, pages, page_map)
+        if physical_page is not None:
+            page_map[candidate.start_page] = physical_page
+    entries = toc_entries_from_candidates(raw, profile.name, max(pages), page_map)
     return TocParseResult(entries=entries, profile=profile.name, match_count=len(raw), toc_pages=selected_pages)
 
 
@@ -349,14 +389,41 @@ def toc_entries_from_candidates(
     return entries
 
 
-def printed_page_map(pages: dict[int, str]) -> dict[int, int]:
+def printed_page_map(pages: dict[int, str], excluded_pages: Iterable[int] = ()) -> dict[int, int]:
     mapped: dict[int, int] = {}
+    excluded = set(excluded_pages)
     for physical_page, text in pages.items():
+        if physical_page in excluded:
+            continue
         printed = extract_printed_page_number(text)
         if printed is None:
             continue
         mapped.setdefault(printed, physical_page)
     return mapped
+
+
+def infer_unprinted_start_page(
+    candidate: TocCandidate, pages: dict[int, str], page_map: dict[int, int]
+) -> int | None:
+    label = candidate.start_page
+    title = re.sub(r"\s+", "", candidate.title)
+    anchors = sorted(page_map, key=lambda number: abs(number - label))
+    adjacent_cover: int | None = None
+    for anchor in anchors:
+        physical_page = page_map[anchor] + label - anchor
+        if physical_page not in pages:
+            continue
+        page_text = re.sub(r"\s+", "", normalize_spaces(pages[physical_page]))
+        if title in page_text:
+            return physical_page
+        if (
+            adjacent_cover is None
+            and abs(anchor - label) == 1
+            and page_text
+            and extract_printed_page_number(pages[physical_page]) is None
+        ):
+            adjacent_cover = physical_page
+    return adjacent_cover
 
 
 def extract_printed_page_number(text: str) -> int | None:
