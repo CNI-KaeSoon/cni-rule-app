@@ -238,6 +238,36 @@ def test_parse_articles_keeps_article_keys_and_titles():
     assert articles[0].amended == "2026-02-09"
 
 
+def test_parse_articles_splits_indented_titled_headings_and_preserves_pages():
+    entry = TocEntry(code="A", rule="예시규칙", start_page=10, end_page=11)
+    page_10 = "제1조(목적) 첫 조문 본문이다."
+    page_11 = " \t제2조(절차) 둘째 조문 본문이다.\n\t제3조의2(기록) 셋째 조문 본문이다."
+    text = f"{page_10}\n{page_11}"
+    spans = [
+        PageSpan(page_no=10, start=0, end=len(page_10)),
+        PageSpan(page_no=11, start=len(page_10) + 1, end=len(text)),
+    ]
+
+    articles = parse_articles(entry, text, page_spans=spans)
+
+    assert [article.article for article in articles] == ["제1조", "제2조", "제3조의2"]
+    assert [article.title for article in articles] == ["목적", "절차", "기록"]
+    assert [article.source_pages for article in articles] == [(10, 10), (11, 11), (11, 11)]
+    assert "제2조" not in articles[0].body
+    assert "제3조의2" not in articles[1].body
+
+
+def test_parse_articles_keeps_indented_untitled_reference_in_body():
+    entry = TocEntry(code="A", rule="예시규칙", start_page=10, end_page=10)
+    text = "제1조(목적) 본문이다.\n 제2조에 따라 처리한다.\n\t제3조의2를 준용한다.\n제2조 본문이다."
+
+    articles = parse_articles(entry, text)
+
+    assert [article.article for article in articles] == ["제1조", "제2조"]
+    assert "제2조에 따라 처리한다." in articles[0].body
+    assert "제3조의2를 준용한다." in articles[0].body
+
+
 def test_extract_refs_for_internal_same_rule_and_quoted_law():
     refs = extract_refs(
         "직제규정 제6조와 제7조를 준용하고 「근로기준법」 제60조를 따른다.",

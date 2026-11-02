@@ -42,7 +42,8 @@ TOC_SLASH_RE = re.compile(
     r"^(?P<num>\d+)\.\s*(?P<title>.+?)\s*/\s*(?P<page>\d+)\s*$"
 )
 ARTICLE_RE = re.compile(
-    r"(?m)^제\s*(?P<num>\d+)\s*조(?:\s*의\s*(?P<sub>\d+))?\s*(?:\((?P<title>[^)\n]+)\))?"
+    r"(?m)^(?:[ \t]+(?=제\s*\d+\s*조(?:\s*의\s*\d+)?\s*\([^)\n]+\)))?"
+    r"제\s*(?P<num>\d+)\s*조(?:\s*의\s*(?P<sub>\d+))?\s*(?:\((?P<title>[^)\n]+)\))?"
 )
 ANNEX_HEADING_RE = re.compile(
     r"^\s*[\[\(<【〔]?\s*"
