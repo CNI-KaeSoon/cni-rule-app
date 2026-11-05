@@ -2720,7 +2720,8 @@ impl ServerHandler for PublicRulesServer {
         } else {
             info.protocol_version.clone()
         };
-        println!(
+        // stdout 은 stdio 전송의 JSON-RPC 스트림이므로 진단 로그는 stderr 로 보낸다.
+        eprintln!(
             "mcp_initialize requested_protocol_version={requested_version} selected_protocol_version={selected_version}"
         );
         info.protocol_version = selected_version;
